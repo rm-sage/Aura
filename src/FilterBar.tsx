@@ -1,7 +1,7 @@
 // Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useMemo, useState, memo } from "react";
+import { useEffect, useMemo, useRef, useState, memo } from "react";
 import type { MetaPreview } from "./types";
 
 // ---------------------------------------------------------------------------
@@ -41,12 +41,15 @@ export interface FilterState {
   airingOnly?: boolean;
 }
 
-const YEAR_MIN_DEFAULT = 1900;
-const YEAR_MAX_DEFAULT = new Date().getFullYear() + 1; // allow next year
+// The slider's range for a list with no years at all.
+const YEAR_FALLBACK_MIN = 1900;
+const YEAR_FALLBACK_MAX = new Date().getFullYear() + 1;
 
+// Unbounded, so an untouched year filter never hides a title (an announced 2028
+// film, a pre-1900 one). A thumb dragged back to its edge returns to unbounded.
 export const DEFAULT_FILTERS: FilterState = {
-  yearMin: YEAR_MIN_DEFAULT,
-  yearMax: YEAR_MAX_DEFAULT,
+  yearMin: -Infinity,
+  yearMax: Infinity,
   genres:  [],
   sort:    "default",
   airingOnly: false,
@@ -66,20 +69,28 @@ export function parseYear(info: string | null): number | null {
   return y >= 1800 && y <= 2200 ? y : null;
 }
 
+/** The year / genre gate of applyFilters for ONE item. Exported so a view
+ *  that runs its own single-pass pipeline (Library's faceted type counts)
+ *  applies exactly the predicate the grid would, rather than a copy of it. */
+export function matchesFilterState(
+  it: Pick<MetaPreview, "release_info" | "genres">,
+  f: FilterState,
+): boolean {
+  // Year
+  const y = parseYear(it.release_info);
+  if (y !== null && (y < f.yearMin || y > f.yearMax)) return false;
+
+  // Genres (OR match)
+  if (f.genres.length > 0) {
+    const hits = it.genres ?? [];
+    if (!hits.some((g) => f.genres.includes(g))) return false;
+  }
+
+  return true;
+}
+
 export function applyFilters(items: MetaPreview[], f: FilterState): MetaPreview[] {
-  const filtered = items.filter((it) => {
-    // Year
-    const y = parseYear(it.release_info);
-    if (y !== null && (y < f.yearMin || y > f.yearMax)) return false;
-
-    // Genres (OR match)
-    if (f.genres.length > 0) {
-      const hits = it.genres ?? [];
-      if (!hits.some((g) => f.genres.includes(g))) return false;
-    }
-
-    return true;
-  });
+  const filtered = items.filter((it) => matchesFilterState(it, f));
 
   switch (f.sort) {
     case "year":
@@ -143,6 +154,12 @@ interface Props {
    *  `airingOnly`, so it stays hidden elsewhere (Discover / Search / Catalog /
    *  View-all) where it would be an inert control. */
   showAiringToggle?: boolean;
+  /** Reports the panel's open state (hover OR pinned) to the caller. Library
+   *  uses it to slide its Options panel aside so both stay visible; every
+   *  other surface omits it and nothing changes there. Pass a stable function
+   *  (a state setter): it is called on every open change and with `false` on
+   *  unmount, so a caller is never left believing a gone panel is open. */
+  onOpenChange?: (open: boolean) => void;
 }
 
 const FilterIcon = () => (
@@ -172,19 +189,24 @@ function useFilterModel({
   statusOptions, statusValue, onStatusChange,
   showAiringToggle = false,
 }: Props) {
-  const genres = useMemo(() => collectGenres(items), [items]);
+  // A selected genre stays listed after its last title leaves, or it would keep
+  // filtering with no chip to untick.
+  const genres = useMemo(
+    () => [...new Set([...collectGenres(items), ...state.genres])].sort((a, b) => a.localeCompare(b)),
+    [items, state.genres],
+  );
 
   // Bounds for the year slider — clamp to actual data when present
   const yearBounds = useMemo(() => {
-    let min = YEAR_MAX_DEFAULT;
-    let max = YEAR_MIN_DEFAULT;
+    let min = Infinity;
+    let max = -Infinity;
     for (const it of items) {
       const y = parseYear(it.release_info);
       if (y === null) continue;
       if (y < min) min = y;
       if (y > max) max = y;
     }
-    if (min > max) { min = YEAR_MIN_DEFAULT; max = YEAR_MAX_DEFAULT; }
+    if (min > max) { min = YEAR_FALLBACK_MIN; max = YEAR_FALLBACK_MAX; }
     return { min, max };
   }, [items]);
 
@@ -218,14 +240,17 @@ function useFilterModel({
   const setStatus = (value: string) => onStatusChange?.(value);
 
   const reset = () => {
-    onChange({ ...DEFAULT_FILTERS, yearMin: yearBounds.min, yearMax: yearBounds.max });
+    onChange(DEFAULT_FILTERS);
     if (sortOptions) onSortChange?.(sortDefault);
     if (statusChoices) onStatusChange?.(statusDefault);
   };
 
   const isDirty =
-    state.yearMin !== yearBounds.min ||
-    state.yearMax !== yearBounds.max ||
+    // Any stored bound, not only one that narrows the current data: bounds
+    // move as titles come and go, and a stored bound still hides what has no
+    // year to test (a Queue stub), so Reset has to stay available.
+    Number.isFinite(state.yearMin) ||
+    Number.isFinite(state.yearMax) ||
     state.genres.length > 0 ||
     activeSort !== sortDefault ||
     (showAiringToggle && (state.airingOnly ?? false)) ||
@@ -253,13 +278,16 @@ function FilterControls({ state, model }: { state: FilterState; model: FilterMod
     showAiringToggle,
   } = model;
 
-  // Highlighted span between the two thumbs, as track percentages. The
-  // committed state can sit outside the data-derived bounds (defaults
-  // are 1900…next year) so clamp before painting the fill.
+  // The committed range can sit outside the data-derived bounds (the default
+  // is unbounded), so the label, thumbs and fill all read it clamped.
+  const clampYear = (y: number) => Math.max(yearBounds.min, Math.min(yearBounds.max, y));
+  const shownMin = clampYear(state.yearMin);
+  const shownMax = clampYear(state.yearMax);
+
+  // Highlighted span between the two thumbs, as track percentages.
   const span = yearBounds.max - yearBounds.min;
-  const clampPct = (n: number) => Math.max(0, Math.min(100, n));
-  const pctMin = span <= 0 ? 0   : clampPct(((state.yearMin - yearBounds.min) / span) * 100);
-  const pctMax = span <= 0 ? 100 : clampPct(((state.yearMax - yearBounds.min) / span) * 100);
+  const pctMin = span <= 0 ? 0   : ((shownMin - yearBounds.min) / span) * 100;
+  const pctMax = span <= 0 ? 100 : ((shownMax - yearBounds.min) / span) * 100;
 
   return (
     <div className="space-y-5">
@@ -349,7 +377,7 @@ function FilterControls({ state, model }: { state: FilterState; model: FilterMod
             Release Year
           </label>
           <span className="text-white/55 text-xs font-mono tabular-nums">
-            {state.yearMin}–{state.yearMax}
+            {shownMin}-{shownMax}
           </span>
         </div>
         <div
@@ -365,10 +393,13 @@ function FilterControls({ state, model }: { state: FilterState; model: FilterMod
             type="range"
             min={yearBounds.min}
             max={yearBounds.max}
-            value={state.yearMin}
+            value={shownMin}
+            // At the right edge both thumbs share a pixel and Latest cannot move
+            // left, so Earliest must be the one on top to be grabbed.
+            style={shownMin >= yearBounds.max ? { zIndex: 4 } : undefined}
             onChange={(e) => {
               const v = parseInt(e.target.value, 10);
-              set({ yearMin: Math.min(v, state.yearMax) });
+              set({ yearMin: v <= yearBounds.min ? -Infinity : Math.min(v, shownMax) });
             }}
             aria-label="Earliest year"
           />
@@ -376,10 +407,10 @@ function FilterControls({ state, model }: { state: FilterState; model: FilterMod
             type="range"
             min={yearBounds.min}
             max={yearBounds.max}
-            value={state.yearMax}
+            value={shownMax}
             onChange={(e) => {
               const v = parseInt(e.target.value, 10);
-              set({ yearMax: Math.max(v, state.yearMin) });
+              set({ yearMax: v >= yearBounds.max ? Infinity : Math.max(v, shownMin) });
             }}
             aria-label="Latest year"
           />
@@ -450,6 +481,16 @@ function FilterMenuInner(props: Props) {
   const [pinned, setPinned] = useState(false);
   const [hovered, setHovered] = useState(false);
   const open = pinned || hovered;
+
+  const { onOpenChange } = props;
+  useEffect(() => {
+    onOpenChange?.(open);
+  }, [open, onOpenChange]);
+  // Separate unmount report through a ref, so a new callback identity does
+  // not fire a spurious `false` between two `true`s.
+  const onOpenChangeRef = useRef(onOpenChange);
+  onOpenChangeRef.current = onOpenChange;
+  useEffect(() => () => onOpenChangeRef.current?.(false), []);
 
   return (
     <div

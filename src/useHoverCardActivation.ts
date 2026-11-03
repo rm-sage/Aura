@@ -51,6 +51,8 @@ export interface HoverCardActivation {
   onPointerCancel?: (e: React.PointerEvent<HTMLElement>) => void;
   onAuxClick?: (e: React.MouseEvent<HTMLElement>) => void;
   onClickCapture?: (e: React.MouseEvent<HTMLElement>) => void;
+  /** Marks the element as a card, so the panel's placement can avoid it. */
+  "data-hover-card": "";
 }
 
 /** Long-press duration to open the panel in "hold" mode. */
@@ -80,11 +82,16 @@ export function useHoverCardActivation(meta: MetaPreview): HoverCardActivation {
       setMode(readActivation());
     };
     window.addEventListener("aura:settings-changed", sync);
-    return () => window.removeEventListener("aura:settings-changed", sync);
+    return () => {
+      window.removeEventListener("aura:settings-changed", sync);
+      // A press still counting when the card unmounts opens nothing.
+      if (hold.current.timer) { clearTimeout(hold.current.timer); hold.current.timer = null; }
+    };
   }, []);
 
   if (mode.activation === "button") {
     return {
+      "data-hover-card": "",
       onPointerDown: (e) => { if (e.button !== mode.button) return; e.preventDefault(); },
       onAuxClick: (e) => {
         if (e.button !== mode.button) return;
@@ -99,6 +106,7 @@ export function useHoverCardActivation(meta: MetaPreview): HoverCardActivation {
       if (hold.current.timer) { clearTimeout(hold.current.timer); hold.current.timer = null; }
     };
     return {
+      "data-hover-card": "",
       onPointerDown: (e) => {
         if (e.button !== 0) return; // primary button / trackpad tap only
         clearTimer();
@@ -131,7 +139,8 @@ export function useHoverCardActivation(meta: MetaPreview): HoverCardActivation {
   }
 
   return {
-    onMouseEnter: (e) => scheduleHoverOpen(meta, e.currentTarget),
+    "data-hover-card": "",
+    onMouseEnter: (e) => scheduleHoverOpen(meta, e.currentTarget, { x: e.clientX, y: e.clientY }),
     onMouseLeave: () => { cancelHoverOpen(); scheduleHoverClose(); },
   };
 }

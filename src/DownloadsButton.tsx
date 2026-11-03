@@ -8,7 +8,7 @@ import { toggleDownloadsPanel, useDownloadsPanelPhase } from "./downloadsPanel";
 
 // ---------------------------------------------------------------------------
 // DownloadsButton: the title-bar affordance, sitting immediately after the
-// Aura Cloud sync chip.
+// service status chip (formerly the Aura Cloud sync chip).
 //
 // Placement is after the chip, not before, and that is load-bearing: the button
 // expands to ~200px when something is downloading, and expanding to the LEFT of
@@ -21,7 +21,7 @@ import { toggleDownloadsPanel, useDownloadsPanelPhase } from "./downloadsPanel";
 // treatment is `inset`), and the panel cannot be a child of this component (it
 // would be clipped to 36px), so it mounts at the App root instead.
 //
-// Status colours are lifted verbatim from SyncStatusChip's COLOR map so the two
+// Status colours are lifted verbatim from ServiceStatusChip's COLOR map so the two
 // adjacent title-bar status affordances speak one colour language.
 // ---------------------------------------------------------------------------
 
@@ -37,7 +37,7 @@ const RING_LEN = 66;
 type Tone = "idle" | "queued" | "running" | "paused" | "complete" | "error";
 
 const TONE_COLOR: Record<Tone, string> = {
-  // Matches SyncStatusChip's guest grey exactly.
+  // Matches ServiceStatusChip's guest grey exactly.
   idle: "rgba(255,255,255,0.6)",
   queued: "var(--ln-accent)",
   running: "var(--ln-accent)",

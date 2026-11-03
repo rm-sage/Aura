@@ -9,14 +9,18 @@ import ImageLoader from "../ImageLoader";
 import { shrinkPoster } from "../posterSize";
 import ErrorBoundary from "../ErrorBoundary";
 import Tooltip from "../Tooltip";
-import { isAnimeMeta, typeLabel, useAnimeCacheVersion } from "../aiometadata";
+import { typeLabel, useAnimeCacheVersion } from "../aiometadata";
 import WatchedBadge from "../WatchedBadge";
 import { useHoverCardActivation } from "../useHoverCardActivation";
 import { closeHoverNow } from "../catalogHoverStore";
 import {
-  FilterMenu, applyFilters, DEFAULT_FILTERS,
+  FilterMenu, matchesFilterState, DEFAULT_FILTERS,
   type FilterState, type SortOption, type StatusOption,
 } from "../FilterBar";
+import {
+  MediaTypePills, classifyMediaKinds, facetCounts, kindMatches,
+  type MediaKinds, type MediaTypeFilter,
+} from "../mediaTypePills";
 import ListSearchInput, { looseMatch } from "../ListSearchInput";
 import { PAGE_CONTENT_MAX_W } from "../pageLayout";
 import { getManualWatchedState, useManualWatchedVersion } from "../manualWatched";
@@ -24,6 +28,8 @@ import { getReleaseSignal, useReleaseSignalsVersion } from "../releaseSignalStor
 import { isAiring } from "../airing";
 import { episodeIsBeforeResume } from "../LibraryContext";
 import { loadAuraSettings, saveAuraSettings } from "../auraSettings";
+import { peekRichestCachedDetailById } from "../metaCache";
+import { seriesIsFinished } from "../libraryActions";
 
 // ---------------------------------------------------------------------------
 // LibraryView — full grid of saved Stremio library items.
@@ -41,7 +47,6 @@ import { loadAuraSettings, saveAuraSettings } from "../auraSettings";
 // ---------------------------------------------------------------------------
 
 type SortMode = "alpha" | "alpha-desc" | "added" | "played";
-type Filter   = "all" | "movie" | "series" | "anime";
 
 // Library's Sort By choices, now surfaced inside the header Filter &
 // Sort panel (the standalone <select> was removed). `value` maps to
@@ -97,21 +102,23 @@ function libraryItemStatus(item: LibraryItem): ExclusiveStatus {
   return "unwatched";
 }
 
-/** Does this library item match the active media-type pill? Mirrors the
- *  single-pass partition's bucket rules (anime detected via state.genres). */
-function itemMatchesTypeFilter(item: LibraryItem, filter: Filter): boolean {
-  if (filter === "all") return true;
-  const mt = (item.media_type ?? "").toLowerCase();
-  if (filter === "movie") return mt === "movie";
-  const stateGenres = (item.state ?? {}).genres;
-  const genres = Array.isArray(stateGenres)
-    ? stateGenres.filter((g): g is string => typeof g === "string")
-    : [];
-  const isAnime = isAnimeMeta({ media_type: item.media_type, id: item.id, genres });
-  // "Series" is LIVE-ACTION only — anime has its own pill.
-  if (filter === "series") return mt === "series" && !isAnime;
-  return isAnime; // anime
+/** A live library item with the two projections every filter reads, built
+ *  ONCE per library / anime-cache change rather than per filter toggle. */
+interface ClassifiedItem {
+  item: LibraryItem;
+  /** MetaPreview projection: the year / genre gate reads it, and the Filter
+   *  & Sort panel derives its genre list and year bounds from it. */
+  meta: MetaPreview;
+  kinds: MediaKinds;
 }
+
+// Header Options panel geometry. The panel is `w-72` (288 px); when the
+// Filter & Sort panel is open beside it, Options slides left until there is
+// MENU_PANEL_GAP between the two, never closer than MENU_EDGE to the left
+// edge of the page's scroll container (which clips anything past it).
+const MENU_PANEL_W = 288;
+const MENU_PANEL_GAP = 8;
+const MENU_EDGE = 8;
 
 /** True when a series in the library has an AIRED, unwatched episode past the
  *  user's watch frontier - "you're following this and it dropped something new
@@ -151,16 +158,22 @@ function hasNewUnwatchedEpisode(item: LibraryItem): boolean {
 /** Watched items of a given media kind - the backlog an auto-remove toggle
  *  offers to clear on enable. "series" covers series + anime; "movie" covers
  *  movies (incl. anime movies). Uses libraryItemStatus so a "watched" series
- *  means a genuine completion mark, not a lingering last-episode offset. */
+ *  means a genuine completion mark, not a lingering last-episode offset.
+ *  Explicit records only: a temp (auto-tracked) row is not in the Library the
+ *  prompt names, and removing it would cost its Continue Watching card. A series
+ *  needs a cached episode list showing nothing still to come (no fetch on a
+ *  toggle), so an airing or unknown one stays and is not counted. */
 function watchedItemsOfKind(items: LibraryItem[], kind: AutoRemoveKind): LibraryItem[] {
   const out: LibraryItem[] = [];
   for (const i of items) {
-    if (!i || i.removed) continue;
+    if (!i || i.removed || i.temp) continue;
     const mt = (i.media_type ?? "").toLowerCase();
     const isSeriesLike = mt === "series" || mt === "anime";
     const kindMatch = kind === "movie" ? mt === "movie" : isSeriesLike;
     if (!kindMatch) continue;
-    if (libraryItemStatus(i) === "watched") out.push(i);
+    if (libraryItemStatus(i) !== "watched") continue;
+    if (kind === "series" && !seriesIsFinished(i, peekRichestCachedDetailById(i.id))) continue;
+    out.push(i);
   }
   return out;
 }
@@ -179,6 +192,10 @@ interface Props {
    *  first enabled and the user confirms the one-time sweep. The implementer
    *  (App) owns the cloud write + optimistic state, same path as onRemoveItem. */
   onAutoRemoveSweep?: (kind: AutoRemoveKind, items: LibraryItem[]) => void;
+  /** The library could not be fetched and nothing is known about it: not the
+   *  same as an empty one. */
+  loadFailed: boolean;
+  onRetryLoad: () => void;
 }
 
 function libraryItemToMeta(item: LibraryItem): MetaPreview {
@@ -244,6 +261,9 @@ const LIB_MAX_GRID_W = PAGE_CONTENT_MAX_W; // px width cap for the centered grid
 const LIB_BUFFER_ROWS = 2;   // overscan rows above + below (trimmed from 3)
 const LIB_EST_ROW_STRIDE = 380; // pre-measure fallback: ~200px poster + h-14 title + gap
 
+/** No layout box: the page is display:none behind the player. */
+const hasNoBox = (el: HTMLElement) => el.clientHeight === 0 && el.clientWidth === 0;
+
 interface RowWindow {
   start: number;
   end: number;
@@ -270,6 +290,11 @@ function useLibraryRowWindow(
   // Viewport height: a taller window at the same column count changes no
   // other input, so the rows it uncovers stayed unmounted until a scroll.
   const [viewH, setViewH] = useState(0);
+  // A hidden page keeps its range and measurements (scrollTop and every size
+  // read 0 there), so its deep cards stay mounted and no top rows load behind
+  // the player. The tick recomputes on return, in case the list changed meanwhile.
+  const wasHiddenRef = useRef(false);
+  const [shownTick, setShownTick] = useState(0);
 
   // Measure layout BEFORE paint (useLayoutEffect, not useEffect) so the
   // first frame already has the right column count + row stride — otherwise
@@ -285,16 +310,19 @@ function useLibraryRowWindow(
     const wrapper = wrapperRef.current;
     if (!scroll || !wrapper) return;
     const measure = () => {
+      if (hasNoBox(scroll)) { wasHiddenRef.current = true; return; }
+      if (wasHiddenRef.current) { wasHiddenRef.current = false; setShownTick((t) => t + 1); }
       const w = wrapper.clientWidth;
       if (w > 0) {
         const c = Math.max(1, Math.floor((w + LIB_GRID_GAP) / (LIB_MIN_CARD_W + LIB_GRID_GAP)));
         setCols((prev) => (prev === c ? prev : c));
       }
       const card = gridRef.current?.firstElementChild as HTMLElement | null;
-      const h = card?.offsetHeight ?? 0;
+      // Unrounded, as in useRowWindow: a rounded stride shifts the grid at each row crossing.
+      const h = card ? parseFloat(getComputedStyle(card).height) || card.offsetHeight : 0;
       if (h > 0) {
         const s = h + LIB_GRID_GAP;
-        setRowStride((prev) => (Math.abs(prev - s) < 0.5 ? prev : s));
+        setRowStride((prev) => (Math.abs(prev - s) < 0.01 ? prev : s));
       }
       const wrapRect = wrapper.getBoundingClientRect();
       const scrollRect = scroll.getBoundingClientRect();
@@ -315,7 +343,7 @@ function useLibraryRowWindow(
     const scroll = scrollRef.current;
     if (!scroll) return;
     const compute = () => {
-      if (rowStride <= 0) return;
+      if (rowStride <= 0 || hasNoBox(scroll)) return;
       const within = scroll.scrollTop - gridTopRef.current;
       const viewportH = scroll.clientHeight;
       const totalRows = Math.ceil(itemCount / cols);
@@ -331,7 +359,7 @@ function useLibraryRowWindow(
     compute();
     scroll.addEventListener("scroll", compute, { passive: true });
     return () => scroll.removeEventListener("scroll", compute);
-  }, [scrollRef, cols, rowStride, itemCount, viewH]);
+  }, [scrollRef, cols, rowStride, itemCount, viewH, shownTick]);
 
   const totalRows = Math.ceil(itemCount / cols);
   const totalHeight = totalRows > 0 ? totalRows * rowStride - LIB_GRID_GAP : 0;
@@ -347,9 +375,9 @@ export default function LibraryView(props: Props) {
   );
 }
 
-function LibraryViewBody({ library, session, onSelectMeta, onRemoveItem, onAutoRemoveSweep }: Props) {
+function LibraryViewBody({ library, session, onSelectMeta, onRemoveItem, onAutoRemoveSweep, loadFailed, onRetryLoad }: Props) {
   const [sort, setSort]     = useState<SortMode>("added");
-  const [filter, setFilter] = useState<Filter>("all");
+  const [filter, setFilter] = useState<MediaTypeFilter>("all");
   // Coarse watch-status cut (All / Watched / Unwatched / In Progress / In Queue
   // / New Episodes), surfaced in the Filter & Sort panel. Combines with the
   // media-type pills + year/genre + name search below.
@@ -380,6 +408,13 @@ function LibraryViewBody({ library, session, onSelectMeta, onRemoveItem, onAutoR
   }, []);
   const [sweepPrompt, setSweepPrompt] = useState<{ kind: AutoRemoveKind; items: LibraryItem[] } | null>(null);
   const [optionsOpen, setOptionsOpen] = useState(false);
+  // The Filter & Sort panel's open state (hover or pinned), reported by
+  // FilterMenu, so the Options panel can make room for it. See optionsShift.
+  const [filterMenuOpen, setFilterMenuOpen] = useState(false);
+  // The pointer is over the Options PANEL. A hover-opened Filter panel closes
+  // the moment the pointer crosses the gap into Options; while this is set the
+  // shift is held, so Options does not slide away from under the cursor.
+  const [optionsPanelHovered, setOptionsPanelHovered] = useState(false);
   // Year / genre refinement plus the Sort By choice, both surfaced in
   // the header Filter & Sort panel (FilterMenu) — the same affordance
   // every other browseable surface uses. `sort` drives the ordering;
@@ -456,115 +491,96 @@ function LibraryViewBody({ library, session, onSelectMeta, onRemoveItem, onAutoR
     }
   };
 
-  // Single-pass partition: classify every live (non-removed) item into
-  // its media-type buckets in ONE iteration. Previously this code did
-  // 7 passes over `items` (one filter for `live`, four for counts, plus
-  // the filtered+sorted derivations). On large libraries (1000+ items)
-  // each filter callback re-evaluates `state.genres` parsing for the
-  // anime check, which adds up.
-  //
-  // The anime check pulls `state.genres` (written by libraryActions on
-  // every Add to Library / progress write) so anime items carry the
-  // genre signal even after the catalog metadata is stripped down to
-  // the bare Stremio library record. Without this, the anime filter
-  // relies only on media_type / id-prefix / cache, missing every IMDb-
-  // id'd anime (Frieren via tt..., etc.).
-  const { buckets, counts } = useMemo(() => {
-    const all: LibraryItem[] = [];
-    const movie: LibraryItem[] = [];
-    const series: LibraryItem[] = [];
-    const anime: LibraryItem[] = [];
+  // Classify every live (non-removed) item ONCE: its media-type kinds and
+  // its MetaPreview projection. The anime check reads `state.genres`
+  // (written by libraryActions on every Add to Library / progress write) so
+  // anime items carry the genre signal even after the catalog metadata is
+  // stripped down to the bare Stremio library record; without it the Anime
+  // pill relies only on media_type / id-prefix / cache and misses every
+  // IMDb-id'd anime (Frieren via tt..., etc.). Re-runs when the background
+  // meta warm marks a newly-resolved anime (animeCacheVersion).
+  const classified = useMemo(() => {
+    const out: ClassifiedItem[] = [];
     for (const i of items) {
       if (!i || i.removed) continue;
-      // Skip auto-tracked entries (Stremio's `temp: true` flag,
-      // written by libraryWriteProgress after PROGRESS_WARMUP_S of
-      // playback). These are how CW gets its "I never explicitly
-      // saved this, but it remembers where I left off" behavior — they
-      // belong in Continue Watching but NOT in the Library view, which
-      // should reflect explicit user intent (Add to Library, Mark as
-      // Planned). The CW row reads library directly with its own
-      // filter so excluding temp here doesn't affect CW. Matches
-      // Stremio's official client semantics.
-      if (i.temp) continue;
-      all.push(i);
-      const mt = (i.media_type ?? "").toLowerCase();
-      const stateGenres = (i.state ?? {}).genres;
-      const genres = Array.isArray(stateGenres)
-        ? stateGenres.filter((g): g is string => typeof g === "string")
-        : [];
-      const isAnime = isAnimeMeta({ media_type: i.media_type, id: i.id, genres });
-      if (mt === "movie") movie.push(i);
-      // "Series" bucket is LIVE-ACTION only — anime gets its own bucket + pill.
-      if (mt === "series" && !isAnime) series.push(i);
-      if (isAnime) anime.push(i);
+      const meta = libraryItemToMeta(i);
+      out.push({ item: i, meta, kinds: classifyMediaKinds(i.media_type, i.id, meta.genres) });
     }
-    return {
-      buckets: { all, movie, series, anime } as Record<Filter, LibraryItem[]>,
-      counts:  { all: all.length, movie: movie.length, series: series.length, anime: anime.length } as Record<Filter, number>,
-    };
+    return out;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [items, animeCacheVersion]);
 
-  // When no status filter is active the grid is exactly as before: the
-  // media-type bucket, which excludes auto-tracked (temp) entries. When a
-  // status IS chosen we rebuild from ALL live items (temp included) so
-  // "In Progress" / "Watched" surface Continue-Watching content the user never
-  // explicitly added - then narrow to the chosen status. `manualVersion` /
-  // `signalsVersion` are in the deps so the set re-derives when a mark flips or
-  // a release signal lands.
-  const filtered = useMemo(() => {
-    let base: LibraryItem[];
-    if (status === "all") {
-      base = buckets[filter];
-    } else {
-      base = [];
-      for (const i of items) {
-        if (!i || i.removed) continue;
-        if (!itemMatchesTypeFilter(i, filter)) continue;
-        if (status === "new-episodes") {
-          if (hasNewUnwatchedEpisode(i)) base.push(i);
-        } else if (libraryItemStatus(i) === status) {
-          base.push(i);
-        }
+  // The explicit library: live items minus auto-tracked entries (Stremio's
+  // `temp: true` flag, written by libraryWriteProgress after
+  // PROGRESS_WARMUP_S of playback). Those are how CW gets its "I never
+  // explicitly saved this, but it remembers where I left off" behavior; they
+  // belong in Continue Watching but NOT in the Library view, which reflects
+  // explicit user intent (Add to Library, Mark as Planned). The CW row reads
+  // library directly with its own filter, so excluding temp here does not
+  // affect CW. Matches Stremio's official client semantics.
+  //
+  // Its size is the header's "N items synced" and the "library is empty"
+  // test: both mean the WHOLE library, never what the filters leave.
+  const explicit = useMemo(() => classified.filter((c) => !c.item.temp), [classified]);
+  const libraryTotal = explicit.length;
+  const aggregateMeta: MetaPreview[] = useMemo(() => explicit.map((c) => c.meta), [explicit]);
+
+  // Every filter EXCEPT the media-type pill, in one pass. The pill counts
+  // are faceted over this list and the grid narrows the same list by pill,
+  // so a pill's count is exactly what selecting it would show, and picking
+  // Movies leaves the other pills' numbers alone.
+  //
+  // Status "all" keeps the grid as it always was: the explicit library
+  // (temp excluded). A chosen status rebuilds from ALL live items (temp
+  // included) so "In Progress" / "Watched" surface Continue-Watching content
+  // the user never explicitly added, then narrows to that status.
+  // `manualVersion` / `signalsVersion` are in the deps so the set re-derives
+  // when a mark flips or a release signal lands.
+  //
+  // The airing narrow is the cheap path (cloud next_aired via the shared
+  // predicate, no per-item meta fetch on a toggle); naturally empty for
+  // guests / opted-out. The dedicated Airing page is the exhaustive surface.
+  // The year / genre gate is FilterBar's own predicate (Library applies its
+  // own Sort By below, so FilterState.sort plays no part here).
+  const typeAgnostic = useMemo(() => {
+    // An emptied library reads empty and unmounts the status control, so the
+    // pills must not keep counting temp items under a status left set.
+    const source = status === "all" || explicit.length === 0 ? explicit : classified;
+    const out: ClassifiedItem[] = [];
+    for (const c of source) {
+      if (status === "new-episodes") {
+        if (!hasNewUnwatchedEpisode(c.item)) continue;
+      } else if (status !== "all" && libraryItemStatus(c.item) !== status) {
+        continue;
       }
+      if (extraFilters.airingOnly && !isAiring(c.item)) continue;
+      if (!matchesFilterState(c.meta, extraFilters)) continue;
+      out.push(c);
     }
-    // Airing-only narrow. Cheap path (cloud next_aired via the shared predicate,
-    // no per-item meta fetch on a filter toggle); naturally empty for guests /
-    // opted-out. The dedicated Airing page is the exhaustive surface.
-    if (extraFilters.airingOnly) base = base.filter((i) => isAiring(i));
-    return base;
+    return out;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [status, filter, buckets, items, manualVersion, signalsVersion, animeCacheVersion, extraFilters.airingOnly]);
+  }, [status, explicit, classified, extraFilters, manualVersion, signalsVersion]);
 
-  // Project library items into MetaPreview shape so the panel's genre /
-  // year filter can run uniformly across every browseable surface. The
-  // conversion is cheap; library typically tops out around a few
-  // hundred entries even for heavy users.
-  const filteredAsMeta: MetaPreview[] = useMemo(
-    () => filtered.map(libraryItemToMeta),
-    [filtered],
-  );
-  const aggregateMeta: MetaPreview[] = useMemo(
-    () => buckets.all.map(libraryItemToMeta),
-    [buckets.all],
-  );
-  // The header Filter & Sort panel now owns BOTH axes for Library:
-  // year / genre filtering via applyFilters, and the Sort By choice via
-  // the panel's sortOptions (wired to `sort` / `setSort`). So we run
-  // applyFilters purely for its FILTER pass (extraFilters.sort stays
-  // "default") and apply Library's own ctime / mtime / alpha ordering
-  // on top — no more dual-control override to reconcile.
-  const filterApplied = useMemo(
-    () => applyFilters(filteredAsMeta, extraFilters),
-    [filteredAsMeta, extraFilters],
-  );
-  const filteredMetaIds = useMemo(
-    () => new Set(filterApplied.map((m) => m.id)),
-    [filterApplied],
+  // Lenient name filter (see looseMatch), still type-agnostic so the pill
+  // counts follow what the search leaves.
+  const searchedAgnostic = useMemo(() => {
+    const q = search.trim();
+    if (!q) return typeAgnostic;
+    return typeAgnostic.filter((c) => looseMatch(q, c.item.name ?? ""));
+  }, [typeAgnostic, search]);
+
+  const counts = useMemo(
+    () => facetCounts(searchedAgnostic, (c) => c.kinds),
+    [searchedAgnostic],
   );
 
-  const sorted = useMemo(() => {
-    const arr = filtered.filter((it) => filteredMetaIds.has(it.id));
+  // The grid: the pill's slice of the same list, in Library's own
+  // ctime / mtime / alpha order.
+  const searched = useMemo(() => {
+    const arr: LibraryItem[] = [];
+    for (const c of searchedAgnostic) {
+      if (kindMatches(c.kinds, filter)) arr.push(c.item);
+    }
     switch (sort) {
       case "alpha":
         arr.sort((a, b) => (a.name ?? "").localeCompare(b.name ?? ""));
@@ -580,14 +596,60 @@ function LibraryViewBody({ library, session, onSelectMeta, onRemoveItem, onAutoR
         break;
     }
     return arr;
-  }, [filtered, sort, filteredMetaIds]);
+  }, [searchedAgnostic, filter, sort]);
 
-  // Final name-filter pass over the already sorted/filtered list.
-  const searched = useMemo(() => {
-    const q = search.trim();
-    if (!q) return sorted;
-    return sorted.filter((it) => looseMatch(q, it.name ?? ""));
-  }, [sorted, search]);
+  // Options and Filter & Sort side by side. Both panels hang `right-0` under
+  // their own trigger, so with both open the Filter panel (later in the DOM)
+  // painted over Options. While the Filter panel is open, Options slides
+  // left by just enough to clear it, clamped so it never passes the scroll
+  // container's left edge (that container clips it). Measured from the two
+  // TRIGGERS, not the panels, so the shift is already known when Options
+  // mounts and it opens in place instead of sliding out from under Filter.
+  const hasHeaderMenus = aggregateMeta.length > 0;
+  const optionsAnchorRef = useRef<HTMLDivElement>(null);
+  const filterAnchorRef = useRef<HTMLDivElement>(null);
+  const [optionsShift, setOptionsShift] = useState(0);
+  // Unmounting the panel fires no pointerleave, so the hover flag is cleared
+  // when Options closes (else the next open would inherit a stale hold).
+  useEffect(() => {
+    if (!optionsOpen) setOptionsPanelHovered(false);
+  }, [optionsOpen]);
+  const holdOptionsShift = optionsOpen && optionsPanelHovered;
+  useLayoutEffect(() => {
+    if (!hasHeaderMenus) return;
+    const measure = () => {
+      const o = optionsAnchorRef.current;
+      const f = filterAnchorRef.current;
+      if (!o || !f) return;
+      // Filter closed while the pointer is inside Options (a hover-opened
+      // Filter panel closes as the pointer crosses into Options; the gap
+      // between the cards counts as Options, see the strip in
+      // LibraryOptionsMenu, so the hover lands first): keep the
+      // current position until the pointer leaves, so the row under the
+      // cursor stays under it. It slides back once the pointer is out.
+      if (!filterMenuOpen && holdOptionsShift) return;
+      const oRight = o.getBoundingClientRect().right;
+      const fRight = f.getBoundingClientRect().right;
+      const wanted = filterMenuOpen
+        ? MENU_PANEL_W + MENU_PANEL_GAP - (fRight - oRight)
+        : 0;
+      const leftLimit = (scrollContainerRef.current?.getBoundingClientRect().left ?? 0) + MENU_EDGE;
+      const room = oRight - MENU_PANEL_W - leftLimit;
+      const next = Math.round(Math.max(0, Math.min(wanted, room)));
+      setOptionsShift((prev) => (prev === next ? prev : next));
+    };
+    measure();
+    // The triggers move when the window resizes and when the Filter trigger
+    // grows its "active" dot (the cluster is right-aligned).
+    const ro = new ResizeObserver(measure);
+    if (optionsAnchorRef.current) ro.observe(optionsAnchorRef.current);
+    if (filterAnchorRef.current) ro.observe(filterAnchorRef.current);
+    window.addEventListener("resize", measure);
+    return () => {
+      ro.disconnect();
+      window.removeEventListener("resize", measure);
+    };
+  }, [filterMenuOpen, holdOptionsShift, hasHeaderMenus]);
 
   // Windowing — only the cards in/near the viewport are mounted.
   const win = useLibraryRowWindow(scrollContainerRef, gridWrapperRef, gridRef, searched.length);
@@ -605,7 +667,7 @@ function LibraryViewBody({ library, session, onSelectMeta, onRemoveItem, onAutoR
     <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
       <div
         ref={scrollContainerRef}
-        className="flex-1 overflow-y-auto"
+        className="aura-page-scroller flex-1 overflow-y-auto"
         style={{ scrollbarWidth: "thin", scrollbarColor: "rgba(255,255,255,0.08) transparent" }}
       >
         {/* Width-capped, centered column. NOTE: `max-w-6xl` (or any
@@ -621,64 +683,61 @@ function LibraryViewBody({ library, session, onSelectMeta, onRemoveItem, onAutoR
               <p className="text-white/35 text-sm mt-1">
                 {isLoading
                   ? "Loading your synced library…"
+                  : session && loadFailed && libraryTotal === 0
+                    ? "Could not load your library."
                   : session
-                    ? `${counts.all} item${counts.all === 1 ? "" : "s"} synced from your Stremio account.`
+                    ? `${libraryTotal} item${libraryTotal === 1 ? "" : "s"} synced from your Stremio account.`
                     : "Sign in to your Stremio account to see your saved library here."}
               </p>
             </div>
 
-            {aggregateMeta.length > 0 && (
+            {hasHeaderMenus && (
               <div className="flex items-center gap-2">
-                <LibraryOptionsMenu
-                  open={optionsOpen}
-                  onOpenChange={setOptionsOpen}
-                  autoRemove={autoRemove}
-                  onToggle={toggleAutoRemove}
-                />
-                <FilterMenu
-                  items={aggregateMeta}
-                  state={extraFilters}
-                  onChange={setExtraFilters}
-                  sortOptions={LIBRARY_SORT_OPTIONS}
-                  sortValue={sort}
-                  onSortChange={(v) => setSort(v as SortMode)}
-                  statusOptions={LIBRARY_STATUS_OPTIONS}
-                  statusValue={status}
-                  onStatusChange={(v) => setStatus(v as LibraryStatusFilter)}
-                  showAiringToggle
-                />
+                {/* `data-library-header-menu` marks both menus as one cluster:
+                    Options' outside-click guard ignores a pointerdown inside
+                    either, so working the Filter panel never closes Options. */}
+                <div ref={optionsAnchorRef} data-library-header-menu="">
+                  <LibraryOptionsMenu
+                    open={optionsOpen}
+                    onOpenChange={setOptionsOpen}
+                    autoRemove={autoRemove}
+                    onToggle={toggleAutoRemove}
+                    shiftX={optionsShift}
+                    onPanelHoverChange={setOptionsPanelHovered}
+                  />
+                </div>
+                <div ref={filterAnchorRef} data-library-header-menu="">
+                  <FilterMenu
+                    items={aggregateMeta}
+                    state={extraFilters}
+                    onChange={setExtraFilters}
+                    sortOptions={LIBRARY_SORT_OPTIONS}
+                    sortValue={sort}
+                    onSortChange={(v) => setSort(v as SortMode)}
+                    statusOptions={LIBRARY_STATUS_OPTIONS}
+                    statusValue={status}
+                    onStatusChange={(v) => setStatus(v as LibraryStatusFilter)}
+                    showAiringToggle
+                    onOpenChange={setFilterMenuOpen}
+                  />
+                </div>
               </div>
             )}
           </div>
 
-          {/* ── Shell: filter pills (always render; counts may be 0) ── */}
+          {/* ── Shell: filter pills (always render; counts may be 0) ──
+              Faceted counts: each pill shows what selecting it would show
+              under the current status / airing / year / genre / search. */}
           <div className="flex items-center gap-2 flex-wrap">
-            {(["all", "movie", "series", "anime"] as Filter[]).map((f) => {
-              const label =
-                f === "all"   ? "All"   :
-                f === "movie" ? "Movies" :
-                f === "series"? "Series" : "Anime";
-              const isActive = filter === f;
-              return (
-                <button
-                  key={f}
-                  onClick={() => setFilter(f)}
-                  disabled={isLoading}
-                  className={`nav-tap flex items-center gap-2 px-3.5 py-1.5 rounded-full text-xs font-medium
-                              border transition-colors disabled:opacity-40
-                              ${isActive
-                                ? "bg-ln-accent/20 text-ln-accent border-ln-accent/30"
-                                : "bg-white/5 text-white/55 border-white/10 hover:text-white/80 hover:bg-white/8"
-                              }`}
-                >
-                  {label}
-                  <span className="text-[10px] tabular-nums opacity-70">
-                    {counts[f]}
-                  </span>
-                </button>
-              );
-            })}
-            {counts.all > 0 && (
+            <MediaTypePills
+              value={filter}
+              onChange={setFilter}
+              counts={counts}
+              disabled={isLoading}
+            />
+            {/* Keyed on the WHOLE library, not the faceted count: a search
+                that matches nothing must not hide the box it is typed in. */}
+            {libraryTotal > 0 && (
               <ListSearchInput
                 value={search}
                 onChange={setSearch}
@@ -694,7 +753,21 @@ function LibraryViewBody({ library, session, onSelectMeta, onRemoveItem, onAutoR
             <SkeletonGrid />
           ) : !session ? (
             <EmptyCard message="Sign in to your Stremio account in the Addons tab to load your library." />
-          ) : counts.all === 0 ? (
+          ) : loadFailed && libraryTotal === 0 ? (
+            <div className="glass-panel rounded-2xl px-6 py-10 text-center space-y-3">
+              <p className="text-white/65 text-sm">
+                Could not load your library. Check your connection and try again.
+              </p>
+              <button
+                type="button"
+                onClick={onRetryLoad}
+                className="px-4 py-1.5 rounded-lg border border-white/15 bg-white/5
+                           text-white/80 text-[12px] font-medium hover:bg-white/10 transition-colors"
+              >
+                Retry
+              </button>
+            </div>
+          ) : libraryTotal === 0 ? (
             <EmptyCard message='Your library is empty. Right-click any catalog poster and choose "Add to Library" to start curating.' />
           ) : searched.length === 0 ? (
             <EmptyCard
@@ -753,20 +826,32 @@ function LibraryViewBody({ library, session, onSelectMeta, onRemoveItem, onAutoR
 // ---------------------------------------------------------------------------
 
 function LibraryOptionsMenu({
-  open, onOpenChange, autoRemove, onToggle,
+  open, onOpenChange, autoRemove, onToggle, shiftX, onPanelHoverChange,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   autoRemove: { movie: boolean; series: boolean };
   onToggle: (kind: AutoRemoveKind) => void;
+  /** How far left (px) the panel sits from its trigger, to clear an open
+   *  Filter & Sort panel. Computed by the view, which can see both triggers. */
+  shiftX: number;
+  /** Whether the pointer is over the open panel, so the view can hold
+   *  `shiftX` while the user works in it. */
+  onPanelHoverChange: (hovered: boolean) => void;
 }) {
   // Click-outside to close - the panel pins open on click (unlike FilterMenu's
-  // hover model) since it holds toggles the user interacts with.
+  // hover model) since it holds toggles the user interacts with. A pointerdown
+  // inside the header menu cluster (this menu or Filter & Sort, both marked
+  // `data-library-header-menu`) is not "outside": the two panels are meant
+  // to be used side by side.
   const wrapRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     if (!open) return;
     const onDown = (e: PointerEvent) => {
-      if (wrapRef.current && !wrapRef.current.contains(e.target as Node)) onOpenChange(false);
+      const target = e.target as Node | null;
+      if (!target || wrapRef.current?.contains(target)) return;
+      if (target instanceof Element && target.closest("[data-library-header-menu]")) return;
+      onOpenChange(false);
     };
     window.addEventListener("pointerdown", onDown);
     return () => window.removeEventListener("pointerdown", onDown);
@@ -793,7 +878,37 @@ function LibraryOptionsMenu({
       </button>
 
       {open && (
-        <div className="absolute right-0 top-full z-50 pt-2">
+        <div
+          className="absolute right-0 top-full z-50 pt-2"
+          onPointerEnter={() => onPanelHoverChange(true)}
+          onPointerLeave={() => onPanelHoverChange(false)}
+          style={{
+            transform: shiftX ? `translateX(${-shiftX}px)` : undefined,
+            // A short slide as Filter & Sort opens or closes beside it;
+            // instant under reduced motion.
+            transition: prefersReducedMotion()
+              ? undefined
+              : "transform 180ms cubic-bezier(0.2, 0.8, 0.2, 1)",
+          }}
+        >
+          {/* Shifted beside an open Filter & Sort panel, the two cards sit
+              MENU_PANEL_GAP apart and that strip belonged to neither. A
+              hover-opened Filter closed the moment the pointer entered it,
+              before Options reported a hover, so the hold in the view never
+              engaged and Options slid back under a pointer on its way to it.
+              This transparent strip makes the gap part of Options' hover
+              region: crossing out of Filter now enters Options in the same
+              pointer event, and the hold is set before Filter reports closed.
+              Only while shifted (unshifted it would just block the grid); in
+              the clamped, overlapping case Filter's later panel paints over it
+              and still owns those pixels. */}
+          {shiftX > 0 && (
+            <div
+              aria-hidden
+              className="absolute top-0 bottom-0"
+              style={{ left: "100%", width: MENU_PANEL_GAP }}
+            />
+          )}
           <div className="w-72 aura-glass-menu rounded-2xl p-4 shadow-2xl space-y-3">
             <div className="space-y-0.5">
               <p className="text-white/85 text-[13px] font-semibold">Auto-remove watched</p>
@@ -809,7 +924,7 @@ function LibraryOptionsMenu({
             />
             <AutoRemoveToggleRow
               label="Watched series"
-              tip="Removes a series from your Library once every aired episode is watched. Series still airing new episodes stay until they finish."
+              tip="Removes a series from your Library once every aired episode is watched, or when you mark a finished series watched. Series still airing new episodes stay until they finish."
               on={autoRemove.series}
               onClick={() => onToggle("series")}
             />
@@ -818,6 +933,10 @@ function LibraryOptionsMenu({
       )}
     </div>
   );
+}
+
+function prefersReducedMotion(): boolean {
+  return document.documentElement.getAttribute("data-reduced-motion") === "true";
 }
 
 function AutoRemoveToggleRow({
@@ -1074,7 +1193,7 @@ const LibraryCard = memo(function LibraryCard({
             onRemove(item, { x: e.clientX, y: e.clientY });
           }}
           className="absolute top-2 right-2 w-7 h-7 rounded-full
-                     bg-black/70 backdrop-blur-md border border-white/20
+                     bg-black/70 border border-white/20
                      text-white/85 hover:text-white hover:bg-rose-500/40
                      hover:border-rose-300/50
                      flex items-center justify-center

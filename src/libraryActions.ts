@@ -2,8 +2,12 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { invoke } from "@tauri-apps/api/core";
-import type { LibraryItem, MetaPreview } from "./types";
+import type { AddonEntry, LibraryItem, MetaDetail, MetaPreview } from "./types";
 import { libraryItemSeriesId } from "./libraryNormalize";
+import { isAiring } from "./airing";
+import { releasedMs } from "./availableEarly";
+import { getMetaDetail } from "./metaCache";
+import { electMetaAddons } from "./addonElection";
 
 // ---------------------------------------------------------------------------
 // libraryActions — toggle membership of a meta in the user's Stremio library.
@@ -335,6 +339,24 @@ export async function libraryClearProgress(
   // write yet, the pull would round-trip the OLD non-zero state back).
 }
 
+/** A tombstone for one raw record: its own bytes with `removed: true`. */
+function tombstoneChange(item: LibraryItem, mtime: string): Record<string, unknown> {
+  return {
+    _id:        item.id,
+    type:       item.media_type,
+    name:       item.name,
+    poster:     item.poster ?? null,
+    background: item.background ?? null,
+    logo:       item.logo ?? null,
+    year:       item.year ?? null,
+    removed:    true,
+    temp:       item.temp ?? false,
+    _ctime:     item.ctime ?? mtime,
+    _mtime:     mtime,
+    state:      item.state ?? {},
+  };
+}
+
 /**
  * Aggressive remove — sends `removed: true` for every entry in `rawLibrary`
  * whose series-root id matches `seriesId`. This is the antidote to phantom
@@ -362,20 +384,7 @@ export async function libraryRemoveAll(
   }
 
   const mtime = nowIso();
-  const changes = matches.map((item) => ({
-    _id:        item.id,
-    type:       item.media_type,
-    name:       item.name,
-    poster:     item.poster ?? null,
-    background: item.background ?? null,
-    logo:       item.logo ?? null,
-    year:       item.year ?? null,
-    removed:    true,
-    temp:       item.temp ?? false,
-    _ctime:     item.ctime ?? mtime,
-    _mtime:     mtime,
-    state:      item.state ?? {},
-  }));
+  const changes = matches.map((item) => tombstoneChange(item, mtime));
 
   console.info(
     `[library] removeAll seriesId=${seriesId} (${matches.length} record${matches.length === 1 ? "" : "s"}): ` +
@@ -390,6 +399,112 @@ export async function libraryRemoveAll(
   }
   window.dispatchEvent(new CustomEvent("aura:library-changed"));
   return { removedCount: matches.length };
+}
+
+/**
+ * libraryRemoveAll for many titles in ONE library_put, so one sweep costs one
+ * write and one `aura:library-changed` refetch. All or nothing: a failed put
+ * throws. `removedIds` is the titles that had a raw record to tombstone; with
+ * none (the raw list not fetched yet) nothing is written.
+ */
+export async function libraryRemoveMany(
+  authKey: string,
+  seriesIds: string[],
+  rawLibrary: LibraryItem[],
+): Promise<{ removedCount: number; removedIds: string[] }> {
+  if (!authKey) return { removedCount: 0, removedIds: [] };
+  const wanted = new Set(seriesIds);
+  const matches = rawLibrary.filter((i) => wanted.has(libraryItemSeriesId(i.id)));
+  if (matches.length === 0) return { removedCount: 0, removedIds: [] };
+
+  const mtime = nowIso();
+  console.info(`[library] removeMany ${seriesIds.length} titles (${matches.length} records)`);
+  await invoke("library_put", {
+    authKey,
+    changes: matches.map((item) => tombstoneChange(item, mtime)),
+  });
+  window.dispatchEvent(new CustomEvent("aura:library-changed"));
+  return {
+    removedCount: matches.length,
+    removedIds: [...new Set(matches.map((i) => libraryItemSeriesId(i.id)))],
+  };
+}
+
+/** May auto-remove take this series out of the Library? Only when its episode
+ *  list is known and nothing is still to come: a future-dated episode
+ *  (autoAdvance's hasFutureEpisode rule, specials included) or the cloud's
+ *  next_aired. No list means no: isAiring alone answers false on a cold cache
+ *  for anyone without release signals. */
+export function seriesIsFinished(item: LibraryItem, detail: MetaDetail | null): boolean {
+  if (!detail?.videos?.length) return false;
+  const now = Date.now();
+  if (detail.videos.some((v) => { const t = releasedMs(v); return t != null && t > now; })) return false;
+  return !isAiring(item, detail);
+}
+
+/** One rule over every provider's answer: an addon listing only aired episodes
+ *  says nothing about what another dates ahead, so no single list can elect. */
+export function seriesFinishedAcross(item: LibraryItem, answers: MetaDetail[]): boolean {
+  const listed = answers.filter((d) => d.videos?.length);
+  return listed.length > 0 && listed.every((d) => seriesIsFinished(item, d));
+}
+
+/** An elected addon that names neither meta nor id prefixes of its own: the
+ *  election's open-resource and open-prefix tiers (evaluate in addonElection.ts
+ *  reads the same two fields). It is asked about ids it may never have heard of,
+ *  so its silence means nothing. */
+function isMetaCatchAll(addon: AddonEntry): boolean {
+  return !addon.resources?.length || !addon.id_prefixes?.length;
+}
+
+/** Every elected provider's episode list for an id, cache hits first. `failed`
+ *  means a provider that claims this id gave no list (an error, a 404, a nameless
+ *  or thin answer: an upstream slowdown looks like all of them) and the walk
+ *  stopped, so the list is incomplete. A catch-all's silence neither blocks nor
+ *  counts: it would otherwise keep every series forever. */
+export async function everyMetaAnswer(
+  addons: AddonEntry[],
+  mediaType: string,
+  id: string,
+): Promise<{ answers: MetaDetail[]; failed: boolean }> {
+  const answers: MetaDetail[] = [];
+  for (const a of electMetaAddons(addons, mediaType, id)) {
+    const detail = await getMetaDetail(a, mediaType, id);
+    if (detail?.videos?.length) answers.push(detail);
+    else if (!isMetaCatchAll(a)) return { answers, failed: true };
+  }
+  return { answers, failed: false };
+}
+
+/** The check before a series is tombstoned. Fails closed: a provider that claims
+ *  the id and gave no list may be the one that dates the next episode. */
+export async function seriesFinishCheck(
+  addons: AddonEntry[],
+  item: LibraryItem,
+): Promise<"finished" | "not-finished" | "failed"> {
+  const mt = (item.media_type ?? "").toLowerCase();
+  const { answers, failed } = await everyMetaAnswer(addons, mt, item.id);
+  if (failed) return "failed";
+  return seriesFinishedAcross(item, answers) ? "finished" : "not-finished";
+}
+
+/** The series of a backlog that seriesFinishCheck confirms. A few at a time (each
+ *  miss is a fetch per provider), and it gives up after a few failures rather
+ *  than wait out every timeout: the rest stay in the Library. */
+export async function finishedSeriesOf(addons: AddonEntry[], items: LibraryItem[]): Promise<LibraryItem[]> {
+  const finished: LibraryItem[] = [];
+  let next = 0;
+  let failures = 0;
+  const worker = async () => {
+    while (next < items.length && failures < 3) {
+      const item = items[next++];
+      const verdict = await seriesFinishCheck(addons, item).catch(() => "failed" as const);
+      if (verdict === "finished") finished.push(item);
+      else if (verdict === "failed") failures += 1;
+    }
+  };
+  await Promise.all([worker(), worker(), worker()]);
+  return finished;
 }
 
 export { SESSION_EXPIRED };

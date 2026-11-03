@@ -735,6 +735,20 @@ function HomeViewBody({
   const scrollRef = useMemo(() => ({ current: scrollEl }), [scrollEl]);
   /** Everything above the catalog rows (hero + Continue Watching). */
   const leadRef = useRef<HTMLDivElement>(null);
+  /** The scroller's scrollbar. The floating search bar sits outside the scroller,
+   *  so it has to leave the same room to centre over what is inside it. */
+  const [scrollbarW, setScrollbarW] = useState(0);
+  useEffect(() => {
+    // Not reset when the scroller unmounts for search results, whose own
+    // scrollbar would otherwise walk the bar sideways on every search.
+    if (!scrollEl) return;
+    const measure = () => setScrollbarW(scrollEl.offsetWidth - scrollEl.clientWidth);
+    measure();
+    // A scrollbar appearing shrinks the content box, which this does observe.
+    const ro = new ResizeObserver(measure);
+    ro.observe(scrollEl);
+    return () => ro.disconnect();
+  }, [scrollEl]);
 
   return (
     <div className="relative flex-1 flex flex-col min-w-0 overflow-hidden">
@@ -752,7 +766,14 @@ function HomeViewBody({
           it as the page scrolls.
           The scroller below compensates with matching top padding, so no
           content is permanently parked underneath. */}
-      <div className="absolute inset-x-0 top-0 z-30 pt-4 pb-2 px-6 pointer-events-none">
+      <div
+        // 36 px each side: the scroller's px-3 plus the hero row's px-6. It was
+        // px-6 alone over the full width, so the hero sat half a scrollbar left
+        // of the bar's centre, and on a window narrow enough not to reach the
+        // hero's maximum width the bar was also wider than the hero.
+        className="absolute inset-x-0 top-0 z-30 pt-4 pb-2 pl-9 pointer-events-none"
+        style={{ paddingRight: 36 + scrollbarW }}
+      >
         <div
           className="mx-auto relative w-full pointer-events-auto"
           style={{ maxWidth: HERO_MAX_WIDTH }}
@@ -789,7 +810,7 @@ function HomeViewBody({
           // rows already self-pad (px-6) so net layout shift is minor and
           // uniform, and the symmetrical right inset softens the (latent)
           // identical clip on the rightmost card.
-          className="flex-1 min-h-0 overflow-y-auto px-3 pt-[66px]"
+          className="aura-page-scroller flex-1 min-h-0 overflow-y-auto px-3 pt-[66px]"
           style={{ scrollbarWidth: "thin", scrollbarColor: "rgba(255,255,255,0.08) transparent" }}
         >
           {/* Empty state when no addons */}

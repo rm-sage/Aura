@@ -399,6 +399,11 @@ pub fn set_media_loaded(loaded: bool) {
     MEDIA_LOADED.store(loaded, Ordering::Release);
 }
 
+/// Whether mpv has a file loaded. See `MEDIA_LOADED`.
+pub fn media_loaded() -> bool {
+    MEDIA_LOADED.load(Ordering::Acquire)
+}
+
 /// Whether a re-park is due: hidden to the tray, not parked yet, and nothing
 /// blocks a park. Pure over the flags, so the gating can be tested.
 fn repark_due() -> bool {
@@ -978,6 +983,12 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) {
                     // lose the list, which would strand .aurapart files with
                     // nothing pointing at them.
                     crate::downloads::shutdown();
+
+                    // Write the watch history if a coalesced write is still
+                    // pending (history_store.rs holds it for ~1.5 s). Same
+                    // reasoning as the download list: synchronous, small,
+                    // and never subject to the deadline below.
+                    crate::history_store::flush_blocking();
 
                     // MANDATORY + main-thread only: the engine join pumps Win32
                     // messages (a child DestroyWindow posts WM_PARENTNOTIFY back

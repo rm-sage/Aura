@@ -558,6 +558,8 @@ export function peekFreshestPostersByIds(ids: Iterable<string>): Map<string, str
  *  localStorage key, but also exposed here for "refresh metadata"
  *  actions that want to invalidate without touching localStorage. */
 export function clearMetaCache(): void {
+  if (persistTimer) clearTimeout(persistTimer);
+  persistTimer = null;
   cache.clear();
   idYearIndex.clear(); // otherwise the Storage→clear button leaves it resident
   try { localStorage.removeItem(STORAGE_KEY); } catch { /* ignore */ }

@@ -318,6 +318,25 @@ export function NotificationsProvider({ children }: { children: ReactNode }) {
     return () => window.removeEventListener("aura:notifications-rehydrate", onRehydrate);
   }, []);
 
+  // Settings > Storage cleared the list. A clear is local: the persist effect
+  // must not write it again or fire the change event that publishes it, so
+  // lastPersistedRef is set first. Update banners are device-local, not history.
+  useEffect(() => {
+    const onCleared = () => {
+      setNotifications((prev) => {
+        const kept = prev.filter((n) => n.kind === "update");
+        const serialized = JSON.stringify(kept);
+        lastPersistedRef.current = serialized;
+        if (kept.length > 0) {
+          try { localStorage.setItem(STORAGE_KEY, serialized); } catch { /* non-fatal */ }
+        }
+        return kept;
+      });
+    };
+    window.addEventListener("aura:notifications-cleared", onCleared);
+    return () => window.removeEventListener("aura:notifications-cleared", onCleared);
+  }, []);
+
   const addNotification = useCallback<NotificationsCtxValue["addNotification"]>((n) => {
     const id = n.id ?? `${n.kind}:${n.title}`;
     // Re-fire guard for aired-content alerts: an `episode`/`release`

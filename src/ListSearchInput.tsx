@@ -49,13 +49,21 @@ export default function ListSearchInput({
             e.preventDefault();
             e.stopPropagation();
             onChange("");
+          } else if (e.key === "Escape") {
+            // Nothing left to clear: give the keys back to the page, or Ctrl+F
+            // would strand them here (useKeybindings ignores a focused input).
+            e.currentTarget.blur();
           }
         }}
         placeholder={placeholder ?? "Filter…"}
+        data-aura-search
         spellCheck={false}
         aria-label={ariaLabel ?? placeholder ?? "Filter list"}
+        // 5 px above and 7 below instead of py-1.5 (same height): the UI font's
+        // metrics put its ink 1-2 px under the line box's centre, which left the
+        // text sitting visibly lower than the search icon beside it.
         className="w-full bg-white/5 border border-white/10 rounded-full
-                   pl-8 pr-8 py-1.5 text-xs text-white/85
+                   pl-8 pr-8 pt-[5px] pb-[7px] text-xs text-white/85
                    placeholder:text-white/30 outline-none transition-colors
                    hover:border-white/20 focus:border-white/30 focus:bg-black/30"
       />
@@ -80,8 +88,10 @@ export default function ListSearchInput({
 // "a little leeway" so the filter isn't brittle:
 //
 //   1. Normalize both sides: lowercase, strip diacritics (NFD then drop the
-//      combining marks U+0300–U+036F), collapse every run of non-alphanumerics
-//      to a single space.
+//      combining marks U+0300-U+036F), collapse every run of anything but
+//      letters, numbers and other marks to a single space. Those other marks
+//      stay because NFD splits a voiced kana or an Indic vowel sign off its
+//      base, and as separators they would cut a title into fragments.
 //   2. Token-AND: every whitespace-separated query token must appear as a
 //      substring of the text. ORDER-INDEPENDENT, matches partial words —
 //      "stone dr" and "dr sto" both match "Dr. Stone".
@@ -94,6 +104,8 @@ export default function ListSearchInput({
 // contiguous is the sweet spot between exact-substring and noise.
 // ---------------------------------------------------------------------------
 
+const KEEP_NON_ASCII = /[\p{L}\p{N}\p{M}]/u;
+
 function normalize(s: string): string {
   const decomposed = s.toLowerCase().normalize("NFD");
   let out = "";
@@ -101,15 +113,19 @@ function normalize(s: string): string {
     const c = ch.codePointAt(0) ?? 0;
     // Combining diacritical marks → drop (the base letter survived NFD).
     if (c >= 0x300 && c <= 0x36f) continue;
-    // a-z or 0-9 survive; everything else becomes a separator space.
-    out += ((c >= 0x61 && c <= 0x7a) || (c >= 0x30 && c <= 0x39)) ? ch : " ";
+    // Letters, numbers and other marks survive; everything else becomes a
+    // separator space.
+    const keep = (c >= 0x61 && c <= 0x7a) || (c >= 0x30 && c <= 0x39)
+      || (c >= 0x80 && KEEP_NON_ASCII.test(ch));
+    out += keep ? ch : " ";
   }
   return out.replace(/ +/g, " ").trim();
 }
 
 export function looseMatch(query: string, text: string): boolean {
+  if (!query.trim()) return true; // empty query matches everything
   const q = normalize(query);
-  if (!q) return true;            // empty query matches everything
+  if (!q) return false;           // only punctuation: a search with no match
   const t = normalize(text);
   if (!t) return false;
 

@@ -25,7 +25,10 @@ import ReactDOM from "react-dom/client";
 import * as Sentry from "@sentry/react";
 import { invoke } from "@tauri-apps/api/core";
 import App from "./App";
-import { applyReducedMotionAttribute } from "./auraSettings";
+import { installSearchHotkey } from "./searchHotkey";
+import { installScrollPause } from "./scrollPause";
+import { installWheelSmooth } from "./wheelSmooth";
+import { applyReducedMotionAttribute, loadAuraSettings } from "./auraSettings";
 
 // Synchronous reduced-motion gate, fired BEFORE React mounts so the
 // initial paint already carries `<html data-reduced-motion="true|false">`.
@@ -220,6 +223,11 @@ window.addEventListener(
   },
   { capture: true },
 );
+
+// Ctrl+F and no native find bar. Before React mounts, like the listener above.
+installSearchHotkey();
+installScrollPause();
+installWheelSmooth(() => loadAuraSettings().smoothWheelScroll);
 
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
   <React.StrictMode>

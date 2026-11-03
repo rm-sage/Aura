@@ -471,6 +471,8 @@ export type KeybindAction =
   | "volume-up"
   | "volume-down"
   | "toggle-osd"
+  // Handled in PerfMonitor.tsx: it has to work while typing and on every screen.
+  | "perf-monitor"
   | "cycle-shader"
   | "toggle-subtitles"
   | "fullscreen"
@@ -500,6 +502,7 @@ export const KEYBIND_ACTIONS: { id: KeybindAction; label: string; description: s
   { id: "volume-up",        label: "Volume Up",            description: "Increase volume by 5%" },
   { id: "volume-down",      label: "Volume Down",          description: "Decrease volume by 5%" },
   { id: "toggle-osd",       label: "Toggle Performance OSD", description: "Show or hide the perf overlay" },
+  { id: "perf-monitor",     label: "Toggle Performance Monitor", description: "Open or close the window of live graphs showing what Aura is using, anywhere in the app" },
   { id: "cycle-shader",     label: "Cycle Shader Profile", description: "Step through upscaling profiles" },
   { id: "toggle-subtitles", label: "Toggle Subtitles",     description: "Open or close the subtitle picker" },
   { id: "fullscreen",       label: "Toggle Fullscreen",    description: "Enter or leave fullscreen during playback" },

@@ -115,8 +115,19 @@ export default function SearchBar({
         setFocused(false);
       }
     };
+    // Focus on a recents button, or fallen to the body when the focused button
+    // removed itself. The input keeps its own Esc (clear first, then close).
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      if (e.target instanceof HTMLInputElement && containerRef.current?.contains(e.target)) return;
+      setFocused(false);
+    };
     window.addEventListener("mousedown", onMouseDown);
-    return () => window.removeEventListener("mousedown", onMouseDown);
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("mousedown", onMouseDown);
+      window.removeEventListener("keydown", onKeyDown);
+    };
   }, [focused]);
 
   // Notify parent immediately when the input is cleared.
@@ -169,7 +180,16 @@ export default function SearchBar({
         />
       )}
 
-      <div ref={containerRef} className="aura-search-float relative z-40">
+      <div
+        ref={containerRef}
+        className="aura-search-float relative z-40"
+        // Tabbing out. A null relatedTarget is not "outside": it is also an
+        // Alt+Tab or a press on the dropdown's plain text.
+        onBlur={(e) => {
+          const next = e.relatedTarget;
+          if (next instanceof Node && !containerRef.current?.contains(next)) setFocused(false);
+        }}
+      >
         <div className="relative">
           <span className="absolute left-4 top-1/2 -translate-y-1/2 text-white/55 pointer-events-none z-10">
             <SearchIcon />
@@ -181,9 +201,14 @@ export default function SearchBar({
             onChange={(e) => setQuery(e.target.value)}
             onKeyDown={(e) => {
               if (e.key === "Escape") {
-                // Empty → close dropdown. Non-empty → clear (which fires
-                // onClear via the useEffect and exits search view).
-                if (query) setQuery(""); else setFocused(false);
+                // Empty → close dropdown and give the keys back to the page.
+                // Non-empty → clear (which fires onClear via the useEffect and
+                // exits search view).
+                if (query) setQuery("");
+                else {
+                  setFocused(false);
+                  e.currentTarget.blur();
+                }
               }
               if (e.key === "Enter") {
                 e.preventDefault();
@@ -191,6 +216,7 @@ export default function SearchBar({
               }
             }}
             placeholder="Search all sources…"
+            data-aura-search
             spellCheck={false}
             // The focus border is a `focus:` VARIANT, not a `focused`-state
             // ternary. `.aura-float-glass` sets the `border` shorthand at

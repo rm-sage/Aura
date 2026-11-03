@@ -393,6 +393,9 @@ function SettingsStep({
     if (Object.keys(patchBackend).length > 0) {
       try {
         await invoke("update_settings", { patch: patchBackend });
+        window.dispatchEvent(new CustomEvent("aura:backend-settings-changed", {
+          detail: { keys: Object.keys(patchBackend) },
+        }));
       } catch {
         // Non-fatal — user can refine in Settings later.
       }
@@ -402,6 +405,9 @@ function SettingsStep({
     if (typed.theme) {
       try {
         await invoke("set_theme", { theme: typed.theme });
+        window.dispatchEvent(new CustomEvent("aura:backend-settings-changed", {
+          detail: { keys: ["theme"] },
+        }));
       } catch {
         // Same fallback contract.
       }

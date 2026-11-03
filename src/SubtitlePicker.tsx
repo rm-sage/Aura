@@ -85,6 +85,17 @@ export default function SubtitlePicker({
     if (open) setQuery(initialQuery ?? "");
   }, [open, initialQuery]);
 
+  // Esc closes (capture phase, or App's listener would exit playback and the
+  // overlay's would leave fullscreen).
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); onClose(); }
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [open, onClose]);
+
   // Only the latest search may write state: a slow answer for an earlier
   // query or language must not replace the current one's results.
   const searchGenRef = useRef(0);
@@ -191,6 +202,7 @@ export default function SubtitlePicker({
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             placeholder="Title, episode, or filename…"
+            data-aura-search
             spellCheck={false}
             className="flex-1 h-9 bg-white/8 border border-white/12 rounded-lg px-3
                        text-[13.5px] placeholder:text-white/40 outline-none focus:border-white/30

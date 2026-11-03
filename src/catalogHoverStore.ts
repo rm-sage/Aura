@@ -11,8 +11,16 @@
 // card schedules open/close, the popup cancels the pending close on its own
 // mouseenter. Open is delayed (hover intent) so a fast mouse sweep across a
 // row doesn't fire a burst of meta fetches; close is delayed (leeway) so the
-// card→popup gap doesn't dismiss it. Update pattern mirrors
+// card→popup gap doesn't dismiss it. While the panel is already up (or
+// was a moment ago) moving to another card switches sooner, since the
+// user is browsing with it open; see SWITCH_DELAY_MS. Update pattern mirrors
 // releaseSignalStore / manualWatched (useSyncExternalStore).
+//
+// A panel that covers other cards lets the pointer through to them
+// (CatalogHoverCard's `covers`), so the card under it can still be hovered.
+// Holding Alt FREEZES it instead (setHoverFrozen): it takes the pointer and
+// ignores the cards, so it can be reached across them. What the cards asked for
+// meanwhile is kept, last request winning, and applied on release.
 // ---------------------------------------------------------------------------
 
 import { useSyncExternalStore } from "react";
@@ -28,6 +36,9 @@ export interface HoverTarget {
   /** Viewport rect of the card. Recomputed from `el` on scroll/resize
    *  so the panel tracks the card while the cursor still hovers it. */
   rect: DOMRect;
+  /** Where the cursor entered the card, which says which way it was going.
+   *  Absent when the panel was not opened by a hover. */
+  entry?: { x: number; y: number } | null;
 }
 
 let active: HoverTarget | null = null;
@@ -41,6 +52,39 @@ let closeTimer: ReturnType<typeof setTimeout> | null = null;
 // short enough to feel responsive on a deliberate hover.
 const OPEN_DELAY_MS = 450;
 const CLOSE_DELAY_MS = 220;
+// Once the panel is up the user is browsing WITH it, so the full intent
+// delay is just lag: moving from one card to its neighbour waited 450 ms
+// before the panel followed. A switch fires after SWITCH_DELAY_MS instead.
+// It stays above a card's crossing time on a normal sweep (well under
+// 150 ms per poster), so cards merely crossed still never fetch.
+const SWITCH_DELAY_MS = 240;
+// A card entered within SWEEP_GAP_MS of the previous one means the cursor
+// is travelling across the grid rather than settling, so the switch waits
+// a little longer for it to come to rest. The timer restarts on every
+// enter, so this only decides how long the RESTING card waits.
+const SWEEP_GAP_MS = 140;
+const SWEEP_DELAY_MS = 380;
+// A hover close that happened this recently still counts as "the panel is
+// up": crossing a gutter between two cards closes it (the close leeway is
+// shorter than a slow gutter crossing), and the next card should not then
+// pay the full cold-open delay.
+const WARM_AFTER_CLOSE_MS = 400;
+
+let lastEnterAt = -Infinity;
+let lastHoverCloseAt = -Infinity;
+
+interface OpenRequest {
+  kind: "open";
+  meta: MetaPreview;
+  el: HTMLElement;
+  entry: HoverTarget["entry"];
+}
+
+let frozen = false;
+/** What the cards asked for while frozen. */
+let deferred: OpenRequest | { kind: "close" } | null = null;
+/** The arguments of the open timer now running, to carry it into a freeze. */
+let pendingOpen: OpenRequest | null = null;
 
 function emit(): void {
   version += 1;
@@ -48,6 +92,7 @@ function emit(): void {
 }
 function clearOpen(): void {
   if (openTimer) { clearTimeout(openTimer); openTimer = null; }
+  pendingOpen = null;
 }
 function clearClose(): void {
   if (closeTimer) { clearTimeout(closeTimer); closeTimer = null; }
@@ -57,18 +102,59 @@ function clearClose(): void {
  *  Takes the card element (not a snapshot rect) so the rect is captured
  *  fresh when the open actually fires, and so scroll/resize can later
  *  re-anchor to its live box. */
-export function scheduleHoverOpen(meta: MetaPreview, el: HTMLElement): void {
+export function scheduleHoverOpen(meta: MetaPreview, el: HTMLElement, entry?: HoverTarget["entry"]): void {
+  if (frozen) {
+    deferred = { kind: "open", meta, el, entry };
+    return;
+  }
   clearClose();
   clearOpen();
-  openTimer = setTimeout(() => {
+  const now = performance.now();
+  const sweeping = now - lastEnterAt < SWEEP_GAP_MS;
+  lastEnterAt = now;
+  // Back onto the card whose panel is already up (the cursor went to the
+  // panel or a gutter and returned): nothing to switch to. Re-anchor at
+  // once instead of re-opening after a delay, since the card may have
+  // scrolled while the cursor sat on the panel (no re-anchor then). The id
+  // check covers a windowed grid that reuses one element for another title.
+  if (active && active.el === el && active.meta.id === meta.id) {
+    const r = el.getBoundingClientRect();
+    const a = active.rect;
+    if (r.left !== a.left || r.top !== a.top || r.width !== a.width || r.height !== a.height) {
+      active = { ...active, rect: r };
+      emit();
+    }
+    return;
+  }
+  const warm = active != null || now - lastHoverCloseAt < WARM_AFTER_CLOSE_MS;
+  const delay = !warm ? OPEN_DELAY_MS : sweeping ? SWEEP_DELAY_MS : SWITCH_DELAY_MS;
+  pendingOpen = { kind: "open", meta, el, entry };
+  const fire = () => {
+    // Still scrolling: this card only passed under a pointer that did not move. Wait
+    // for the scroll to settle (src/scrollPause.ts); a real leave cancels this timer.
+    if (document.documentElement.hasAttribute("data-aura-scrolling")) {
+      openTimer = setTimeout(fire, 120);
+      return;
+    }
     openTimer = null;
-    active = { meta, el, rect: el.getBoundingClientRect() };
+    pendingOpen = null;
+    // The card unmounted while waiting (no mouseleave comes from a removed
+    // element). A plain return would strand a panel still up on another card:
+    // this enter already cleared its close. Same for a context menu that is up:
+    // the panel is portalled above the app shell and would cover it.
+    if (!el.isConnected || document.querySelector("[data-aura-context-menu]")) {
+      scheduleHoverClose();
+      return;
+    }
+    active = { meta, el, rect: el.getBoundingClientRect(), entry };
     emit();
-  }, OPEN_DELAY_MS);
+  };
+  openTimer = setTimeout(fire, delay);
 }
 
 /** Card pointer-leave before the open fired — abort the pending open. */
 export function cancelHoverOpen(): void {
+  if (deferred?.kind === "open") deferred = null;
   clearOpen();
 }
 
@@ -82,10 +168,15 @@ export function cancelHoverOpen(): void {
  *  `loadAuraSettings()` is memoized and cache-busted on change, so cheap. */
 export function scheduleHoverClose(): void {
   if (loadAuraSettings().metaPanelActivation !== "hover") return;
+  if (frozen) {
+    deferred = { kind: "close" };
+    return;
+  }
   clearOpen();
   clearClose();
   closeTimer = setTimeout(() => {
     closeTimer = null;
+    if (active) lastHoverCloseAt = performance.now();
     active = null;
     emit();
   }, CLOSE_DELAY_MS);
@@ -93,13 +184,36 @@ export function scheduleHoverClose(): void {
 
 /** Popup (or re-entered card) pointer-enter — keep it open. */
 export function cancelHoverClose(): void {
+  if (deferred?.kind === "close") deferred = null;
   clearClose();
+}
+
+/** Alt held / released while the panel is up. A held panel stays where it is
+ *  and takes the pointer, whatever the cursor crosses on the way to it. */
+export function setHoverFrozen(on: boolean): void {
+  if (on === frozen || (on && !active)) return;
+  frozen = on;
+  if (on) {
+    // Whatever was about to happen still happens, on release.
+    deferred = pendingOpen ?? (closeTimer ? { kind: "close" } : null);
+    clearOpen();
+    clearClose();
+    emit();
+    return;
+  }
+  const d = deferred;
+  deferred = null;
+  emit();
+  if (d?.kind === "open") scheduleHoverOpen(d.meta, d.el, d.entry);
+  else if (d?.kind === "close") scheduleHoverClose();
 }
 
 /** Hard close — card click, route change. */
 export function closeHoverNow(): void {
   clearOpen();
   clearClose();
+  frozen = false;
+  deferred = null;
   if (active) {
     active = null;
     emit();
@@ -110,7 +224,8 @@ export function closeHoverNow(): void {
  *  optional mouse-button bind, where the open is an explicit user
  *  action rather than a hover so the 450 ms intent delay is wrong. */
 export function openHoverNow(meta: MetaPreview, el: HTMLElement): void {
-  clearClose();   // order mirrors scheduleHoverOpen's idiom (immaterial — independent timers)
+  if (!el.isConnected) return;
+  clearClose();  // order mirrors scheduleHoverOpen's idiom (immaterial: independent timers)
   clearOpen();
   active = { meta, el, rect: el.getBoundingClientRect() };
   emit();
@@ -167,6 +282,11 @@ export function refreshHoverAnchor(): void {
 function subscribe(cb: () => void): () => void {
   listeners.add(cb);
   return () => { listeners.delete(cb); };
+}
+
+/** Panel hook: is Alt holding the panel? */
+export function useHoverFrozen(): boolean {
+  return useSyncExternalStore(subscribe, () => frozen, () => frozen);
 }
 
 /** Host hook — re-renders the host when the active hover target changes. */

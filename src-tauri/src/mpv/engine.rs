@@ -1172,11 +1172,13 @@ unsafe fn drain_mpv_events(lib: &Libmpv, handle: *mut mpv_handle, emit: &EngineE
                 // The debug panel's drop test reads the counters via
                 // get_property instead.
                 if name == "frame-drop-count" {
+                    crate::perf_monitor::note_drops(false, data.as_i64());
                     crate::devlog!(
                         debug, "mpv",
                         "frame-drop-count → {data} (VO)",
                     );
                 } else if name == "decoder-frame-drop-count" {
+                    crate::perf_monitor::note_drops(true, data.as_i64());
                     crate::devlog!(
                         debug, "mpv",
                         "decoder-frame-drop-count → {data} (decoder)",
@@ -2522,6 +2524,27 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
                             .ok().and_then(|v| v.as_f64())
                     })
                     .filter(|v| v.is_finite() && *v >= 0.0);
+
+                // The Performance Monitor's video figures, read HERE because the
+                // engine thread cannot race its own seek. All but the frame rate
+                // and the buffer ceiling are already in the snapshot above; those
+                // two extra reads happen only while the window is open. The live
+                // cache-secs, not the setting: a cloud merge or import changes
+                // the setting without applying it to the engine.
+                if crate::perf_monitor::is_active() {
+                    let double = |name: &str| {
+                        get_property_generic(&lib, handle, name, GetFormat::Double)
+                            .ok().and_then(|v| v.as_f64())
+                    };
+                    let field = |k: &str| cache_state.as_ref().and_then(|v| v.get(k)).and_then(|v| v.as_f64());
+                    crate::perf_monitor::publish_video(
+                        double("estimated-vf-fps"),
+                        field("raw-input-rate"),
+                        cache_seconds,
+                        double("cache-secs"),
+                        field("total-bytes"),
+                    );
+                }
 
                 let mut m = serde_json::Map::new();
                 m.insert("paused_for_cache".into(), serde_json::Value::Bool(paused_for_cache));

@@ -21,8 +21,6 @@ import { getManualWatchedState } from "./manualWatched";
 import { isAnimeMeta } from "./aiometadata";
 import { cloudNextIsOut, releasedMs } from "./availableEarly";
 
-const DAY_MS = 24 * 60 * 60 * 1000;
-
 export type AirWindow = "today" | "week" | "later" | "none";
 
 /** Series / anime only — a movie can't "air". */
@@ -89,11 +87,13 @@ export function airingLastAiredMs(item: LibraryItem, detail?: MetaDetail | null)
  *  cloud-returning show with no concrete next date yet. */
 export function airWindow(ms: number | null, now: number = Date.now()): AirWindow {
   if (ms == null) return "none";
-  const startOfToday = new Date(now);
-  startOfToday.setHours(0, 0, 0, 0);
-  const endOfToday = startOfToday.getTime() + DAY_MS;
-  if (ms < endOfToday) return "today";
-  if (ms < startOfToday.getTime() + 7 * DAY_MS) return "week";
+  // Boundaries are built from date PARTS, never `midnight + n * 24 h`: a daylight
+  // saving day is 23 or 25 hours, which would move them off midnight by an hour.
+  const d = new Date(now);
+  const midnightIn = (days: number) =>
+    new Date(d.getFullYear(), d.getMonth(), d.getDate() + days).getTime();
+  if (ms < midnightIn(1)) return "today";
+  if (ms < midnightIn(7)) return "week";
   return "later";
 }
 

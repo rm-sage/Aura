@@ -133,8 +133,11 @@ export default function HeroBackdropPicker({
   useEffect(() => {
     const inside = (t: EventTarget | null) =>
       t instanceof Node && !!panelRef.current?.contains(t);
+    // The Performance Monitor floats over the app, it is not part of the page.
+    const onMonitor = (t: EventTarget | null) =>
+      t instanceof Element && !!t.closest("[data-perf-monitor]");
     const onMouseDown = (e: MouseEvent) => {
-      if (inside(e.target)) return;
+      if (inside(e.target) || onMonitor(e.target)) return;
       // A menu raised while the panel is open is not a DOM descendant of it.
       if (e.target instanceof Element && e.target.closest("[data-aura-context-menu]")) return;
       onClose();
@@ -142,7 +145,7 @@ export default function HeroBackdropPicker({
     // Scrolling somewhere else means the user has moved on. Scrolling the
     // tile grid itself is how a long list is browsed, so that is exempt.
     const onWheel = (e: WheelEvent) => {
-      if (!inside(e.target)) onClose();
+      if (!inside(e.target) && !onMonitor(e.target)) onClose();
     };
     // Capture phase, and stopped there: App's window-level Escape handler
     // would otherwise close the whole detail page along with the panel.

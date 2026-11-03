@@ -41,6 +41,7 @@ mod crash_reporting;
 mod devlog;
 mod download_path;
 mod downloads;
+mod history_store;
 mod log_export;
 mod manga_chapters;
 mod anime_id_map;
@@ -66,6 +67,8 @@ mod scrobble_anilist;
 mod scrobble_auth;
 mod scrobble_simkl;
 mod per_title;
+mod perf_monitor;
+mod service_status;
 mod settings;
 mod silencedetect;
 mod skipdetect;
@@ -1840,6 +1843,9 @@ pub fn run() {
             if crate::skipdetect::cancel_all() {
                 crate::devlog!(info, "skipdetect", "main page reloaded: cancelling detection");
             }
+            // The Performance Monitor's page is gone: its next sample, if the
+            // new page reopens it, starts over.
+            crate::perf_monitor::stop();
             #[cfg(target_os = "windows")]
             {
                 // A reloaded page restores no playback, so nothing is loaded.
@@ -2559,6 +2565,11 @@ pub fn run() {
             introdb::introdb,
             // ── Manga chapters (MangaUpdates + Fandom, one tagged command) ──
             manga_chapters::manga_chapters,
+            // ── Service status (title-bar monitor: Aura server, addons, relay, providers) ──
+            service_status::service_status,
+            perf_monitor::perf_monitor,
+            // ── Watch history (Rust-owned compact file per scope, one tagged command) ──
+            history_store::history_store,
             // ── Phase 3C: scrobbling ──────────────────────────────────────────
             scrobble::scrobble_start,
             scrobble::scrobble_heartbeat,

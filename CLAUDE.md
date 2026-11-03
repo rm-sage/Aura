@@ -562,8 +562,8 @@ after-credits scene on 10 of the 11 episodes that have one.
 
 `src-tauri/src/downloads/` (engine) plus `src-tauri/src/download_path.rs` (path
 safety) plus `src/Downloads*.tsx` / `src/downloads*.ts`. Right-click a source on
-the DETAIL PAGE to download it; a title-bar button beside the Aura Cloud chip
-opens the panel. Downloads are FILE downloads only: `load_video` still refuses
+the DETAIL PAGE to download it; a title-bar button beside the service status chip
+(`ServiceStatusChip.tsx`, formerly the Aura Cloud chip) opens the panel. Downloads are FILE downloads only: `load_video` still refuses
 local paths and offline playback is not in scope.
 
 Rust is authoritative; the React store is a projection that rehydrates from
@@ -748,6 +748,26 @@ frontend ~40k LOC over ~70 files + ~13 views).
   `crash_reporting.rs` (Sentry + minidump self-spawn), `runtime_deps.rs` (on-demand binary fetch),
   `tray.rs`, `popup_nav.rs` (in-app browser webview nav), `devlog.rs`, `log_export.rs`,
   `debug_panel.rs`.
+- **Watch history**: `history_store.rs` (one compact gzip file per scope under
+  `app_data_dir()/history`, no entry cap, coalesced atomic writes, the cloud `history` blob's
+  encode / decode; one tagged command `history_store`). A failed background write is retried with
+  backoff. `sync.ts` keeps an `aura:sync:history-unpushed:<scope>` marker from a local edit until a
+  push lands, and every completed pull republishes while it is set: only a local edit pushes
+  history, so a push lost at exit or on the network had no other retry. Devlog label `[history]`.
+- **Service status**: `service_status.rs`, one tagged command `service_status` (action `check`),
+  behind the title-bar chip. It probes Aura's server (`/healthz`, the ONE host const), every
+  installed addon's `/manifest.json`, the Watch Together relay's `/health`, and the debrid
+  providers the user chose to monitor (`monitoredProviders`, a portable Aura setting) from a FIXED
+  table of status endpoints in Rust, never URLs from the frontend. Provider answers are cached 60 s
+  (a failed fetch 5 s); the frontend polls every 5 min. Two clients: the Aura / provider one is
+  rustls `https_only(true)`; the ADDON one is deliberately not, because installed addons and the
+  dev relay can be `http://` (a LAN or loopback addon, Stremio's "Local Files" on 127.0.0.1:11470,
+  `ws://` relays), which matches every other addon fetch in `stremio.rs`. Addon URLs carry config
+  tokens: they are logged only through `redact_sensitive_url` and never echoed back (the reply is
+  index-aligned). An addon the list gains after a check read it gets one addons-only probe
+  (`probeNewAddons`) that moves neither the 5 min poll nor any other addon. A full round that reads offline (Aura and
+  every non-loopback addon and relay probe failed with no HTTP answer; `Probe.loopback` marks a probe to this machine)
+  gets one retry 30-60 s later by rewinding the poll clock, and the retry earns no further one. Devlog label `[status]`.
 
 ### Frontend (`src/`)
 
@@ -766,6 +786,9 @@ frontend ~40k LOC over ~70 files + ~13 views).
   network-free candidate list) and `HeroBackdropPicker.tsx` (the portalled picker panel), raised by
   right-clicking bare hero area on the detail page. The override is read at every hero latch site
   (see "Hero art latch" in `DetailView.tsx`).
+- **Service status**: `ServiceStatusChip.tsx` (the title-bar chip and its panel, which replaced
+  `SyncStatusChip.tsx`), `serviceStatusStore.ts` (App publishes the addon list there instead of
+  threading a prop through `TitleBar`).
 - **Subsystem modules**: live TV in `src/iptv/*` (M3U / Xtream / XMLTV parse, EPG store + worker),
   watch-together in `src/watchTogether/*` (WebSocket to the `watch-relay/` Cloudflare Workers + DO
   relay), casting via `cast.ts` + `useCastSession.ts`, notifications in `Notifications*.tsx`
@@ -777,7 +800,7 @@ frontend ~40k LOC over ~70 files + ~13 views).
   `DownloadsClosePrompt.tsx`, `DownloadsRelinkBridge.tsx`.
 - **Data / caching**: `metaCache.ts`, `persistentCache.ts`, `libraryNormalize.ts`, `auraSettings.ts`,
   `settingsTransfer.ts`, `sessionRoute.ts`, `catalogHoverStore.ts`, `releaseSignalStore.ts`,
-  `historyStore.ts`, `streamMeta.ts`, `aiometadata.ts`, `mangaChapters.ts`. See "Caching boundaries".
+  `historyStore.ts` (mirror of the Rust `history_store.rs` file), `streamMeta.ts`, `aiometadata.ts`, `mangaChapters.ts`. See "Caching boundaries".
 - **Addon election**: `addonElection.ts` owns "which addons can answer this, in what order":
   Stremio's resource / type / id-prefix gates (failing open on empty cached fields) in plain
   addon order, except meta, which is tiered (declared prefix match, then the pinned or
@@ -1121,6 +1144,84 @@ Bound every cache (see Performance & memory).
 - **sessionRoute.ts** (`sessionStorage`): active nav tab + open detail target so Ctrl+R/F5 restores
   the page you were on; cleared on app close (cold start opens Home).
 - **Notifications** (`aura:notifications:v1`): ring buffer capped at 200 entries.
+- **Watch history** (`history_store.rs` + `src/historyStore.ts`): user data, NOT a cache, and
+  deliberately UNCAPPED. One gzip file per scope, `app_data_dir()/history/<scope>.history.gz`:
+  a versioned compact form (every string interned once, field names and kinds stored once per
+  row shape, an ISO timestamp kept as a ms delta ONLY when it round-trips byte-exactly through
+  JS `toISOString`, else as a string, since `played_at` is half of the removal key), measured
+  25.8 KB for the real 650-row history (380 KB as JSON), 229 KB at 10k rows, 2.2 MB at 100k.
+  Rust owns the file and holds ONE scope resident; writes are coalesced (1.5 s) and atomic, with
+  a synchronous flush on exit (`flush_blocking`, CloseRequested) and before an updater install.
+  "Durable" means LANDED, not snapshotted: the exit flush, a scope swap and the migration go
+  through `make_durable` (holds WRITES, so it waits out a write in flight, then compares the
+  resident generation with the one on disk), a swap whose old scope cannot be written is
+  REFUSED rather than dropping its rows, and after `flush_blocking` every call writes before
+  returning. A file that EXISTS but cannot be read (AV / backup / OneDrive holding it, an I/O
+  error) is never an empty history: the scope is resident as unreadable, nothing is written
+  for it, `load` and every op but `append` fail (the frontend retries forever, 30 s apart after
+  three quick tries, and the History view says so), and appends are kept and also written on
+  every append to a sidecar, `<scope>.history.pending.gz` (a crash or updater relaunch has no exit
+  path), merged where the scope next becomes resident and removed only by a landed write holding
+  its rows. A play whose scope swap was refused is parked in Rust (`PARKED`, cap 500) until the
+  swap or the exit flush. A file that does not decode is set aside as `.gz.bad` only if that rename
+  works (else unreadable), and the load reports `recovered`: sync.ts then pulls history with no
+  If-None-Match and nothing is pushed until a cloud merge (or a 404) lands. That latch is persisted
+  (`<scope>.history.recovering` beside the file, written before the rename, none for a guest): a
+  restart or scope swap reports it again, even once a play has written a new file, and it goes only
+  when the merged rows are on disk or the pull found no cloud copy (`cloud_absent`). A signed-in
+  scope with NO file takes the same latch at discovery, on whichever op reads first, because a
+  persisted etag vouches for a file that is gone (`latch_missing_file`). MergeCloud writes
+  synchronously when rows changed, so an etag never gets ahead of its rows. Each set-aside records
+  its time in `<scope>.history.setaside` (guests too, up to 3), and backup.rs `prune_dir` keeps the
+  newest auto snapshot older than each time, so snapshots of a near-empty history cannot roll out
+  the last good one. A history Clear PUBLISHES the empty list and takes a snapshot first
+  (`clearHistoryChecked`, which aborts without one); the Storage clears of manual-state, skip-marks
+  and notifications stay local.
+  The frontend keeps the synchronous API over an array hydrated by `load` and sends only small
+  mutations, all through ONE promise chain; while a load / carry-over / cloud merge is in flight
+  later writes are logged and replayed onto its result (do not "simplify" that away: it is what
+  keeps a play made during startup or a pull). Anything that treats the list as authoritative
+  (cloud push or merge, backups) awaits `historyReady()`; an empty pre-hydration list must never
+  be pushed. Migration: the first load sends the scope's old localStorage copy
+  (`aura:history:<scope>`), Rust unions it in, writes, reads back, and only on `verified` is the
+  key removed (idempotent, so a crash just repeats it); if that write did not verify, a scoped
+  `flush` is retried (and right after every remove / clear) and the key goes once it verifies,
+  because a key left for the next launch would union back every row removed meanwhile. Cloud
+  `history` blob: a JSON ARRAY of the newest rows in plain form (<= 500 / 256 KiB) followed by
+  ONE element `{"v":2,"enc":"gzip-b64","n":N,"data":...}` holding the rest, built and read in
+  Rust (history_store.rs "WIRE SHAPE"); legacy plain arrays and a bare envelope still read. The
+  plain head is load-bearing: v2.2.4 pushes its whole list on its first local edit and merges
+  only arrays, so a bare envelope let a fresh old install replace the cloud copy with its next
+  play alone. That needs it to take a 200, so the history etag is stored under its own field
+  (`history:v2` in `aura:sync:etags:<scope>`, read from nowhere else; a `history` there is v2.2.4's
+  and is stripped on load, never adopted), at the cost of one full pull after upgrading. A push with
+  a null If-Match overwrites unconditionally, so history sends one only when the last pull answered
+  404 (`historyCloudAbsent`): an etag-less device whose pull failed or whose merge threw holds the
+  push with the unpushed marker set, and a double 412 keeps the etag of the copy it merged, so the
+  next attempt merges again. A guest never encodes. When
+  the blob would pass the 1 MiB limit the CLOUD copy keeps the newest rows that fit (~24k of
+  real rows) and the local file keeps all (Settings > Cloud Sync says so, from
+  `aura:sync:history-trim:<scope>`, written when a push lands); a newer client that
+  pulls an old client's plain array unions it and re-publishes (sync.ts "MIXED VERSIONS"). A
+  pull merges history only into the history scope captured BEFORE its fetch, and every pull or
+  push drops what it fetched once the account changed (`accountGen`, bumped by
+  `clearSyncEtags`). Change events carry a `reason`; only `"mutation"` pushes or snapshots.
+  The envelope and the file parse through `PlainValue` (`parse_capped`), never `Value`'s own
+  `Deserialize`: tauri and axum force serde_json's `raw_value` on, which makes `Value` re-parse the
+  string under the key `$serde_json::private::RawValue`, past the budget the text was charged.
+  Backups get history from the store in Rust (`historyFromStore`, same JSON-array string under
+  `values.history`; with the file unreadable an automatic snapshot is skipped rather than roll good
+  ones out, and a user-initiated one is written without history and flagged `historyUnavailable`,
+  so restoring it leaves history untouched). A Restore reads its target first, then takes the
+  pre-restore snapshot with `protect` naming the target (still counted in the bucket's cap so its
+  own prune cannot delete it), and stops if that snapshot fails. Snapshot writes remove their tmp on
+  failure, and a prune sweeps tmp files older than an hour (younger ones may be in flight), and
+  backup bodies are now gzipped under their OWN suffix `.aura-backup.json.gz` (readers accept
+  both suffixes and both bodies): an older Aura's prune reads a gzipped body as text, finds no
+  reason and would delete manual snapshots as auto, and its suffix filter skips `.gz`. `serde_json`'s `float_roundtrip` feature is
+  on so floats survive the Rust round trip exactly; the migration's read-back depends on it.
+  `scrobbledStore.ts`'s mark cap follows the history size (floor 4500, ceiling 30k, orphans
+  evicted first).
 - **EPG** (`src/iptv/epgStore.ts`): localStorage, ~4-week retention, parsed off-thread in a worker.
 - **Story arcs**: `aura:story-arcs:v8` (24 h TTL, cap 60) holds the joined arcs per series; the TTL is
   short deliberately because an ongoing show gains an episode weekly and a stale arc would be missing
@@ -1146,7 +1247,7 @@ Bound every cache (see Performance & memory).
   user picked for a title's detail hero (`heroBackdrop.ts`), validated on read, and forgets one whose
   image failed to load on two opens in a row (the count is stored with it). Device-local like
   `aura:arc-mode:v1`: not cloud-synced, not in settings export/import. Settings > Storage clears it
-  through `clearHeroBackdrops`, because a bare `removeItem` under a live `PersistentCache` is written
+  through `clearPersistentCache` (every `PersistentCache` registers by storage key), because a bare `removeItem` under a live `PersistentCache` is written
   back, cleared entries included, by the cache's next save.
 - **Addon manifest fields**: `AddonEntry`'s capability fields (`resources`, `types`, `id_prefixes`,
   `stream_types`, `stream_id_prefixes`, `has_search`) are populated at install/sync time and REBUILT
@@ -1385,12 +1486,93 @@ old-format and new-format samples and diff the field sets. Node runs the `.ts` f
 
 ## Conventions
 
+- Ctrl+F focuses the search box on screen and the native find bar is off (`src/searchHotkey.ts`,
+  popups through `POPUP_NO_FIND_SCRIPT`). A new search box only needs `data-aura-search` on its
+  `<input>`. Do not use WebView2's `AreBrowserAcceleratorKeysEnabled`: it also kills F5.
+- The hover meta panel opens on a side that covers no other card when one fits, else behind the
+  cursor's travel (`src/hoverPlacement.ts`, once per card, never flipped live). While it covers cards
+  it lets the pointer through to them; holding Alt freezes it and lets it take the pointer.
+- Alt+~ (the `perf-monitor` keybinding, Shift tolerated since ~ is Shift+`) opens the Performance
+  Monitor (`src/PerfMonitor.tsx`, `src/perfSeries.ts`, `src-tauri/src/perf_monitor.rs`). Closed, it
+  costs nothing: the panel unmounts and Rust holds no thread, timer or PDH query; pdh.dll and dxgi.dll
+  load by hand on the first sample. Figures cover the process TREE (aura.exe holds mpv, WebView2 and
+  ffmpeg are children). Video figures come ONLY from the engine's gated cache poll
+  (`publish_video`), never a `get_property` from the sampler (landmine 3). I/O is files AND pipes, and
+  Network is the stream plus downloads: Windows has no per-process disk or network figure without
+  elevation, so do not relabel either as if it did. It sits above every z-index but cannot cover a
+  native child webview (the source popup). A floating surface that hit-tests the page should look
+  through `[data-perf-monitor]`, as `searchHotkey.ts` and `CatalogHoverCard.tsx` do; a capture-phase dismiss
+  listener must exempt it, because the monitor's React stopPropagation only shields bubble listeners. The Video
+  figure is the video's own frame rate (`estimated-vf-fps`), not a presentation rate (`display-fps` is pinned
+  through `display-fps-override`, so it measures nothing); the dropped-frame counts are the health signal and run
+  since the last seek or load. The Buffer bar fills against the engine's live `cache-secs`, not the setting. The
+  Frame line plots main-thread stalls through a `longtask` observer. A sample more than 5 s after the last one is a
+  new baseline. The Shift tolerance yields when another action holds the Shift chord, and a plain or Shift-only
+  binding stands aside inside text boxes. The crash reporter counts as Core.
+- The player keybindings are enabled only while a player is active. Off the player every bound key belongs to the
+  page, and `isChordBound` is false, so Ctrl+F always reaches the search box there.
+- Esc layering: a layer above a page or the player takes Escape in a window CAPTURE listener with stopPropagation,
+  because a bubble stop does not stop App's sibling listener on window. Capture listeners on window are siblings too
+  and run in registration order, so a panel hosting a nested layer yields to it explicitly (the Downloads and Service
+  status panels check `[data-aura-context-menu]`). Every docked player menu that owns its open state calls
+  `useMenuEscape` (`src/playerMenu.tsx`), except the hover-opened VolumeControl.
+- A title-bar panel keeps Space / Enter on its controls and Up / Down from the player keybindings through
+  `keepPanelKeysFromPlayer` (`downloadsPanel.ts`), stopping at the document because dnd-kit's keyboard drag listens
+  there. Both title-bar panels hold "closing" for at least a macrotask (`anyMenuOpen` must stay true through a
+  dismissing mousedown). `Tooltip` blurs the active element only after a mouse click (click detail above 0).
+- Mouse wheel scrolling. Do not judge it by rAF: compositor scrolling draws an even 4.2 ms while rAF reads 90 fps
+  (measure `Display::DrawAndSwap` gaps in a trace). What read as jitter was the motion: Chromium plays each notch as
+  a separate curve back to rest, and no flag changes that (`ImpulseScrollAnimations` was removed upstream). So
+  `src/wheelSmooth.ts` takes whole notches (`wheelDeltaY` a multiple of 120, setting `smoothWheelScroll`, never with
+  reduced motion) and drives `scrollTop` from a critically damped spring on the main thread; touchpads and free-spin
+  wheels stay native. It keeps its own wheel latch, stops at a fixed ancestor (the native chain follows the containing
+  block, and modals render inside page scrollers) and leaves a non-overflowing `overscroll-behavior` element to the
+  browser. Because it runs on the main thread, `src/scrollPause.ts` sets `data-aura-scrolling` on `<html>` during a
+  scroll the user is driving, which pauses every keyframe animation (Library rAF 55 to 227 fps; no single loop accounts
+  for it) and freezes `.card-grow` hover. A hover panel's open timer waits for it. Wall-clock transient UI opts out with
+  `data-aura-no-scroll-pause`. A page's main scroller takes `.aura-page-scroller` (`will-change: scroll-position`):
+  below 150% scale Chromium otherwise re-rasters a non-opaque scroller as it moves (3.2 raster tasks per frame, 0.12
+  with it; text rendering unchanged). Small card controls take no `backdrop-blur`. Row stride is unrounded
+  (`parseFloat` of the computed height, never the rect, which includes a hover scale).
+- Settings sync. `aura:backend-settings-changed`, detail `{ keys?, fromCloud? }`, fires AFTER a backend write lands
+  (`applyBackendPatch` in SettingsView, `ThemeEngine.setTheme`, onboarding, the trailer quality write, a reset with no
+  keys, `writeSettingsBlob` with fromCloud), and `keys` lists only keys whose value really changed, so an empty list
+  is a no-op. Sync stamps and pushes on it (not fromCloud, not machine-local keys), App's settings effect reloads on
+  it through a key list beside the loader, ThemeEngine re-reads for `theme`. ANY new `update_settings` or `set_theme`
+  caller must dispatch it. Sync no longer listens to `aura:keybindings-changed`. The last-writer-wins stamp is per sync
+  scope (`aura:settings-updated-at:<scope>`, `setSettingsStampScope`); a guest never stamps; the old global key is
+  adopted once, only when the scope entered still has persisted etags. `aura:sync:settings-unpushed:<scope>` marks an
+  edit the cloud has not taken and arms a push only in a pull's 304 or 404 branch, never at the end of a pull, because
+  a push with no etag sends a null If-Match, which overwrites unconditionally. So a push with no etag is held unless
+  the last pull answered 404 (`settingsCloudAbsent`), and a 200 received with no etag held means this device never
+  merged this account's copy: the cloud wins outright, whatever the stamps say. `clearSyncEtags` must be followed in
+  the same tick by `setSyncActiveScope`; stored etags, stamp and marker drop only when that call changes scope (a
+  StrictMode re-apply keeps them). Known gaps: signing out inside the 5 s debounce or offline discards an unpublished
+  edit (accepted: the mechanism that used to save it was the guest-edit bug), and a scope with no settings file still
+  inherits the previous cache in `settings.rs::load`, so after a first pull answering 404 the next edit publishes
+  those values.
+- Settings import: `providers.occurrences` is optional and additive (repeated manifest ids resolve by occurrence, a
+  fallback is reported as ambiguous). A stream or search list where nothing resolves is left out of the patch, so it
+  cannot empty the override and turn off every installed addon. A rejected backend patch retries field by field.
+- Library loads are latest-request-wins (`libraryLoadGenRef`, bumped through `invalidateLibraryLoads` BEFORE anything
+  swaps the manual-watched scope). The warm cache paints only when this account's list is not on screen; a failed
+  refetch never repaints. A failed write rolls itself back in its own handler. Views read `libraryKnown`
+  (`libraryLoaded || (authChecked && !session)`); App's raw flag stays false for a guest on purpose, for the Queue
+  prune. Queue renders planned ids with no library record as stubs from the meta cache.
+- FilterState's default year range is unbounded (-Infinity / Infinity), clamped only for display: never JSON-serialize
+  it as is.
+- Auto-remove: a series is tombstoned only through `seriesFinishCheck` (`libraryActions.ts`). Every elected meta addon
+  is asked; at least one answer must have videos, none may date a future episode, and the cloud signal must agree. A
+  provider that claims the id and gives no list keeps the show; a catch-all's silence does not. Most-videos
+  (`getRichestMetaDetail`) must not decide "nothing is coming", because it can elect an aired-only list. The not-found
+  test in `askMetaAddon` matches Rust's `fetch_meta_detail` error strings: change them together.
 - F12 opens the in-app DevConsole (ring buffer, level filters, search). Rust logs arrive via the
   `crate::devlog!` macro, which mirrors to stderr AND emits a `dev-log` Tauri event.
 - Rust log labels to grep in the DevConsole or `aura-mpv.log`: `[bridge]`, `[player]`, `[streams]`,
   `[meta]`, `[catalog]`, `[search]`, `[subtitles]`, `[ratings]`, `[rpc]`, `[win32]`, `[smtc]`,
   `[scrobble]`, `[publicmetadb]`, `[mpv]` (the playback engine), `[cast]`, `[iptv]`, `[sync]`,
-  `[aniskip]`, `[introdb]`, `[skipdetect]` (the layered OP/ED detector), `[arcs]`, `[subsync]`, `[downloads]`, `[tenrai]` (the MyAnimeList client), `[manga]` (manga chapters: MangaUpdates + Fandom), `[airing-check]` (frontend, the stream check for an
+  `[aniskip]`, `[introdb]`, `[skipdetect]` (the layered OP/ED detector), `[arcs]`, `[subsync]`, `[downloads]`, `[history]` (the watch-history store), `[status]` (the service status probes),
+  `[backup]` (the user-data snapshot ledger), `[perf]` (the Performance Monitor's GPU counters), `[tenrai]` (the MyAnimeList client), `[manga]` (manga chapters: MangaUpdates + Fandom), `[airing-check]` (frontend, the stream check for an
   airing show's next episode), `[extras]` (frontend,
   the anime metadata tabs on the detail page), `[next-up]` (frontend, the Next-Up card's timing
   inputs: the elected ending with its source and level, trusted end, preview, media end).

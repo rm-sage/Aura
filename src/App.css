@@ -2384,6 +2384,36 @@ html[data-reduced-motion="true"] .aura-detail-title-slot {
 /* reads as live. The player bars also stay live under the FOCUSED    */
 /* user-idle tier below (a user can watch without moving the mouse).  */
 /* ---------------------------------------------------------------- */
+/* A page's main scroller gets its own compositor layer. Aura's page is transparent, and
+   below 150% display scale Chromium otherwise re-rasters a non-opaque scroller as it
+   moves: measured on Home, 3.2 raster tasks per drawn frame, 0.12 with this. Only the
+   page-level scrollers: each one holds its own GPU tiles. */
+.aura-page-scroller {
+  will-change: scroll-position;
+}
+
+/* Hover effects would otherwise start on every card a scroll carries under the pointer. */
+html[data-aura-scrolling] .card-grow {
+  transition: none !important;
+}
+html[data-aura-scrolling] .card-grow:hover {
+  transform: scale(0.94);
+  filter: none;
+}
+
+/* Held still while anything scrolls (src/scrollPause.ts). Measured on Library: 55 fps
+   with spikes past 50 ms running, 227 fps paused, and no single loop accounts for it,
+   which is why this is every animation and not a list. */
+html[data-aura-scrolling] *,
+html[data-aura-scrolling] *::before,
+html[data-aura-scrolling] *::after {
+  animation-play-state: paused !important;
+}
+/* A toast's lifetime runs on a timer: held at its first frame, it would expire unseen. */
+html[data-aura-scrolling] [data-aura-no-scroll-pause] {
+  animation-play-state: running !important;
+}
+
 html[data-aura-idle="true"] .aura-sweep,
 html[data-aura-idle="true"] .aura-sweep::after,
 html[data-aura-idle="true"] .aura-ambient,
@@ -2666,6 +2696,32 @@ html[data-theme="midnight"] .aura-float-glass,
 html[data-theme="contrast"] .aura-float-glass,
 html[data-theme="contrast-azure"] .aura-float-glass {
   background: var(--ln-panel-solid, #0b0d12);
+}
+
+/* The Performance Monitor. Darker than the shared glass because thin coloured
+   lines have to read over a bright video frame, and no blur: it would re-run on
+   every canvas draw, inflating the very figures the window shows, and the video
+   is not in the webview, so nothing behind it could refract anyway. The zero-blur
+   themes' opaque fill above still wins on specificity. */
+.aura-float-glass.aura-perf-monitor {
+  background: linear-gradient(rgba(10, 12, 16, 0.86), rgba(10, 12, 16, 0.92));
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  animation: aura-perf-in 140ms ease-out;
+}
+@keyframes aura-perf-in {
+  from { opacity: 0; transform: scale(0.98); }
+  to   { opacity: 1; transform: scale(1); }
+}
+.aura-perf-bar {
+  transform-origin: left center;
+  opacity: 0.72;
+  transition: transform 500ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+html[data-reduced-motion="true"] .aura-float-glass.aura-perf-monitor,
+html[data-reduced-motion="true"] .aura-perf-bar {
+  animation: none;
+  transition: none;
 }
 
 /* The search bar's own field. Slightly lighter than the shell it sits in so

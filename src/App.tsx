@@ -46,6 +46,7 @@ import { runtimeDepPresent, ensureRuntimeDep, ensureRuntimeDepOnce } from "./run
 import PartyToastHost from "./PartyToast";
 import SourcePopupHost from "./SourcePopup";
 import DevConsole from "./DevConsole";
+import PerfMonitorHost from "./PerfMonitor";
 import UpdatePopup from "./UpdatePopup";
 import CrashReportingConsent from "./CrashReportingConsent";
 import ResumePrompt, { type PendingResume } from "./ResumePrompt";
@@ -58,7 +59,7 @@ import { onWatchedSync } from "./manualWatched";
 import { useScrobble, type ActiveScrobbleTarget } from "./useScrobble";
 import { useScrobbleAuthAlerts } from "./useScrobbleAuthAlerts";
 import { useKeybindings } from "./useKeybindings";
-import { libraryToggle, libraryRemoveAll, libraryWriteProgress, libraryClearProgress } from "./libraryActions";
+import { libraryToggle, libraryRemoveAll, libraryRemoveMany, libraryWriteProgress, libraryClearProgress, seriesFinishCheck, finishedSeriesOf } from "./libraryActions";
 import { libraryItemSeriesId } from "./libraryNormalize";
 import { isWindowHidden, isWindowFocused, useWindowHidden, subscribeWindowVisibility } from "./windowVisibility";
 import { sourcesForMeta, openSourceLink } from "./externalSources";
@@ -117,6 +118,7 @@ import {
 } from "./nextPrescan";
 import { resolveSkipCour } from "./skipCour";
 import { applyReducedMotionAttribute, loadAuraSettings, streamQueryAddons } from "./auraSettings";
+import { publishStatusAddons, useStatusPanelPhase } from "./serviceStatusStore";
 import { electAddons } from "./addonElection";
 import {
   isHashableStreamUrl, mergeSubtitleAnswers, playingFilename, streamSourceKey,
@@ -2029,6 +2031,23 @@ function withOrderOf(current: readonly AddonEntry[], order: readonly AddonEntry[
   return [...current].sort((a, b) => at(a) - at(b));
 }
 
+/** Auto-remove's re-check, for after any wait: that kind's toggle is still on and
+ *  the title still counts as watched. `trusted`: the caller confirmed a movie's
+ *  completion from the final playhead, so its stored ratio need not agree. */
+function autoRemoveStillWanted(item: LibraryItem, trusted: boolean): boolean {
+  const s = loadAuraSettings();
+  const mt = (item.media_type ?? "").toLowerCase();
+  if (mt === "series" || mt === "anime") {
+    // Series completion is a persistent local flag either way, so this re-check
+    // is reliable regardless of `trusted`.
+    return s.libraryAutoRemoveWatchedSeries && getManualWatchedState(item.id) === "watched";
+  }
+  if (!s.libraryAutoRemoveWatchedMovies) return false;
+  const off = typeof item.state?.timeOffset === "number" ? item.state.timeOffset : 0;
+  const dur = typeof item.state?.duration === "number" ? item.state.duration : 0;
+  return trusted || getManualWatchedState(item.id) === "watched" || (dur > 0 && off / dur >= 0.9);
+}
+
 export default function App() {
   // ── Nav state ──
   // Restore the route from sessionStorage on a webview reload (Ctrl+R / F5)
@@ -2101,6 +2120,10 @@ export default function App() {
   const addonsGenRef = useRef(0);
   const reorderInFlightRef = useRef(0);
   const syncedAccountRef = useRef<string | null>(null);
+  // The title-bar service monitor probes each installed addon; it sits far
+  // from this state, so the list is published to its store rather than
+  // threaded through TitleBar (src/serviceStatusStore.ts).
+  useEffect(() => { publishStatusAddons(addons, addonsSettled); }, [addons, addonsSettled]);
 
   // ── Library (Continue Watching + Calendar source) ──
   const [library, setLibrary] = useState<LibraryItem[]>([]);
@@ -2142,6 +2165,12 @@ export default function App() {
    *  Drives the LibraryView skeleton state — without this we'd flash an
    *  empty-state card during the initial fetch. */
   const [libraryLoaded, setLibraryLoaded] = useState(false);
+  /** The fetch failed with nothing to show for this account: not an empty library. */
+  const [libraryLoadFailed, setLibraryLoadFailed] = useState(false);
+  // App's own flag stays false for a guest (nothing loads), so what a view can
+  // conclude from the library needs this. Not a bare `!session`: that is also
+  // true before get_session resolves, while a session's library is still coming.
+  const libraryKnown = libraryLoaded || (authChecked && !session);
 
   // ── Active scrobble / RPC / SMTC target ──
   const [activeTarget, setActiveTarget] = useState<ActiveScrobbleTarget | null>(null);
@@ -2247,6 +2276,7 @@ export default function App() {
   // down as a prop is the same route `subsOpen` takes, and it is what stops a
   // dismissing click on the video from also toggling pause.
   const downloadsPanelPhase = useDownloadsPanelPhase();
+  const statusPanelPhase = useStatusPanelPhase();
   // Rust owns the job list; this only subscribes the projection to it.
   useEffect(() => startDownloadsStore(), []);
 
@@ -2660,7 +2690,7 @@ export default function App() {
   const openDetail = useCallback((meta: MetaPreview) => {
     setIgnoreResumeOnNextOpen(true);
     const el = document.querySelector<HTMLElement>(
-      `[data-meta-card="${meta.media_type}:${meta.id}"]`
+      `[data-meta-card="${CSS.escape(`${meta.media_type}:${meta.id}`)}"]`
     );
     setSelectedRect(el ? el.getBoundingClientRect() : null);
     setSelectedMeta(meta);
@@ -2672,7 +2702,7 @@ export default function App() {
   const openDetailFromCW = useCallback((meta: MetaPreview) => {
     setIgnoreResumeOnNextOpen(false);
     const el = document.querySelector<HTMLElement>(
-      `[data-meta-card="${meta.media_type}:${meta.id}"]`
+      `[data-meta-card="${CSS.escape(`${meta.media_type}:${meta.id}`)}"]`
     );
     setSelectedRect(el ? el.getBoundingClientRect() : null);
     setSelectedMeta(meta);
@@ -4441,8 +4471,8 @@ export default function App() {
   // ── Keybindings + preferred subtitle language ──
   // Both come from the backend `AppSettings`. The preferred subs lang
   // drives the PlayerOverlay's subtitle-list ordering (selected language
-  // pulled to the top). Reload on `aura:keybindings-changed` (also fires
-  // for general settings updates).
+  // pulled to the top). Reloaded when a backend write lands, on a rebind, on an
+  // Aura-side settings event and after a scope swap (sign-in / sign-out).
   const [keybindings, setKeybindings] = useState<Record<string, string>>({});
   // We keep all four lang prefs in state; the *preferred* values passed
   // to PlayerOverlay are derived per-stream from `isAnimeMeta(activeTarget)`
@@ -4485,11 +4515,25 @@ export default function App() {
         .catch(() => {});
     loadSettings();
     const onChange = () => loadSettings();
+    // The backend keys read above: a text field patches on every keystroke, so
+    // an unrelated one must not re-read and hand the player new array identities.
+    const loaded = [
+      "keybindings", "subtitle_language", "selectable_subtitle_languages",
+      "audio_priority", "avoid_dubs", "user_region", "next_up_lead_seconds",
+    ];
+    const onBackendChange = (e: Event) => {
+      const keys = (e as CustomEvent<{ keys?: string[] }>).detail?.keys;
+      if (!Array.isArray(keys) || keys.some((k) => loaded.includes(k))) loadSettings();
+    };
     window.addEventListener("aura:keybindings-changed", onChange);
     window.addEventListener("aura:settings-changed", onChange);
+    window.addEventListener("aura:session-changed", onChange);
+    window.addEventListener("aura:backend-settings-changed", onBackendChange);
     return () => {
       window.removeEventListener("aura:keybindings-changed", onChange);
       window.removeEventListener("aura:settings-changed", onChange);
+      window.removeEventListener("aura:session-changed", onChange);
+      window.removeEventListener("aura:backend-settings-changed", onBackendChange);
     };
   }, []);
 
@@ -4648,7 +4692,7 @@ export default function App() {
   }, []);
 
   // ── Session-changed broadcast ──
-  // Decoupled components (SyncStatusChip in the title bar, profile
+  // Decoupled components (ServiceStatusChip in the title bar, profile
   // popover, etc.) need to know when the active Stremio session
   // changes so they can refresh their cloud-side state without
   // waiting for the next poll cycle. Single useEffect that fires on
@@ -4663,7 +4707,7 @@ export default function App() {
 
   // ── Settings-deep-link router ──
   // Components that aren't in the NavSidebar's prop tree (TitleBar's
-  // SyncStatusChip, NotificationsPanel action items, etc.) can request
+  // ServiceStatusChip, NotificationsPanel action items, etc.) can request
   // a jump to a specific Settings section via:
   //   window.dispatchEvent(new CustomEvent("aura:open-settings", {
   //     detail: { section: "sec-cloud-sync" }
@@ -6029,7 +6073,11 @@ export default function App() {
         setTrailerMaxHeight(res.max_height_available);
         setTrailerQualityLabel(res.quality_label);
         setTrailerQuality(heightToRung(res.height));
-        invoke("update_settings", { patch: { trailer_quality: quality } }).catch(() => {});
+        invoke("update_settings", { patch: { trailer_quality: quality } })
+          .then(() => window.dispatchEvent(new CustomEvent("aura:backend-settings-changed", {
+            detail: { keys: ["trailer_quality"] },
+          })))
+          .catch(() => {});
         // Resolves to the SAME height already playing (e.g. re-selecting the
         // current rung) — skip the reload so the picture doesn't stutter.
         if (res.height === currentTrailerHeightRef.current) {
@@ -6149,8 +6197,8 @@ export default function App() {
       // up — next season not yet aired": re-run the walk ignoring the
       // aired filter (a far-future `now`); a hit there means a later
       // episode exists but simply hasn't aired.
-      // RICHEST detail (most videos) for the caught-up vs finale call —
-      // prefer the full episode list DetailView already cached, else fetch
+      // RICHEST detail (most videos) for the caught-up vs finale call: the
+      // richest entry cached so far (which may be the only one, and lean), else
       // the richest across addons. peekCachedDetailById / getMetaDetailFallback
       // can return a leaner entry (freshest-by-ts, or the FIRST addon with
       // any videos) that omits future-dated episodes, making a still-airing
@@ -6339,7 +6387,22 @@ export default function App() {
     );
   }, []);
 
+  // Latest request wins: a response whose generation moved on is dropped whole,
+  // because it may be another account's (bumped before any account swap, ahead
+  // of the manual-watched scope change its mirror would write into) or older than
+  // one already applied. Not comparable through sessionRef: that lags the swap.
+  const libraryLoadGenRef = useRef(0);
+  // The account whose list is on screen, warm or fetched. The warm cache is for
+  // that first paint only: on a refetch it would bring back what was just removed.
+  const libraryPaintedKeyRef = useRef<string | null>(null);
+  const invalidateLibraryLoads = useCallback(() => {
+    libraryLoadGenRef.current += 1;
+    libraryPaintedKeyRef.current = null;
+    setLibraryLoadFailed(false);
+  }, []);
+
   const loadLibrary = useCallback(async (sess: UserSession | null) => {
+    const gen = ++libraryLoadGenRef.current;
     if (!sess?.auth_key) { setLibrary([]); setRawLibrary([]); setLibraryLoaded(true); return; }
     // Warm-start from the localStorage cache so the user sees their library
     // instantly on app launch — Stremio's `datastoreGet` round-trip can take
@@ -6351,10 +6414,10 @@ export default function App() {
     const cacheKey = `aura:library:${
       sess.user_id && sess.user_id.trim() ? `u:${sess.user_id}` : `k:${sess.auth_key.slice(0, 12)}`
     }`;
-    try {
-      const raw = localStorage.getItem(cacheKey);
-      if (raw) {
-        const cached = JSON.parse(raw) as LibraryItem[];
+    const paintWarm = (): boolean => {
+      try {
+        const raw = localStorage.getItem(cacheKey);
+        const cached = raw ? JSON.parse(raw) as LibraryItem[] : null;
         if (Array.isArray(cached) && cached.length > 0) {
           // metaCache hydrates synchronously at module import, so any
           // fresh poster URLs we warmed in the previous session are
@@ -6370,12 +6433,20 @@ export default function App() {
             : cached;
           setLibrary(overlayRecentClears(warmed));
           setLibraryLoaded(true);
+          setLibraryLoadFailed(false);
+          libraryPaintedKeyRef.current = cacheKey;
+          return true;
         }
-      }
-    } catch { /* malformed cache — ignore */ }
+      } catch { /* malformed cache: ignore */ }
+      return false;
+    };
+    if (libraryPaintedKeyRef.current !== cacheKey) paintWarm();
 
     try {
       const raw = await invoke<LibraryItem[]>("library_get", { authKey: sess.auth_key });
+      if (gen !== libraryLoadGenRef.current) return;
+      libraryPaintedKeyRef.current = cacheKey;
+      setLibraryLoadFailed(false);
       // Collapse per-episode rows into one canonical entry per series root
       // BEFORE anything else sees the list. Library, Calendar, Continue
       // Watching all read the same `library` state — normalising at the
@@ -6446,8 +6517,12 @@ export default function App() {
       // local UI cache; the Stremio cloud record itself is left untouched.
       safeSetItem(cacheKey, JSON.stringify(itemsWithFreshPosters));
     } catch (err) {
+      // A stale 401 is an old key's: it must not sign out the next account.
+      if (gen !== libraryLoadGenRef.current) return;
       if (String(err) === SESSION_EXPIRED) {
+        invalidateLibraryLoads();
         await invoke("logout").catch(() => {});
+        invalidateLibraryLoads();
         syncedAccountRef.current = null;
         refreshedAddonsRef.current.clear();
         addonsGenRef.current += 1;
@@ -6457,13 +6532,22 @@ export default function App() {
         // below, so not called from here): signed out while still showing the
         // account's addons, a guest's add or reorder would work from them.
         await invoke<AddonEntry[]>("list_addons").then(setAddons).catch(() => setAddons([]));
+      } else if (libraryPaintedKeyRef.current !== cacheKey) {
+        // With no list on screen (the warm paint above found none), say so
+        // rather than "empty". Otherwise the last good list stands; a write
+        // that failed rolls itself back in its own handler.
+        setLibraryLoadFailed(true);
       }
-      // Other errors silently leave library empty — calendar/Continue Watching
-      // will just show empty states.
     } finally {
-      setLibraryLoaded(true);
+      if (gen === libraryLoadGenRef.current) setLibraryLoaded(true);
     }
-  }, [overlayRecentClears]);
+  }, [overlayRecentClears, invalidateLibraryLoads]);
+
+  const retryLibraryLoad = useCallback(() => {
+    setLibraryLoadFailed(false);
+    setLibraryLoaded(false);
+    void loadLibrary(session);
+  }, [loadLibrary, session]);
 
   // ── Background library-poster warm ──
   // Stremio library records freeze the poster URL at insertion time
@@ -6555,7 +6639,10 @@ export default function App() {
 
   // ── Session expired ──
   const handleSessionExpired = useCallback(async () => {
+    invalidateLibraryLoads();
     await invoke("logout").catch(() => {});
+    // Again: the old session's listeners can start a refetch until setSession lands.
+    invalidateLibraryLoads();
     syncedAccountRef.current = null;
     refreshedAddonsRef.current.clear();
     addonsGenRef.current += 1;
@@ -6567,7 +6654,7 @@ export default function App() {
     // which is exactly the state DetailView reads as "none installed" and
     // latches the wrong hero on.
     await invoke<AddonEntry[]>("list_addons").then(setAddons).catch(() => setAddons([]));
-  }, []);
+  }, [invalidateLibraryLoads]);
 
   // ── Library refresh — fires after any context-menu library toggle ──
   useEffect(() => {
@@ -6983,12 +7070,27 @@ export default function App() {
     return () => window.removeEventListener("aura:auto-advance-watched", onAdvance);
   }, [addons, activeTarget, library, selectedMeta]);
 
+  // Puts back what an optimistic remove took when its write failed. A merge, so
+  // a patch or a refetch that landed meanwhile stands.
+  const restoreLibraryRows = useCallback((id: string, libSnap: LibraryItem[], rawSnap: LibraryItem[]) => {
+    setLibrary((prev) => prev.some((i) => i.id === id)
+      ? prev
+      : [...prev, ...libSnap.filter((i) => i.id === id)]);
+    setRawLibrary((prev) => {
+      const have = new Set(prev.map((i) => i.id));
+      return [...prev, ...rawSnap.filter((i) => libraryItemSeriesId(i.id) === id && !have.has(i.id))];
+    });
+  }, []);
+
   // ── Auto-remove watched (Library) ──
   // Two opt-in toggles (Library page options popover, off by default) drop a
   // title from the Library once it's fully watched. A movie counts when it
   // reaches >=90% or is marked watched; a series counts only when its root
   // "watched" flag flips (every AIRED episode watched, nothing further
-  // scheduled - advanceWatchedAfter), so an ongoing show is never removed.
+  // scheduled - advanceWatchedAfter), so an ongoing show is never removed. A
+  // manual mark on a series counts too, but only through seriesFinishCheck at fire
+  // time: an airing show or one whose episode list cannot be had stays. Only
+  // explicit Library records are removed; a temp row was never in the Library.
   //
   // Removal is triggered at two RACE-SAFE points and always DEFERRED ~3 s +
   // re-verified before it fires:
@@ -7015,10 +7117,8 @@ export default function App() {
     // the post-exit refetch may not have landed within the defer window.
     const scheduleRemoval = (id: string, trusted: boolean) => {
       if (pending.has(id)) return; // already queued for this id
-      const timer = setTimeout(() => {
-        pending.delete(id);
-        const auth = sessionRef.current?.auth_key;
-        if (!auth) return;
+      // What can change during the series detail fetch, so it runs after it too.
+      const eligibleItem = (): LibraryItem | null => {
         // Re-check active playback at FIRE time (not just schedule time): if the
         // id became the currently-playing title during the 3s defer window,
         // removing it now would race the ongoing progress writes and get the
@@ -7026,37 +7126,56 @@ export default function App() {
         // the final flush) instead of removing mid-playback.
         const at = activeTargetRef.current;
         const activeId = at ? (at.series_id ?? at.id) : null;
-        if (activeId && id === activeId) return;
+        if (activeId && id === activeId) return null;
         const item = libraryRef.current.find((i) => i.id === id && !i.removed);
-        if (!item) return;
-        const s = loadAuraSettings();
-        const mt = (item.media_type ?? "").toLowerCase();
-        const isSeriesLike = mt === "series" || mt === "anime";
-        // Re-verify eligibility + that the toggle is still on.
-        if (isSeriesLike) {
-          if (!s.libraryAutoRemoveWatchedSeries) return;
-          // Series completion is a persistent local flag either way, so this
-          // re-check is reliable regardless of `trusted`.
-          if (getManualWatchedState(item.id) !== "watched") return;
-        } else {
-          if (!s.libraryAutoRemoveWatchedMovies) return;
-          const off = typeof item.state?.timeOffset === "number" ? item.state.timeOffset : 0;
-          const dur = typeof item.state?.duration === "number" ? item.state.duration : 0;
-          const watched =
-            trusted || getManualWatchedState(item.id) === "watched" || (dur > 0 && off / dur >= 0.9);
-          if (!watched) return;
-        }
-        // Optimistic local removal + cloud tombstone - same path as the manual X.
-        setLibrary((prev) => prev.filter((i) => i.id !== item.id));
-        setRawLibrary((prev) => prev.filter((i) => libraryItemSeriesId(i.id) !== item.id));
-        if (getManualWatchedState(item.id) === "planned") setManualWatchedState(item.id, null);
-        void libraryRemoveAll(auth, item.id, rawLibraryRef.current)
-          .then((res) => {
-            if (res.removedCount > 0) {
-              showAppToast(`Auto-removed watched ${isSeriesLike ? "series" : "movie"} · ${item.name}`);
+        if (!item || item.temp) return null;
+        return autoRemoveStillWanted(item, trusted) ? item : null;
+      };
+      const timer = setTimeout(() => {
+        pending.delete(id);
+        void (async () => {
+          const auth = sessionRef.current?.auth_key;
+          if (!auth) return;
+          const first = eligibleItem();
+          if (!first) return;
+          const mt = (first.media_type ?? "").toLowerCase();
+          const isSeriesLike = mt === "series" || mt === "anime";
+          if (isSeriesLike) {
+            // Every provider, not one list: the one that dates the next episode
+            // need not be the first or the longest.
+            const verdict = await seriesFinishCheck(addonsRef.current, first).catch(() => "failed" as const);
+            if (verdict !== "finished") {
+              console.info(`[library] auto-remove kept series id=${id}: ${verdict === "failed" ? "a provider gave no episode list" : "airing or episode list unknown"}`);
+              return;
             }
-          })
-          .catch((err) => console.warn(`[library] auto-remove failed id=${item.id} err=${String(err)}`));
+          }
+          const item = eligibleItem();
+          if (!item || sessionRef.current?.auth_key !== auth) return;
+          // Optimistic local removal + cloud tombstone - same path as the manual X.
+          const libSnap = libraryRef.current;
+          const rawSnap = rawLibraryRef.current;
+          const wasPlanned = getManualWatchedState(item.id) === "planned";
+          setLibrary((prev) => prev.filter((i) => i.id !== item.id));
+          setRawLibrary((prev) => prev.filter((i) => libraryItemSeriesId(i.id) !== item.id));
+          if (wasPlanned) setManualWatchedState(item.id, null);
+          const undo = () => {
+            if (sessionRef.current?.auth_key !== auth) return;
+            restoreLibraryRows(item.id, libSnap, rawSnap);
+            if (wasPlanned) setManualWatchedState(item.id, "planned");
+          };
+          void libraryRemoveAll(auth, item.id, rawSnap)
+            .then((res) => {
+              if (res.removedCount > 0) {
+                showAppToast(`Auto-removed watched ${isSeriesLike ? "series" : "movie"} · ${item.name}`);
+              } else {
+                undo();
+              }
+            })
+            .catch((err) => {
+              console.warn(`[library] auto-remove failed id=${item.id} err=${String(err)}`);
+              undo();
+            });
+        })();
       }, 3000);
       pending.set(id, timer);
     };
@@ -7110,7 +7229,8 @@ export default function App() {
   // checkmark overlay) flips state in the same frame as the click. The
   // server confirmation lands ~250-2000 ms later via the
   // `aura:library-changed` re-fetch, which then either confirms or
-  // gently corrects the optimistic state.
+  // gently corrects the optimistic state. A failed write rolls itself back
+  // first, since the re-fetch may fail the same way.
   const handleLibraryToggle = useCallback(async (meta: MetaPreview, originPoint?: { x: number; y: number }) => {
     if (!session?.auth_key) {
       // Guest: surface that this is a Stremio-account-scoped feature.
@@ -7119,6 +7239,10 @@ export default function App() {
     }
     const inLib = library.some((i) => i.id === meta.id && !i.removed);
     const nowIso = new Date().toISOString();
+    const auth = session.auth_key;
+    const libSnap = libraryRef.current;
+    const rawSnap = rawLibraryRef.current;
+    const wasPlanned = getManualWatchedState(meta.id) === "planned";
 
     if (inLib) {
       // Optimistic remove — drop from BOTH normalized and raw views so
@@ -7134,7 +7258,7 @@ export default function App() {
       // orphaned Queue tile lingers for content the user no longer has
       // saved. Only "planned" is cleared; "watched"/"in-progress" are
       // independent historical marks that should survive a library remove.
-      if (getManualWatchedState(meta.id) === "planned") {
+      if (wasPlanned) {
         setManualWatchedState(meta.id, null);
       }
     } else {
@@ -7171,15 +7295,29 @@ export default function App() {
     }
 
     try {
-      await libraryToggle(session.auth_key, meta, library, rawLibraryRef.current);
+      await libraryToggle(auth, meta, library, rawSnap);
     } catch (err) {
-      if (String(err) === SESSION_EXPIRED) await handleSessionExpired();
-      // On any error, the impending `aura:library-changed` re-fetch
-      // (which DOESN'T fire on throw — let's force one) corrects the
-      // optimistic state. Trigger a refresh so UI snaps back to truth.
+      // A stale 401 is an old key's: it must not sign out the next account.
+      if (String(err) === SESSION_EXPIRED) {
+        if (sessionRef.current?.auth_key === auth) await handleSessionExpired();
+        return;
+      }
+      if (sessionRef.current?.auth_key !== auth) return;
+      if (inLib) {
+        if (wasPlanned) setManualWatchedState(meta.id, "planned");
+      } else {
+        setLibrary((prev) => prev.filter((i) => i.id !== meta.id));
+        setRawLibrary((prev) => prev.filter((i) => i.id !== meta.id));
+      }
+      restoreLibraryRows(meta.id, libSnap, rawSnap);
+      showAppToast(
+        inLib ? `Could not remove "${meta.name}" from your library` : `Could not add "${meta.name}" to your library`,
+        { tone: "danger" },
+      );
+      // library_put threw, so no `aura:library-changed` fired: force the re-fetch.
       window.dispatchEvent(new CustomEvent("aura:library-changed"));
     }
-  }, [session, library, handleSessionExpired]);
+  }, [session, library, handleSessionExpired, restoreLibraryRows]);
 
   // Library card "X" affordance. Uses libraryRemoveAll (not the simple
   // toggle) so phantom per-episode rows that were collapsed by the
@@ -7193,15 +7331,23 @@ export default function App() {
     // Optimistic remove — same shape as handleLibraryToggle's remove
     // path. Reads as instant feedback even though the
     // datastorePut + library_get round-trip takes a beat.
+    const auth = session.auth_key;
+    const libSnap = libraryRef.current;
+    const rawSnap = rawLibraryRef.current;
+    const wasPlanned = getManualWatchedState(item.id) === "planned";
     setLibrary((prev) => prev.filter((i) => i.id !== item.id));
     setRawLibrary((prev) =>
       prev.filter((i) => libraryItemSeriesId(i.id) !== item.id),
     );
     // Drop Queue (planned) membership too — see handleLibraryToggle's
     // remove branch for the rationale (planned ⟹ in library invariant).
-    if (getManualWatchedState(item.id) === "planned") {
+    if (wasPlanned) {
       setManualWatchedState(item.id, null);
     }
+    const undo = () => {
+      restoreLibraryRows(item.id, libSnap, rawSnap);
+      if (wasPlanned) setManualWatchedState(item.id, "planned");
+    };
 
     if (originPoint) {
       showFlyUpToast(`Removed from Library · ${item.name}`, {
@@ -7212,10 +7358,12 @@ export default function App() {
     }
 
     try {
-      const result = await libraryRemoveAll(session.auth_key, item.id, rawLibraryRef.current);
+      const result = await libraryRemoveAll(auth, item.id, rawSnap);
+      if (sessionRef.current?.auth_key !== auth) return;
       if (result.removedCount === 0) {
         // Nothing matched on the server — surface to the user, then
         // force a refresh so the optimistic state is reconciled.
+        undo();
         showAppToast(`Could not find "${item.name}" to remove`, { tone: "danger" });
         window.dispatchEvent(new CustomEvent("aura:library-changed"));
       } else if (!originPoint) {
@@ -7225,35 +7373,88 @@ export default function App() {
         showAppToast(`Removed "${item.name}" from library${suffix}`);
       }
     } catch (err) {
-      if (String(err) === SESSION_EXPIRED) await handleSessionExpired();
+      // A stale 401 is an old key's: it must not sign out the next account.
+      if (String(err) === SESSION_EXPIRED) {
+        if (sessionRef.current?.auth_key === auth) await handleSessionExpired();
+        return;
+      }
+      if (sessionRef.current?.auth_key !== auth) return;
+      undo();
+      showAppToast(`Could not remove "${item.name}" from your library`, { tone: "danger" });
       window.dispatchEvent(new CustomEvent("aura:library-changed"));
     }
-  }, [session, handleSessionExpired]);
+  }, [session, handleSessionExpired, restoreLibraryRows]);
 
   // One-time backlog sweep when an auto-remove toggle is first enabled and the
   // user confirms the Library prompt. Bulk version of handleLibraryRemove:
-  // optimistic drop of all victims at once, then parallel cloud tombstones
-  // against the pre-optimistic raw snapshot, then one summary toast.
-  const handleAutoRemoveSweep = useCallback((kind: "movie" | "series", victims: LibraryItem[]) => {
+  // optimistic drop of all victims at once, then ONE cloud write against the
+  // pre-optimistic raw snapshot (one refetch, not one per title), then a toast
+  // worded from what was written. Planned marks go only with a landed write.
+  // The prompt's series count is a peek at what happens to be cached, so each
+  // series is re-checked against every provider first; the rows stay until then.
+  // That wait can be long, so what it could have changed is read again after it,
+  // the same checks as scheduleRemoval's eligibleItem: a title started meanwhile
+  // would have its tombstone race the progress writes, a mark or toggle undone
+  // meanwhile stops its removal, and a failed write restores the rows as they are
+  // now rather than as the prompt saw them.
+  const handleAutoRemoveSweep = useCallback(async (kind: "movie" | "series", requested: LibraryItem[]) => {
     const auth = session?.auth_key;
-    if (!auth || victims.length === 0) return;
+    if (!auth || requested.length === 0) return;
+    if (kind === "series") showAppToast(`Checking ${requested.length} watched series...`);
+    const confirmed = kind === "series" ? await finishedSeriesOf(addonsRef.current, requested) : requested;
+    if (sessionRef.current?.auth_key !== auth) return;
+    const settings = loadAuraSettings();
+    if (!(kind === "series" ? settings.libraryAutoRemoveWatchedSeries : settings.libraryAutoRemoveWatchedMovies)) return;
+    const kept = requested.length - confirmed.length;
+    const confirmedIds = new Set(confirmed.map((v) => v.id));
+    const at = activeTargetRef.current;
+    const activeId = at ? (at.series_id ?? at.id) : null;
+    const victims = libraryRef.current.filter((i) =>
+      confirmedIds.has(i.id) && !i.removed && !i.temp && i.id !== activeId && autoRemoveStillWanted(i, false));
+    if (victims.length === 0) {
+      if (kept > 0) showAppToast(`Kept your ${kept} watched series: still airing, or could not be confirmed finished`);
+      return;
+    }
+    const keptNote = kept > 0 ? ` Kept ${kept} still airing or unconfirmed.` : "";
     const ids = new Set(victims.map((v) => v.id));
     const rawSnapshot = rawLibraryRef.current;
     setLibrary((prev) => prev.filter((i) => !ids.has(i.id)));
     setRawLibrary((prev) => prev.filter((i) => !ids.has(libraryItemSeriesId(i.id))));
-    for (const v of victims) {
-      if (getManualWatchedState(v.id) === "planned") setManualWatchedState(v.id, null);
+    let removedIds: string[] = [];
+    try {
+      ({ removedIds } = await libraryRemoveMany(auth, [...ids], rawSnapshot));
+    } catch (err) {
+      console.warn(`[library] auto-remove sweep failed err=${String(err)}`);
+      // A stale 401 is an old key's: it must not sign out the next account.
+      if (String(err) === SESSION_EXPIRED && sessionRef.current?.auth_key === auth) {
+        await handleSessionExpired();
+        return;
+      }
     }
-    void Promise.allSettled(
-      victims.map((v) => libraryRemoveAll(auth, v.id, rawSnapshot)),
-    ).then(() => {
-      const label =
-        kind === "movie"
-          ? (victims.length === 1 ? "movie" : "movies")
-          : "series";
-      showAppToast(`Removed ${victims.length} watched ${label} from your Library`);
-    });
-  }, [session]);
+    // Signed out or switched during the write: nothing here is that account's.
+    if (sessionRef.current?.auth_key !== auth) return;
+    const plural = kind === "movie" ? "movies" : "series";
+    if (removedIds.length === 0) {
+      setLibrary((prev) => {
+        const have = new Set(prev.map((i) => i.id));
+        return [...prev, ...victims.filter((v) => !have.has(v.id))];
+      });
+      setRawLibrary((prev) => {
+        const have = new Set(prev.map((i) => i.id));
+        return [...prev, ...rawSnapshot.filter((i) => ids.has(libraryItemSeriesId(i.id)) && !have.has(i.id))];
+      });
+      showAppToast(`Could not remove your watched ${plural}. They stay in your Library.`, { tone: "danger" });
+      window.dispatchEvent(new CustomEvent("aura:library-changed"));
+      return;
+    }
+    for (const id of removedIds) {
+      if (getManualWatchedState(id) === "planned") setManualWatchedState(id, null);
+    }
+    const label = kind === "movie" && victims.length === 1 ? "movie" : plural;
+    showAppToast((removedIds.length === victims.length
+      ? `Removed ${victims.length} watched ${label} from your Library.`
+      : `Removed ${removedIds.length} of ${victims.length} watched ${label} from your Library.`) + keptNote);
+  }, [session, handleSessionExpired]);
 
   // ── Card right-click — listens for "aura:card-context" events fired by
   //     CatalogCard / ContinueWatchingCard / PosterCard. App builds the menu
@@ -7978,30 +8179,40 @@ export default function App() {
 
   // ── Auth handlers ──
   const handleLoginSuccess = useCallback(async (sess: UserSession) => {
+    invalidateLibraryLoads();
     syncedAccountRef.current = null;
     refreshedAddonsRef.current.clear();
     addonsGenRef.current += 1;
     await applySettingsScope(sess);
+    // Nothing is known about this account's library yet, so the skeleton, not
+    // "empty". Here and not in loadLibrary: a refetch must not flash it, and
+    // not on sign-out: no load follows there.
+    setLibraryLoaded(false);
+    setLibrary([]); setRawLibrary([]);
     setSession(sess);
     setLandingDismissed(true);
     await Promise.all([loadSyncedAddons(sess), loadLibrary(sess)]);
-  }, [loadSyncedAddons, loadLibrary, applySettingsScope]);
+  }, [loadSyncedAddons, loadLibrary, applySettingsScope, invalidateLibraryLoads]);
 
   const handleContinueGuest = useCallback(() => {
+    invalidateLibraryLoads();
     applySettingsScope(null);
     setLandingDismissed(true);
-  }, [applySettingsScope]);
+  }, [applySettingsScope, invalidateLibraryLoads]);
 
   const handleLogout = useCallback(async () => {
+    invalidateLibraryLoads();
     await invoke("logout").catch(() => {});
     syncedAccountRef.current = null;
     refreshedAddonsRef.current.clear();
     addonsGenRef.current += 1;
     await applySettingsScope(null);
+    // Again: the old session's listeners can start a refetch until setSession lands.
+    invalidateLibraryLoads();
     setSession(null);
     setLibrary([]); setRawLibrary([]);
     loadLocalAddons();
-  }, [loadLocalAddons, applySettingsScope]);
+  }, [loadLocalAddons, applySettingsScope, invalidateLibraryLoads]);
 
 
   // ── Addon list handlers (passed to AddonsView) ──
@@ -8406,7 +8617,10 @@ export default function App() {
 
   useKeybindings({
     bindings: keybindings,
-    enabled: !showLogin,
+    // Every action below acts on the player. Off it the keys stay the page's:
+    // arrows scroll, Space presses a focused button, the volume is not silently
+    // changed and saved, and isChordBound lets Ctrl+F through to the search.
+    enabled: !showLogin && isPlayerActive,
     handlers: {
       "toggle-pause":     () => wtTogglePause(),
       // Step read at PRESS time, not when the handler map was built, so a
@@ -10664,7 +10878,9 @@ export default function App() {
         )}
         {activeView === "library" && (
           <LibraryView
-            library={libraryLoaded ? library : undefined}
+            library={libraryKnown ? library : undefined}
+            loadFailed={libraryLoadFailed}
+            onRetryLoad={retryLibraryLoad}
             session={session}
             onSelectMeta={openDetail}
             onRemoveItem={handleLibraryRemove}
@@ -10704,7 +10920,14 @@ export default function App() {
           <HistoryView onSelectMeta={openDetail} />
         )}
         {activeView === "queue" && (
-          <QueueView library={library} onSelectMeta={openDetail} />
+          <QueueView
+            library={library}
+            libraryLoaded={libraryKnown && !libraryLoadFailed}
+            loadFailed={libraryLoadFailed}
+            onRetryLoad={retryLibraryLoad}
+            addons={addons}
+            onSelectMeta={openDetail}
+          />
         )}
         {activeView === "airing" && (
           <AiringView library={library} addons={addons} onSelectMeta={openDetail} />
@@ -10715,7 +10938,7 @@ export default function App() {
       </div>
 
       {/* Account button — top-left, below the title bar's
-          SyncStatusChip. Same body-level placement as the bell /
+          ServiceStatusChip. Same body-level placement as the bell /
           refresh below so all three floating account/notification
           affordances inherit the `hidden` class during playback. */}
       <AccountButton
@@ -10970,7 +11193,7 @@ export default function App() {
           commitSpeed={wtCommitSpeed}
           onExitPlayback={handleExitPlayback}
           subsOpen={subsOpen}
-          downloadsOpen={downloadsPanelPhase !== "closed"}
+          downloadsOpen={downloadsPanelPhase !== "closed" || statusPanelPhase !== "closed"}
           setSubsOpen={setSubsOpen}
           isFullscreen={isFullscreen}
           onToggleFullscreen={toggleFullscreen}
@@ -11327,9 +11550,9 @@ export default function App() {
           // saved sign-in the vault could not read), so the hero's arc hold
           // must not engage. Not a bare `!session`: that is also true before
           // get_session resolves, the reload window the hold exists for. And
-          // not App's own flag, whose other readers (the Queue prune, the
-          // Library prop) keep their guest behaviour.
-          libraryLoaded={libraryLoaded || (authChecked && !session)}
+          // not App's own flag, whose other reader (the Queue prune) keeps its
+          // guest behaviour.
+          libraryLoaded={libraryKnown}
           trailerLaunchingId={trailerLaunching}
           trailerDepProgress={trailerDepProgress}
           openOnEpisodeId={lastPlayedEpisodeId}
@@ -11446,6 +11669,9 @@ export default function App() {
 
       {/* DevConsole — F12-toggled terminal-style log viewer */}
       <DevConsole />
+
+      {/* Performance Monitor: Alt+~, above everything, on every screen */}
+      <PerfMonitorHost bindings={keybindings} />
 
       {/* First-run crash reporting consent dialog. Renders only when the
           persisted `crash_reporting_consent` setting is `null` (the user

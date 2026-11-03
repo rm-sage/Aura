@@ -240,12 +240,19 @@ function ContextMenuRender({ x, y, items, onClose }: RenderProps) {
       if (sub && sub.contains(target)) return;
       onClose();
     };
-    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
+    // Capture phase, and stopped there: the window-level Escape handlers (App's,
+    // the catalog page's) would otherwise close the page under the menu too.
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      e.preventDefault();
+      e.stopPropagation();
+      onClose();
+    };
     window.addEventListener("mousedown", onDown);
-    window.addEventListener("keydown", onKey);
+    window.addEventListener("keydown", onKey, true);
     return () => {
       window.removeEventListener("mousedown", onDown);
-      window.removeEventListener("keydown", onKey);
+      window.removeEventListener("keydown", onKey, true);
     };
   }, [onClose]);
 

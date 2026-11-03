@@ -5,7 +5,19 @@ import { useCallback, useEffect, useState } from "react";
 import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { bumpImageEpoch } from "./imageCacheBust";
-import { HERO_BACKDROP_STORAGE_KEY, clearHeroBackdrops } from "./heroBackdrop";
+import { HERO_BACKDROP_STORAGE_KEY } from "./heroBackdrop";
+import { clearHistoryChecked, flushHistoryNow } from "./historyStore";
+import { dropPendingPush } from "./sync";
+import { reloadManualWatchedFromStorage } from "./manualWatched";
+import { reloadSkipMarksFromStorage } from "./skipMarks";
+import { reloadScrobbledFromStorage } from "./scrobbledStore";
+import { clearPersistentCache } from "./persistentCache";
+import { clearMetaCache } from "./metaCache";
+
+/** storage.rs HISTORY_ID: the watch-history file. User data, cleared through
+ *  the history store (a file delete under its hydrated in-memory list would be
+ *  written straight back), and flagged as such in the confirm. */
+const HISTORY_DISK_ID = "history-store";
 
 // ---------------------------------------------------------------------------
 // StorageReport - Settings → Storage panel.
@@ -42,7 +54,8 @@ interface StorageReportPayload {
 }
 
 interface LocalStorageEntry {
-  key: string;
+  /** The catalogue prefix: what the row's bytes add up, and what Clear removes. */
+  prefix: string;
   label: string;
   description: string;
   bytes: number;
@@ -67,13 +80,13 @@ const LOCAL_STORAGE_CATALOGUE: { prefix: string; label: string; description: str
   {
     prefix:      "aura:manual-state:",
     label:       "Manual watched + queue",
-    description: "Per-account watched, in-progress, and planned marks plus the Queue tab's order. Synced to Aura Cloud when you're signed in, so a signed-in device can re-merge the server copy after a clear; on a guest install this is the only copy. Skip annotations live in their own entry below and are NOT cleared with this one, so clear both together or skipped episodes keep their tag without a watched mark behind it.",
+    description: "Watched, in-progress, and planned marks plus the Queue tab's order, for every account on this device. Synced to Aura Cloud when you're signed in: a clear is local, your next mark replaces the cloud copy with what this device then holds, and another device's marks can come back; on a guest install this is the only copy. Skip annotations live in their own entry below and are NOT cleared with this one, so clear both together or skipped episodes keep their tag without a watched mark behind it.",
     destructive: true,
   },
   {
     prefix:      "aura:notifications:v1",
     label:       "Notifications history",
-    description: "Bell-panel notification list. Clearing wipes the history but doesn't affect future scans.",
+    description: "Bell-panel notification list. Clearing doesn't affect future scans. Synced to Aura Cloud when you're signed in: a clear is local, your next notification replaces the cloud copy with what this device then holds, and another device's notifications can come back.",
     destructive: false,
   },
   {
@@ -170,7 +183,7 @@ function formatBytes(n: number): string {
  *  sum across all matches. */
 function enumerateLocalStorage(): LocalStorageEntry[] {
   const out: LocalStorageEntry[] = [];
-  const acc = new Map<string, { entry: typeof LOCAL_STORAGE_CATALOGUE[number]; bytes: number; matchedKey: string }>();
+  const acc = new Map<string, number>();
   for (let i = 0; i < localStorage.length; i += 1) {
     const key = localStorage.key(i);
     if (!key || !key.startsWith("aura:")) continue;
@@ -179,21 +192,14 @@ function enumerateLocalStorage(): LocalStorageEntry[] {
     );
     if (!match) continue;
     const value = localStorage.getItem(key) ?? "";
-    const bytes = new Blob([value]).size;
-    const existing = acc.get(match.prefix);
-    if (existing) {
-      existing.bytes += bytes;
-    } else {
-      acc.set(match.prefix, { entry: match, bytes, matchedKey: key });
-    }
+    acc.set(match.prefix, (acc.get(match.prefix) ?? 0) + new Blob([value]).size);
   }
   for (const c of LOCAL_STORAGE_CATALOGUE) {
-    const hit = acc.get(c.prefix);
     out.push({
-      key:         hit?.matchedKey ?? c.prefix,
+      prefix:      c.prefix,
       label:       c.label,
       description: c.description,
-      bytes:       hit?.bytes ?? 0,
+      bytes:       acc.get(c.prefix) ?? 0,
       destructive: c.destructive,
     });
   }
@@ -208,6 +214,24 @@ function clearLocalStoragePrefix(prefix: string): void {
     if (key === prefix || key.startsWith(prefix)) toRemove.push(key);
   }
   for (const k of toRemove) localStorage.removeItem(k);
+}
+
+/** Re-read the mirror of a store just cleared, or its next write puts every
+ *  cleared entry back. The two synced stores' reloads fire the change event a
+ *  debounced push hangs off, and a clear must not publish the emptied blob. */
+function reloadMirrorOf(prefix: string): void {
+  if (prefix === "aura:manual-state:") {
+    reloadManualWatchedFromStorage();
+    dropPendingPush("manual-state");
+  } else if (prefix === "aura:skip-marks:") {
+    reloadSkipMarksFromStorage();
+    dropPendingPush("skip-marks");
+  } else if (prefix === "aura:scrobbled:" || prefix === "aura:scrobble-ineligible:") {
+    reloadScrobbledFromStorage();
+  } else if (prefix === "aura:notifications:v1") {
+    window.dispatchEvent(new CustomEvent("aura:notifications-cleared"));
+    dropPendingPush("notifications");
+  }
 }
 
 interface PendingClear {
@@ -253,18 +277,27 @@ export default function StorageReport() {
     if (pending.kind === "disk") {
       setBusy(true);
       try {
-        await invoke("clear_storage_item", { id: pending.target });
+        if (pending.target === HISTORY_DISK_ID) {
+          await clearHistoryChecked();
+          // Write now so the size shown below is the cleared file's.
+          await flushHistoryNow();
+        } else {
+          await invoke("clear_storage_item", { id: pending.target });
+        }
         await refresh();
       } catch (e) {
-        setError(String(e));
+        setError(e instanceof Error ? e.message : String(e));
       } finally {
         setBusy(false);
       }
     } else {
       // A key owned by a live in-memory cache must be cleared THROUGH that
       // cache, or its next write puts every cleared entry back.
-      if (pending.target === HERO_BACKDROP_STORAGE_KEY) clearHeroBackdrops();
-      else clearLocalStoragePrefix(pending.target);
+      if (pending.target === "aura:meta-cache:v2") clearMetaCache();
+      else if (!clearPersistentCache(pending.target)) {
+        clearLocalStoragePrefix(pending.target);
+        reloadMirrorOf(pending.target);
+      }
       setLocalEntries(enumerateLocalStorage());
     }
   }, [refresh]);
@@ -312,7 +345,7 @@ export default function StorageReport() {
                       kind: "disk",
                       target: e.id,
                       label: e.label,
-                      destructive: false,
+                      destructive: e.id === HISTORY_DISK_ID,
                     })}
                   />
                 )}
@@ -337,7 +370,7 @@ export default function StorageReport() {
         </div>
         <div className="divide-y divide-white/8 rounded-md border border-white/10 overflow-hidden">
           {localEntries.map((e) => (
-            <div key={e.key} className="flex items-start gap-3 px-3 py-2.5">
+            <div key={e.prefix} className="flex items-start gap-3 px-3 py-2.5">
               <div className="flex-1 min-w-0">
                 <div className="flex items-center gap-2">
                   <p className="text-white/90 text-[13px] font-medium leading-tight">{e.label}</p>
@@ -357,7 +390,7 @@ export default function StorageReport() {
                     destructive={e.destructive}
                     onClick={() => setPendingClear({
                       kind: "local",
-                      target: e.key,
+                      target: e.prefix,
                       label: e.label,
                       destructive: e.destructive,
                     })}
@@ -480,8 +513,10 @@ function ClearConfirmModal({
               {pending.destructive ? "Wipe user data?" : isImages ? "Reload posters?" : "Clear cache?"}
             </h3>
             <p className="text-white/70 text-[13px] leading-relaxed">
-              {pending.destructive
-                ? `This will permanently erase your ${pending.label.toLowerCase()} on this device. If you are signed in, Cloud Sync may restore some of it on the next pull, and Settings > Backup & Restore keeps local snapshots you can roll back to. Otherwise it is not recoverable.`
+              {pending.target === HISTORY_DISK_ID
+                ? "This erases your watch history on this device. If you are signed in, it also replaces the Aura Cloud copy with the empty list within seconds, and another signed-in device that still holds these rows can bring them back when it next syncs. Plays already scrobbled stay on Trakt, AniList and Simkl. A snapshot is taken first, so you can roll back from Settings > Backup & Restore."
+                : pending.destructive
+                ? `This will permanently erase ${pending.kind === "local" ? `the ${pending.label.toLowerCase()} of every account` : `your ${pending.label.toLowerCase()}`} on this device. If you are signed in, Cloud Sync may restore some of it on the next pull, and Settings > Backup & Restore keeps local snapshots you can roll back to. Otherwise it is not recoverable.`
                 : isImages
                   ? "Aura will re-download every poster, backdrop, and logo from source at the current size. Uses bandwidth; nothing is deleted. Use this after a poster source or size change."
                   : `Clear ${pending.label.toLowerCase()}? Aura will rebuild it on next use; this only frees storage.`

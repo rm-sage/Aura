@@ -50,6 +50,19 @@ interface Options {
   reclaimable?: boolean;
 }
 
+/** Every live cache by storage key, so Settings > Storage can clear one without
+ *  importing the module that owns it (App.tsx and DetailView.tsx hold theirs
+ *  privately). A cache whose module has not loaded has no mirror to clear. */
+const liveCaches = new Map<string, PersistentCache<unknown>>();
+
+/** Clear through the live cache, since a bare removeItem is written back,
+ *  cleared entries included, by its next save. False when none owns the key. */
+export function clearPersistentCache(storageKey: string): boolean {
+  const cache = liveCaches.get(storageKey);
+  cache?.clear();
+  return cache !== undefined;
+}
+
 export class PersistentCache<V> {
   private readonly storageKey: string;
   private readonly ttlMs: number;
@@ -64,6 +77,7 @@ export class PersistentCache<V> {
     this.maxEntries = opts.maxEntries ?? 1000;
     this.debounceMs = opts.debounceMs ?? 250;
     this.hydrate();
+    liveCaches.set(opts.storageKey, this as PersistentCache<unknown>);
     // Disposable cache: when the shared localStorage origin hits quota during
     // ANOTHER tenant's important write, yield room (drop our oldest half) rather
     // than letting that write fail silently. The data re-fetches on next use.
@@ -153,6 +167,8 @@ export class PersistentCache<V> {
   }
 
   clear(): void {
+    if (this.persistTimer) clearTimeout(this.persistTimer);
+    this.persistTimer = null;
     this.map.clear();
     try { localStorage.removeItem(this.storageKey); } catch { /* ignore */ }
   }

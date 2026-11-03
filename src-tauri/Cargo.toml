@@ -20,7 +20,15 @@ window-vibrancy = "0.5"
 libloading = "0.8"
 indexmap = { version = "2", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# float_roundtrip: parse floats to the exact f64 the writer meant. Without it
+# serde_json's fast path can land one ULP off, and the history store
+# (history_store.rs) must hand back exactly the watched_seconds / duration the
+# frontend gave it; its migration verifies the file byte-for-value before the
+# localStorage copy is deleted. A feature of a crate already here, not a new one.
+# raw_value: the history store's cloud merge answers with JSON text it built
+# once from the rows themselves (`RawValue`), instead of a `Value` copy of
+# every merged row that Tauri would then serialize into a second copy.
+serde_json = { version = "1", features = ["float_roundtrip", "raw_value"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 # gzip decompression for IPTV EPGs — many XMLTV guides are served as
 # `.xml.gz` FILES (body is gzip, not Content-Encoding), so reqwest's
@@ -173,6 +181,12 @@ windows = { version = "0.61", features = [
     # on a quota-managed share the two differ and only the former is what we
     # can actually write.
     "Win32_Storage_FileSystem",
+    # The Performance Monitor (perf_monitor.rs): total RAM, and each adapter's
+    # dedicated memory. dxgi.dll is loaded by hand there, so this adds types and
+    # no import.
+    "Win32_System_SystemInformation",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
 ] }
 
 # Dev-profile slimming. The default debug profile produced ~43 GB of

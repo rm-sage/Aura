@@ -35,7 +35,9 @@ const TYPE_LABELS: Record<string, string> = {
 
 export function typeLabel(rawType: string): string {
   const key = (rawType ?? "").toLowerCase().trim();
-  if (TYPE_LABELS[key]) return TYPE_LABELS[key];
+  // Own keys only: an addon-supplied "__proto__" or "constructor" must not reach
+  // Object.prototype (rendering that as a React child throws).
+  if (Object.prototype.hasOwnProperty.call(TYPE_LABELS, key)) return TYPE_LABELS[key];
   // Fallback: title-case the raw type
   return key ? key.charAt(0).toUpperCase() + key.slice(1) : "Other";
 }
@@ -51,7 +53,10 @@ export function withTypeSuffix(name: string, rawType: string): string {
   const label = typeLabel(rawType);
   if (!label) return name;
   // Don't double-tag if the catalog name already ends with (or contains) the label.
-  if (new RegExp(`\\b${label}\\b`, "i").test(name)) return name;
+  // The label can be an addon's raw type ("c++", "("): escape it, and use
+  // lookarounds because \b cannot follow a non-word character.
+  const escaped = label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  if (new RegExp(`(?<!\\w)${escaped}(?!\\w)`, "i").test(name)) return name;
   return `${name} ${label}`;
 }
 

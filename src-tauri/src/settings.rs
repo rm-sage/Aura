@@ -396,6 +396,9 @@ pub fn default_keybindings() -> HashMap<String, String> {
     m.insert("volume-up".into(),       "ArrowUp".into());
     m.insert("volume-down".into(),     "ArrowDown".into());
     m.insert("toggle-osd".into(),      "Backquote".into());
+    // The Performance Monitor window, Alt + the ~ key. Handled in PerfMonitor.tsx
+    // rather than useKeybindings, so it works while typing and on every page.
+    m.insert("perf-monitor".into(),    "Alt+Backquote".into());
     m.insert("cycle-shader".into(),    "KeyS".into());
     m.insert("toggle-subtitles".into(),"KeyV".into());
     m.insert("fullscreen".into(),      "KeyF".into());

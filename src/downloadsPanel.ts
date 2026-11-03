@@ -76,22 +76,20 @@ export function closeDownloadsPanel(): void {
   if (phase !== "open") return;
   // Reduced motion kills the exit keyframe in CSS, so holding the node for
   // 180 ms there would just freeze a static panel on screen for a fifth of a
-  // second. Collapse the delay instead of animating nothing.
+  // second. Collapse the delay, but keep a macrotask of "closing": this runs in
+  // a capture listener, and React can flush "closed" in the microtask before
+  // the video layer's mousedown reads anyMenuOpen, which would let that click
+  // toggle pause.
   const reduced =
     typeof document !== "undefined" &&
     document.documentElement.getAttribute("data-reduced-motion") === "true";
-  if (reduced) {
-    phase = "closed";
-    emit();
-    return;
-  }
   phase = "closing";
   emit();
   closeTimer = setTimeout(() => {
     closeTimer = null;
     phase = "closed";
     emit();
-  }, PANEL_CLOSE_MS);
+  }, reduced ? 0 : PANEL_CLOSE_MS);
 }
 
 /** Close with no exit animation. Used when the anchor disappears from under
@@ -107,4 +105,32 @@ export function closeDownloadsPanelImmediate(): void {
 export function toggleDownloadsPanel(): void {
   if (phase === "open") closeDownloadsPanel();
   else openDownloadsPanel();
+}
+
+/** The player is up: the app body is hidden, so a page cannot be navigated to
+ *  (App.tsx sets this class from isPlayerActive). */
+export function isPlayerActive(): boolean {
+  return document.documentElement.classList.contains("playing-video");
+}
+
+/** While a title-bar panel is up, keep the keys its controls need from the
+ *  window-level player keybindings: Space / Enter on a control inside it
+ *  (useKeybindings' preventDefault cancels the button press), Up / Down
+ *  anywhere inside it (they would change the volume instead of scrolling). The
+ *  bare panel root is only a focus landing spot, so Space there still pauses.
+ *  At the document, not on the panel: document listeners (dnd-kit's keyboard
+ *  drag in the Downloads list) still run, and every other key still reaches the
+ *  window. Returns the cleanup. */
+export function keepPanelKeysFromPlayer(panelSelector: string): () => void {
+  const onKey = (e: KeyboardEvent) => {
+    if (e.ctrlKey || e.altKey || e.shiftKey || e.metaKey) return;
+    if (!(e.target instanceof Element)) return;
+    const panel = e.target.closest(panelSelector);
+    if (!panel) return;
+    const arrow = e.code === "ArrowUp" || e.code === "ArrowDown";
+    const press = e.code === "Space" || e.code === "Enter";
+    if (arrow || (press && e.target !== panel)) e.stopPropagation();
+  };
+  document.addEventListener("keydown", onKey);
+  return () => document.removeEventListener("keydown", onKey);
 }

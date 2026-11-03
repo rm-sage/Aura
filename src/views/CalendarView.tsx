@@ -304,13 +304,20 @@ export default function CalendarView({ library, addons, onSelectMeta }: Props) {
   const { monthCells, rows } = useMemo(() => {
     const gridStart = startOfWeekMon(monthAnchor);
     const monthEnd = new Date(monthAnchor.getFullYear(), monthAnchor.getMonth() + 1, 0);
-    const daysSpanned = Math.floor((monthEnd.getTime() - gridStart.getTime()) / DAYS_MS) + 1;
+    // Rounded, not floored: both ends are local midnights, so across a DST
+    // change the gap is a whole number of days plus or minus an hour, and a
+    // floor on the 23-hour side counts one day short (which could cut a row).
+    const daysSpanned = Math.round((monthEnd.getTime() - gridStart.getTime()) / DAYS_MS) + 1;
     const weeksNeeded = Math.ceil(daysSpanned / 7);
     const r = Math.max(5, weeksNeeded);
     const totalCells = r * 7;
     const cells: { date: Date; inMonth: boolean }[] = [];
     for (let i = 0; i < totalCells; i++) {
-      const d = new Date(gridStart.getTime() + i * DAYS_MS);
+      // Built from date PARTS, never `gridStart + i * DAYS_MS`: a DST day is 23
+      // or 25 hours long, so on the 25-hour day the millisecond step landed at
+      // 23:00 of the SAME date. That showed Sunday Nov 1 2026 twice and left
+      // every later cell (and the releases keyed to it) one day behind.
+      const d = new Date(gridStart.getFullYear(), gridStart.getMonth(), gridStart.getDate() + i);
       cells.push({ date: d, inMonth: d.getMonth() === monthAnchor.getMonth() });
     }
     return { monthCells: cells, rows: r };
@@ -749,7 +756,7 @@ function DayOverlay({ date, entries, onClose, onSelectMeta }: DayOverlayProps) {
 
         {/* Card grid — scrollable */}
         <div
-          className="overflow-y-auto p-6"
+          className="aura-page-scroller overflow-y-auto p-6"
           style={{ scrollbarWidth: "thin", scrollbarColor: "rgba(255,255,255,0.08) transparent" }}
         >
           <div className="grid gap-4 grid-cols-2 md:grid-cols-3 lg:grid-cols-4">

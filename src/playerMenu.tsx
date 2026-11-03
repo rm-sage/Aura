@@ -11,7 +11,8 @@
 // hints. Every menu docked to the control bar (speed, audio, subtitles,
 // upscaler, subtitle style, more, trailer quality) is built from these pieces
 // so they read alike and cannot drift apart again; the centred dialogs
-// (Switch source, Cast, AuraSkip) share the same type scale.
+// (Switch source, Cast, AuraSkip) share the same type scale. Every docked menu
+// that owns its open state calls useMenuEscape, or Esc exits playback under it.
 //
 // Legibility over video is the point: a docked menu has no scrim, so nothing
 // here goes below 55% white for text a user has to read, and nothing below
@@ -36,6 +37,24 @@ export function useMenuWheelScroll(open: boolean, ref: RefObject<HTMLElement | n
     el.addEventListener("wheel", onWheel, { passive: false });
     return () => el.removeEventListener("wheel", onWheel);
   }, [open, ref]);
+}
+
+/** Esc closes an open docked menu. Capture phase, and stopped there: App's
+ *  window-level handler would exit playback and the overlay's would leave
+ *  fullscreen. `setOpen` is the menu's state setter (stable). Not for the
+ *  hover-opened volume slider, which must not eat the key. */
+export function useMenuEscape(open: boolean, setOpen: (open: boolean) => void): void {
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      e.preventDefault();
+      e.stopPropagation();
+      setOpen(false);
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [open, setOpen]);
 }
 
 /** A menu docked above its control-bar button. `position` replaces the

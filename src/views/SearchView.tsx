@@ -147,7 +147,7 @@ function SearchViewBody({ addons, installedAddons, query, onSelectMeta }: Props)
   return (
     <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
       <div
-        className="flex-1 overflow-y-auto"
+        className="aura-page-scroller flex-1 overflow-y-auto"
         style={{ scrollbarWidth: "thin", scrollbarColor: "rgba(255,255,255,0.08) transparent" }}
       >
         <div className="mx-auto px-2 py-4 space-y-2" style={{ maxWidth: PAGE_CONTENT_MAX_W }}>

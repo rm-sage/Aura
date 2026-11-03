@@ -32,12 +32,45 @@ const CHANGE_EVENT = "aura:settings-changed";
  *  Bumped by `bumpSettingsUpdatedAt()` (called from saveAuraSettings
  *  and from a sync-side listener on backend changes); replaced
  *  verbatim by the cloud-pull path so future readLocal calls reflect
- *  the cloud's authoritative timestamp. */
-const SETTINGS_UPDATED_AT_KEY = "aura:settings-updated-at";
+ *  the cloud's authoritative timestamp.
+ *
+ *  One key per sync scope: a device-wide stamp let a guest edit, or another
+ *  account's cloud stamp, beat this account's cloud copy. A scope that has not
+ *  synced reads 0, so the cloud wins, and a guest (no cloud) never stamps. */
+const SETTINGS_UPDATED_AT_PREFIX = "aura:settings-updated-at:";
+/** The device-wide key older builds wrote. */
+const LEGACY_SETTINGS_UPDATED_AT_KEY = "aura:settings-updated-at";
+
+let stampScope = "guest";
+
+function settingsStampKey(): string {
+  return `${SETTINGS_UPDATED_AT_PREFIX}${stampScope}`;
+}
+
+/** Follows sync.ts's active scope. `restoredSession`: this scope is the one the
+ *  last run ended in, the only one the legacy stamp can belong to (an edit whose
+ *  push never landed before the upgrade keeps it). */
+export function setSettingsStampScope(scope: string, restoredSession: boolean): void {
+  stampScope = scope;
+  try {
+    const legacy = localStorage.getItem(LEGACY_SETTINGS_UPDATED_AT_KEY);
+    if (legacy === null) return;
+    if (restoredSession && scope !== "guest" && localStorage.getItem(settingsStampKey()) === null) {
+      safeSetItem(settingsStampKey(), legacy);
+    }
+    localStorage.removeItem(LEGACY_SETTINGS_UPDATED_AT_KEY);
+  } catch { /* the merge degrades to "local 0": the cloud wins */ }
+}
+
+/** The account is being left. Auth keys rotate per login, so the key would
+ *  otherwise stay behind for good, one per login. */
+export function clearSettingsUpdatedAt(): void {
+  try { localStorage.removeItem(settingsStampKey()); } catch { /* ignore */ }
+}
 
 export function getSettingsUpdatedAt(): number {
   try {
-    const raw = localStorage.getItem(SETTINGS_UPDATED_AT_KEY);
+    const raw = localStorage.getItem(settingsStampKey());
     if (!raw) return 0;
     const n = parseInt(raw, 10);
     return Number.isFinite(n) && n > 0 ? n : 0;
@@ -47,10 +80,11 @@ export function getSettingsUpdatedAt(): number {
 }
 
 export function setSettingsUpdatedAt(unixSeconds: number): void {
+  if (stampScope === "guest") return;
   // Via safeSetItem so a full origin evicts a disposable cache and retries: a
   // dropped timestamp would let the cloud silently win the next settings merge.
   // Still non-fatal if it ultimately fails (merger degrades to "treat local 0").
-  safeSetItem(SETTINGS_UPDATED_AT_KEY, String(Math.floor(unixSeconds)));
+  safeSetItem(settingsStampKey(), String(Math.floor(unixSeconds)));
 }
 
 export function bumpSettingsUpdatedAt(): void {
@@ -329,6 +363,16 @@ export interface AuraSettings {
    *  portable (PORTABLE_AURA_FIELDS) and cloud-synced like the rest of this
    *  blob. Default false. */
   showAdvancedSettings: boolean;
+  /** Blend mouse wheel notches into one motion (src/wheelSmooth.ts). Default true.
+   *  Portable: it is about how the user likes scrolling to feel. */
+  smoothWheelScroll: boolean;
+  /** Debrid providers the title-bar service monitor checks, by id from
+   *  STATUS_PROVIDERS (src/serviceStatusStore.ts). Default empty: Aura cannot
+   *  tell which debrid service an addon is configured with, so the user picks.
+   *  A preference about the account's services, not this machine, so it is
+   *  portable (PORTABLE_AURA_FIELDS) and cloud-synced with the rest of the
+   *  blob. */
+  monitoredProviders: string[];
 }
 
 export const DEFAULT_AURA_SETTINGS: AuraSettings = {
@@ -370,6 +414,8 @@ export const DEFAULT_AURA_SETTINGS: AuraSettings = {
   airingSort: "recent",
   airingTileSize: "medium",
   showAdvancedSettings: false,
+  smoothWheelScroll: true,
+  monitoredProviders: [],
 };
 
 // Module-level memoization snapshot. loadAuraSettings is called many
@@ -515,9 +561,19 @@ function readFromStorage(): AuraSettings {
         ? (parsed.heroCatalog as AuraSettings["heroCatalog"])
         : null,
       heroDisabled: typeof parsed.heroDisabled === "boolean" ? parsed.heroDisabled : false,
+      smoothWheelScroll: typeof parsed.smoothWheelScroll === "boolean"
+        ? parsed.smoothWheelScroll
+        : true,
       showAdvancedSettings: typeof parsed.showAdvancedSettings === "boolean"
         ? parsed.showAdvancedSettings
         : false,
+      // Strings only, de-duplicated and capped: the list can arrive from a
+      // cloud blob or an import. Unknown ids are harmless (Rust ignores an id
+      // outside its table), so they are not filtered against the catalogue
+      // here, which would also make this module import the monitor's.
+      monitoredProviders: Array.isArray(parsed.monitoredProviders)
+        ? [...new Set(parsed.monitoredProviders.filter((p): p is string => typeof p === "string" && p.length <= 32))].slice(0, 12)
+        : [],
     };
   } catch {
     return { ...DEFAULT_AURA_SETTINGS };

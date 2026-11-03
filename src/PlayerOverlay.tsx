@@ -37,7 +37,7 @@ import SubtitleSyncPanel, { type SyncAnchorPair } from "./SubtitleSyncPanel";
 import { MenuTrackerCtx, useMenuOpenSync, type MenuTracker } from "./menuTracker";
 import {
   PlayerMenuButton, PlayerMenuChip, PlayerMenuDivider, PlayerMenuPanel, PlayerMenuRow,
-  PlayerMenuSection, PlayerMenuSlider, PlayerMenuToggle, MenuCheckIcon, useMenuWheelScroll,
+  PlayerMenuSection, PlayerMenuSlider, PlayerMenuToggle, MenuCheckIcon, useMenuEscape, useMenuWheelScroll,
 } from "./playerMenu";
 import { recommendUpscaler } from "./upscalerRecommend";
 import { noteEndingAutoSkipSeek } from "./nextUpGate";
@@ -411,6 +411,7 @@ function ShaderPicker({ activeTarget, loadKey, isAnime, readGate, controlsVisibl
   controlsVisible: boolean;
 }) {
   const [open, setOpen] = useState(false);
+  useMenuEscape(open, setOpen);
   // The playing video's display size (never polled), for the "Recommended"
   // tag: read once per title as soon as it is safe, so the pill can show a
   // recommendation before the menu was ever opened, and again on each open,
@@ -533,7 +534,8 @@ function ShaderPicker({ activeTarget, loadKey, isAnime, readGate, controlsVisibl
 
   // Pull current keybindings so the submenu can show each Anime4K
   // mode's chord. Refresh on `aura:keybindings-changed` so a Settings
-  // remap reflects immediately without a player restart.
+  // remap reflects immediately without a player restart, and on
+  // `aura:settings-changed` for a rebind that arrives by cloud pull.
   useEffect(() => {
     const refresh = () => {
       invoke<{ keybindings?: Record<string, string> }>("get_settings")
@@ -542,7 +544,11 @@ function ShaderPicker({ activeTarget, loadKey, isAnime, readGate, controlsVisibl
     };
     refresh();
     window.addEventListener("aura:keybindings-changed", refresh);
-    return () => window.removeEventListener("aura:keybindings-changed", refresh);
+    window.addEventListener("aura:settings-changed", refresh);
+    return () => {
+      window.removeEventListener("aura:keybindings-changed", refresh);
+      window.removeEventListener("aura:settings-changed", refresh);
+    };
   }, []);
 
   // Apply persisted shader for this title (if any) once the profile list
@@ -940,6 +946,7 @@ function SubtitleStyleMenu() {
   const [style, setStyle] = useState<SubStyle | null>(null);
   const ref = useRef<HTMLDivElement>(null);
   useMenuOpenSync(open);
+  useMenuEscape(open, setOpen);
 
   useEffect(() => {
     invoke<SubStyle>("get_settings").then(setStyle).catch(() => {});
@@ -1320,6 +1327,21 @@ function EpisodeEdgeTrigger({
     clearTimers();
     setOpen(false);
   }, [clearTimers]);
+
+  // Capture phase, and stopped there: EpisodePanel's own listener shares the
+  // window with App's, so Esc would close the drawer AND exit playback. An open
+  // season dropdown takes the key first.
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape" || document.querySelector("[data-season-select-popover]")) return;
+      e.preventDefault();
+      e.stopPropagation();
+      closeNow();
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [open, closeNow]);
 
   return (
     <>
@@ -2257,9 +2279,12 @@ export default function PlayerOverlay({
   // the more-menu, etc.) so those can scroll their content normally.
   useEffect(() => {
     const onWheel = (e: WheelEvent) => {
+      // The wheel smoother already moved a list with this notch.
+      if (e.defaultPrevented) return;
       // Walk up the target chain — if any ancestor has overflow-y auto/scroll
-      // AND content larger than its container, defer to the browser.
-      let el = e.target instanceof HTMLElement ? e.target : null;
+      // AND content larger than its container, defer to the browser. Element, not
+      // HTMLElement: the wheel can land on an icon's SVG inside a list.
+      let el: Element | null = e.target instanceof Element ? e.target : null;
       while (el && el !== document.body) {
         const cs = window.getComputedStyle(el);
         const oy = cs.overflowY;
@@ -2278,7 +2303,8 @@ export default function PlayerOverlay({
     return () => window.removeEventListener("wheel", onWheel);
   }, [volume, commitVolume]);
 
-  // Esc exits fullscreen first; if not in fullscreen, fall through to nothing.
+  // Esc exits fullscreen; windowed, App's handler exits playback. An open menu
+  // or panel takes the key before either (capture phase, useMenuEscape).
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape" && isFullscreen) {
@@ -3784,6 +3810,7 @@ function SpeedMenu({
   const ref = useRef<HTMLDivElement>(null);
   const bodyRef = useRef<HTMLDivElement>(null);
   useMenuOpenSync(open);
+  useMenuEscape(open, setOpen);
   useMenuWheelScroll(open, bodyRef);
 
   useEffect(() => {
@@ -3876,6 +3903,7 @@ function TrailerQualityMenu({
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
   useMenuOpenSync(open);
+  useMenuEscape(open, setOpen);
 
   // Only show rungs this title actually offers (+ Auto, which always maps to
   // the best available) so the user can't pick a resolution that doesn't exist.
@@ -3983,6 +4011,7 @@ function TrackMenu({
   const ref = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   useMenuOpenSync(open);
+  useMenuEscape(open, setOpen);
   // Mousewheel-over-dropdown: scroll the menu instead of letting the
   // overlay's volume-wheel handler steal the event.
   useMenuWheelScroll(open, scrollRef);
@@ -4127,6 +4156,7 @@ function MoreMenu({
   skipWindows: AuraSkipWindow[];
 }) {
   const [open, setOpen] = useState(false);
+  useMenuEscape(open, setOpen);
   const [aniskipOpen, setAniskipOpen] = useState(false);
   // AniSkip rows a theme match replaced: listed (with vote arrows) by the
   // AuraSkip menu only, never handed to the scrubber or the SkipController.

@@ -403,7 +403,20 @@ function LiveBody({ active, playerActive, onPlayChannel }: Props) {
               <input
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key !== "Escape") return;
+                  // Clear first, then give the keys back to the page: useKeybindings
+                  // ignores a focused input.
+                  if (query) {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    setQuery("");
+                  } else {
+                    e.currentTarget.blur();
+                  }
+                }}
                 placeholder={favoritesView ? "Search favorites…" : "Search channels…"}
+                data-aura-search
                 className="h-9 w-64 max-w-full px-3 rounded-xl bg-white/5 border border-white/10
                            text-[13px] text-white/90 placeholder:text-white/30
                            focus:outline-none focus:border-ln-accent/40"

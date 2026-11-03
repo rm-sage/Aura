@@ -2,9 +2,12 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { invoke } from "@tauri-apps/api/core";
-import { loadAuraSettings, saveAuraSettings, getSettingsUpdatedAt, setSettingsUpdatedAt, bumpSettingsUpdatedAt, type AuraSettings, DEFAULT_AURA_SETTINGS } from "./auraSettings";
+import { loadAuraSettings, saveAuraSettings, getSettingsUpdatedAt, setSettingsUpdatedAt, bumpSettingsUpdatedAt, setSettingsStampScope, clearSettingsUpdatedAt, type AuraSettings, DEFAULT_AURA_SETTINGS } from "./auraSettings";
 import { encryptForCloud, decryptFromCloud, isEncryptedBlob, type EncryptedBlob } from "./syncCrypto";
-import { getHistory, setAllHistory, type HistoryEntry } from "./historyStore";
+import {
+  encodeHistoryForCloud, mergeHistoryFromCloud, historyChangeReason, getHistoryScope,
+  historyNeedsCloudMerge, noteHistoryCloudAbsent, noteHistoryCloudPushed,
+} from "./historyStore";
 import { isWindowHidden, subscribeWindowVisibility } from "./windowVisibility";
 import { safeSetItem } from "./storageQuota";
 
@@ -41,9 +44,8 @@ import { safeSetItem } from "./storageQuota";
 //      `session?.auth_key` flips from null to set, OR when the
 //      active session changes.
 //
-// Sync is paused while playback is active so the per-frame work stays
-// clear of network I/O. Pushes that fire during playback queue and
-// flush on the first pause OR on `aura:playback-ended`.
+// Sync keeps running during playback: nothing here is on the playback path,
+// and a hidden or occluded window is what pauses the background pull.
 // ---------------------------------------------------------------------------
 
 // ── Wire types (mirror sync.rs) ──────────────────────────────────────────
@@ -131,9 +133,22 @@ const LOCAL_KEYS: Partial<Record<SyncNamespace, string>> = {
 // launch refetches every namespace even when nothing changed. Cleared on
 // account switch (clearSyncEtags) so a new account doesn't carry forward
 // the previous one's etags.
+//
+// The history etag is stored under its own field, never `history`. v2.2.4 reads
+// `history` from this same key, so after a downgrade it sent our etag, got a
+// 304, merged nothing (its localStorage copy is gone) and its first play replaced
+// the whole cloud copy with one row. Without the field it takes a 200 and merges
+// the plain head. It rewrites this blob without our field, and a `history` it
+// wrote is never adopted, so a re-upgrade takes a 200 too and `pullHistory`
+// republishes. The cost is one full history pull after upgrading.
 
 const lastEtag: Map<SyncNamespace, string> = new Map();
 const ETAG_STORAGE_PREFIX = "aura:sync:etags:";
+const HISTORY_ETAG_FIELD = "history:v2";
+
+function etagField(ns: SyncNamespace): string {
+  return ns === "history" ? HISTORY_ETAG_FIELD : ns;
+}
 
 function etagStorageKey(): string {
   return `${ETAG_STORAGE_PREFIX}${activeScope()}`;
@@ -149,11 +164,19 @@ function loadEtagsForActiveScope(): void {
     if (!raw) return;
     const parsed = JSON.parse(raw);
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return;
+    const rec = parsed as Record<string, unknown>;
     for (const ns of SYNC_NAMESPACES) {
-      const val = (parsed as Record<string, unknown>)[ns];
+      const val = rec[etagField(ns)];
       if (typeof val === "string" && val.length > 0) {
         lastEtag.set(ns, val);
       }
+    }
+    // Stripped NOW, not at the next persistEtags: a launch where everything
+    // answers 304 never persists, and a downgrade right after it would 304.
+    if ("history" in rec) {
+      delete rec.history;
+      if (Object.keys(rec).length === 0) localStorage.removeItem(etagStorageKey());
+      else safeSetItem(etagStorageKey(), JSON.stringify(rec));
     }
   } catch {
     // Corrupt JSON / quota error — fall through with an empty Map; the
@@ -168,7 +191,7 @@ function loadEtagsForActiveScope(): void {
  *  within a single session. */
 function persistEtags(): void {
   const obj: Record<string, string> = {};
-  for (const [ns, etag] of lastEtag) obj[ns] = etag;
+  for (const [ns, etag] of lastEtag) obj[etagField(ns)] = etag;
   if (Object.keys(obj).length === 0) {
     try { localStorage.removeItem(etagStorageKey()); } catch { /* ignore */ }
     return;
@@ -179,13 +202,35 @@ function persistEtags(): void {
   safeSetItem(etagStorageKey(), JSON.stringify(obj));
 }
 
+/** The scope clearSyncEtags left, until the setSyncActiveScope paired with it says
+ *  where it went. Only a real change drops what is stored: re-applying the SAME
+ *  scope (React.StrictMode runs the startup effect twice in `tauri dev`) would lose
+ *  the etags, stamp and marker, so the next pull is a 200 the cloud wins over an
+ *  unpublished edit. */
+let scopeBeingLeft: string | null = null;
+
+/** Forget the active scope's stored etags, settings stamp and marker. */
+function dropStoredScopeState(): void {
+  try {
+    localStorage.removeItem(etagStorageKey());
+    localStorage.removeItem(settingsUnpushedKey());
+  } catch {}
+  clearSettingsUpdatedAt();
+}
+
+/** Always paired, in one tick, with a following setSyncActiveScope. */
 export function clearSyncEtags(): void {
-  // Drop the persisted blob for the OUTGOING scope before we mutate
-  // _activeScope — otherwise the removeItem in persistEtags would land
-  // on the wrong key. Callers typically pair clearSyncEtags with a
-  // following setSyncActiveScope, so the order matters.
-  try { localStorage.removeItem(etagStorageKey()); } catch {}
+  scopeBeingLeft = activeScope();
+  resetSyncSession();
+}
+
+function resetSyncSession(): void {
   lastEtag.clear();
+  historyCloudAbsent = false;
+  settingsCloudAbsent = false;
+  // A pull or push already in flight belongs to the account being left: it
+  // must not merge into, or stamp etags for, the next one (see accountGen).
+  accountGen++;
   // Reset the pull min-interval guard too — a fresh account swap
   // should pull immediately, not wait out a 30s floor that was set
   // by the previous account's pull.
@@ -219,15 +264,27 @@ let _activeScope: string = "guest";
 
 export function setSyncActiveScope(scope: string | null): void {
   const next = scope && scope.trim() ? scope : "guest";
-  if (next === _activeScope) return;
+  const left = scopeBeingLeft;
+  scopeBeingLeft = null;
+  // Before _activeScope moves: these keys are per scope.
+  if (left !== null && left !== next) dropStoredScopeState();
+  // Etags still stored for the scope being entered prove it is the one the last
+  // run ended in: every account change removes them. Before the same-scope return,
+  // because a guest launch never changes scope.
+  let restored = false;
+  try { restored = localStorage.getItem(`${ETAG_STORAGE_PREFIX}${next}`) !== null; } catch { /* no */ }
+  setSettingsStampScope(next, restored);
+  if (next === _activeScope) {
+    // clearSyncEtags emptied the Map, and this scope's stored entry still holds.
+    // A same-scope call without it keeps the Map: it may hold etags freshly
+    // written by a just-completed pull or push.
+    if (left !== null) loadEtagsForActiveScope();
+    return;
+  }
   _activeScope = next;
   // Rehydrate the per-namespace etag Map from this scope's persisted
   // entry so an app restart can immediately use If-None-Match on the
-  // first pull. clearSyncEtags wipes the previous scope's storage
-  // before this point on a real account switch; on a same-scope
-  // re-call (no-op guarded above) we'd skip the reload to avoid
-  // clobbering in-memory etags freshly written by a just-completed
-  // pull or push.
+  // first pull.
   loadEtagsForActiveScope();
 }
 
@@ -466,34 +523,12 @@ const mergeAnilistIdMap: MergeFn<{ by_show?: Record<string, AnilistMapEntry> }> 
   return { by_show: out };
 };
 
-interface HistoryWireEntry {
-  id: string;
-  played_at: string;
-  [k: string]: unknown;
-}
-
-/** History merger — union by (id, played_at) so the same play
- *  captured on multiple devices dedupes, sorted newest-first, capped
- *  at 1000. Server entries iterate first so a local re-watch with
- *  the exact same timestamp (vanishingly rare, but cheap to handle)
- *  keeps the server copy's enrichment (poster URL etc) over a
- *  potentially sparser local row. */
-const mergeHistory: MergeFn<HistoryWireEntry[]> = (local, server) => {
-  const list: HistoryWireEntry[] = [];
-  const seen = new Set<string>();
-  const push = (e: HistoryWireEntry | undefined | null) => {
-    if (!e || typeof e !== "object") return;
-    if (typeof e.id !== "string" || typeof e.played_at !== "string") return;
-    const key = `${e.id}::${e.played_at}`;
-    if (seen.has(key)) return;
-    seen.add(key);
-    list.push(e);
-  };
-  if (Array.isArray(server)) for (const e of server) push(e);
-  if (Array.isArray(local))  for (const e of local)  push(e);
-  list.sort((a, b) => b.played_at.localeCompare(a.played_at));
-  return list.slice(0, 1000);
-};
+// History never reaches MERGERS: its merge runs in Rust over the whole on-disk
+// history (history_store.rs `apply_cloud_merge`, the same server-wins union by
+// (id, played_at), now uncapped) and only the delta comes back, so a pull no
+// longer ships the full list through the webview twice. See pullHistory /
+// pushHistoryNow below. The entry here only satisfies the Record type.
+const mergeHistory: MergeFn<unknown> = (local) => local;
 
 // Per-namespace merge wiring. recent-searches and title-state use
 // shape-validating server-wins (the previous unconditional server-wins
@@ -690,6 +725,29 @@ async function readSettingsBlob(): Promise<SettingsSyncBlob> {
 }
 
 async function writeSettingsBlob(blob: Partial<SettingsSyncBlob>): Promise<void> {
+  const gen = accountGen;
+  // The backend half goes FIRST: the frontend save below raises the fromCloud
+  // `aura:settings-changed`, and everything that reads get_settings on it (App's
+  // bindings and audio prefs, the skip re-stamp, subtitle style) must see these.
+  if (blob.backend) {
+    // Same carve-out on the way in. Re-reading the local values and pinning
+    // them into the patch is what makes this safe against the shallow merge
+    // described in applyBackendSettings: omitting a key is not enough if the
+    // incoming blob still has it.
+    const localBackend = await readBackendSettings();
+    // That read can span an account change, and the write would land in the new
+    // scope's file.
+    if (gen !== accountGen) return;
+    await applyBackendSettings({
+      ...blob.backend,
+      download_dir: localBackend.download_dir,
+      screenshot_dir: localBackend.screenshot_dir,
+      gpu_acceleration: localBackend.gpu_acceleration,
+    });
+    if (gen !== accountGen) return;
+    // After the write landed, and never a local edit (see installSyncTriggers).
+    window.dispatchEvent(new CustomEvent("aura:backend-settings-changed", { detail: { fromCloud: true } }));
+  }
   if (blob.frontend) {
     // fromCloud: true suppresses the bumpSettingsUpdatedAt() inside
     // saveAuraSettings — we want the local stamp to inherit the
@@ -710,19 +768,10 @@ async function writeSettingsBlob(blob: Partial<SettingsSyncBlob>): Promise<void>
       },
       { fromCloud: true },
     );
-  }
-  if (blob.backend) {
-    // Same carve-out on the way in. Re-reading the local values and pinning
-    // them into the patch is what makes this safe against the shallow merge
-    // described in applyBackendSettings: omitting a key is not enough if the
-    // incoming blob still has it.
-    const localBackend = await readBackendSettings();
-    await applyBackendSettings({
-      ...blob.backend,
-      download_dir: localBackend.download_dir,
-      screenshot_dir: localBackend.screenshot_dir,
-      gpu_acceleration: localBackend.gpu_acceleration,
-    });
+  } else if (blob.backend) {
+    // keys: an event with no list reads as "everything changed" and refetches
+    // the Home grid.
+    window.dispatchEvent(new CustomEvent("aura:settings-changed", { detail: { keys: [], fromCloud: true } }));
   }
   // Decrypt the API-keys blob (if present) and persist the
   // contained values to the local OS keyring. Silently skips when
@@ -733,11 +782,11 @@ async function writeSettingsBlob(blob: Partial<SettingsSyncBlob>): Promise<void>
   // up.
   if (blob.api_keys && isEncryptedBlob(blob.api_keys)) {
     const userId = await activeUserId();
-    if (userId) {
+    if (userId && gen === accountGen) {
       try {
         const pt = await decryptFromCloud(blob.api_keys, userId);
         const parsed = JSON.parse(pt) as ApiKeysPlaintext;
-        await writeApiKeyBundle(parsed);
+        if (gen === accountGen) await writeApiKeyBundle(parsed);
       } catch (e) {
         console.warn(`[sync] api-keys decrypt/apply failed: ${String(e)}`);
       }
@@ -748,7 +797,7 @@ async function writeSettingsBlob(blob: Partial<SettingsSyncBlob>): Promise<void>
   // wins in the merger? No, equal returns server too because the
   // strict `>` check fails). Either way, subsequent pulls won't
   // re-clobber.
-  if (typeof blob.updated_at === "number" && blob.updated_at > 0) {
+  if (gen === accountGen && typeof blob.updated_at === "number" && blob.updated_at > 0) {
     setSettingsUpdatedAt(blob.updated_at);
   }
 }
@@ -778,11 +827,8 @@ async function readLocal(namespace: SyncNamespace): Promise<unknown> {
       return m.getSkippedIds();
     } catch { return []; }
   }
-  if (namespace === "history") {
-    // historyStore reads from its scoped localStorage entry — same
-    // shape that flies on the wire (an array of HistoryEntry).
-    return getHistory();
-  }
+  // "history" is handled by pullHistory / pushHistoryNow and never read here.
+  if (namespace === "history") return null;
 
   const lsKey = LOCAL_KEYS[namespace];
   if (!lsKey) return null;
@@ -830,13 +876,8 @@ async function writeLocal(namespace: SyncNamespace, value: unknown): Promise<voi
     }
     return;
   }
-  if (namespace === "history") {
-    // silent: true keeps writeLocal off the aura:history-changed →
-    // debouncedPush bus so a pull doesn't immediately schedule a
-    // re-push of the same merged blob.
-    setAllHistory(value as HistoryEntry[], { silent: true });
-    return;
-  }
+  // "history" merges in Rust (mergeHistoryFromCloud); nothing to write here.
+  if (namespace === "history") return;
 
   const lsKey = LOCAL_KEYS[namespace];
   if (!lsKey) return;
@@ -944,6 +985,13 @@ function writeManualStateAggregate(value: ManualState): void {
 // ── Public API ────────────────────────────────────────────────────────────
 
 let pullAllInflight: Promise<void> | null = null;
+/** Bumped by clearSyncEtags, i.e. on every account change. A pull or push
+ *  compares the value it started with: Rust answered it with the session of
+ *  that moment, so once the account changed its blobs belong to the previous
+ *  account and are dropped rather than merged into the new one. */
+let accountGen = 0;
+/** accountGen of the pull in `pullAllInflight`. */
+let pullAllGen = 0;
 /** True while a pull sweep is mid-merge. `syncPushNow` defers when set
  *  so a user mutation that fires DURING the pull doesn't get
  *  overwritten by the soon-to-land merged write. The push trigger
@@ -974,7 +1022,13 @@ let lastPullCompletedAt = 0;
  * sweep, matching the Rust side's best-effort intent.
  */
 export function syncPullAll(): Promise<void> {
-  if (pullAllInflight) return pullAllInflight;
+  if (pullAllInflight) {
+    // A pull for the PREVIOUS account is still running: run this account's
+    // own pull after it, instead of handing back one that will discard
+    // everything it fetched.
+    if (pullAllGen !== accountGen) return pullAllInflight.then(() => syncPullAll());
+    return pullAllInflight;
+  }
   // Min-interval guard: if a successful pull completed less than
   // PULL_MIN_INTERVAL_MS ago (and the account hasn't changed since,
   // which would have called clearSyncEtags and reset the timestamp),
@@ -984,6 +1038,11 @@ export function syncPullAll(): Promise<void> {
     return Promise.resolve();
   }
   pullInFlight = true;
+  const gen = accountGen;
+  pullAllGen = gen;
+  // Captured BEFORE the fetch: the history blob is merged into this scope
+  // or not at all (mergeHistoryFromCloud).
+  const historyScope = getHistoryScope();
   pullAllInflight = (async () => {
     try {
       // Snapshot the in-memory etag Map and forward as If-None-Match
@@ -994,6 +1053,9 @@ export function syncPullAll(): Promise<void> {
       // (404 → no server-side blob, drop any stale etag we hold).
       const etagMap: Record<string, string> = {};
       for (const [ns, etag] of lastEtag) {
+        // A history file set aside as unreadable, or missing, needs the cloud
+        // copy itself, and a 304 would skip the merge it is waiting for.
+        if (ns === "history" && historyNeedsCloudMerge()) continue;
         if (etag) etagMap[ns] = etag;
       }
       const outcomes = await invoke<PullOutcome[]>("sync_pull_all", {
@@ -1001,6 +1063,9 @@ export function syncPullAll(): Promise<void> {
       });
       let etagsMutated = false;
       for (const outcome of outcomes) {
+        // The account changed while this was in flight: what is left belongs
+        // to the previous one (the chained pull fetches the new account's).
+        if (gen !== accountGen) break;
         // Any outcome at all (200 / 304 / 404) means the proxy now accepts
         // this name, so release a latch set while it did not. Lets a proxy
         // deploy take effect on the next sweep instead of needing a restart.
@@ -1009,20 +1074,43 @@ export function syncPullAll(): Promise<void> {
         if (answeredNs && unsupportedNamespaces.delete(answeredNs)) {
           console.info(`[sync] proxy now accepts "${answeredNs}" - resuming sync for it`);
         }
+        if (answeredNs === "history") historyCloudAbsent = outcome.status === "missing";
+        if (answeredNs === "settings") settingsCloudAbsent = outcome.status === "missing";
         if (outcome.status === "fresh") {
           const blob = outcome.blob;
           const ns = blob.namespace as SyncNamespace;
           if (!SYNC_NAMESPACES.includes(ns)) continue;
           try {
-            const local  = await readLocal(ns);
-            const merger = MERGERS[ns];
-            const merged = merger(local, blob.data);
-            await writeLocal(ns, merged);
-            // The settings write is fromCloud and schedules no push. When the
-            // merge KEPT this device's newer blob (a change whose push never
-            // landed: app closed inside the debounce, or the push failed),
-            // push it here, or it would wait for the next local change.
-            if (ns === "settings" && merged === local) debouncedPush("settings");
+            if (ns === "history") {
+              // Not hydrated yet: leave the etag alone so the next pull
+              // fetches this blob again instead of 304-ing past it.
+              if (!(await pullHistory(blob.data, historyScope))) continue;
+            } else {
+              const seenSettingsEdit = ns === "settings" ? readSettingsUnpushed() : null;
+              const local  = await readLocal(ns);
+              if (gen !== accountGen) break;
+              const merger = MERGERS[ns];
+              // No etag: this device has never merged this account's settings, so
+              // what it holds came from the previous scope (Rust's cache, the
+              // device-wide frontend blob). An edit on top of that, made while the
+              // first pull failed, must not beat the cloud copy.
+              const merged = ns === "settings" && !lastEtag.has("settings")
+                ? blob.data
+                : merger(local, blob.data);
+              // A kept local blob has nothing to apply, and writing it back would
+              // revert an edit made during the read: the blob's stamp is read last,
+              // so it carries that edit's stamp over the values from before it.
+              if (ns !== "settings" || merged !== local) await writeLocal(ns, merged);
+              if (gen !== accountGen) break;
+              // The settings write is fromCloud and schedules no push. When a 200's
+              // merge KEPT this device's newer blob, push it here, or it would wait
+              // for the next local change. A 304 never gets here: see the
+              // not_modified branch.
+              if (ns === "settings") {
+                if (merged === local) debouncedPush("settings");
+                else clearSettingsUnpushed(seenSettingsEdit);
+              }
+            }
             if (lastEtag.get(ns) !== blob.etag) {
               lastEtag.set(ns, blob.etag);
               etagsMutated = true;
@@ -1041,6 +1129,10 @@ export function syncPullAll(): Promise<void> {
             lastEtag.set(ns, outcome.etag);
             etagsMutated = true;
           }
+          // The cloud is the copy this device merged, so an edit still marked
+          // never landed: publish it. Armed here, not at the end of the pull: a
+          // pull that did not answer for settings proves nothing about the etag.
+          if (ns === "settings" && readSettingsUnpushed() !== null) debouncedPush("settings");
         } else if (outcome.status === "missing") {
           // 404 — server has no blob for this namespace. Drop any
           // local etag pointing at a vanished blob so the next pull
@@ -1048,19 +1140,25 @@ export function syncPullAll(): Promise<void> {
           // ignore anyway, and a subsequent push can force-overwrite
           // without an If-Match round-trip.
           const ns = outcome.namespace as SyncNamespace;
+          // No cloud history at all: a set-aside file has nothing to wait for.
+          if (ns === "history" && getHistoryScope() === historyScope) noteHistoryCloudAbsent(historyScope);
           if (SYNC_NAMESPACES.includes(ns) && lastEtag.has(ns)) {
             lastEtag.delete(ns);
             etagsMutated = true;
           }
+          // Nothing in the cloud to overwrite, so the null If-Match is safe.
+          if (ns === "settings" && readSettingsUnpushed() !== null) debouncedPush("settings");
         }
       }
-      if (etagsMutated) persistEtags();
+      if (etagsMutated && gen === accountGen) persistEtags();
     } catch (e) {
       console.warn("[sync] pull_all failed:", e);
     } finally {
       pullInFlight = false;
       pullAllInflight = null;
-      lastPullCompletedAt = Date.now();
+      // Only a pull for the CURRENT account arms the min-interval floor;
+      // a discarded one must not hold the new account's pull off.
+      if (gen === accountGen) lastPullCompletedAt = Date.now();
       // Flush any pushes that were deferred while the pull held the
       // gate. We schedule them through the normal debounce so the
       // 5s rate-limiting still applies (otherwise a flurry of marks
@@ -1068,6 +1166,21 @@ export function syncPullAll(): Promise<void> {
       const flushed = Array.from(deferredPushes);
       deferredPushes.clear();
       for (const ns of flushed) debouncedPush(ns);
+      // A history edit whose push never landed (app closed inside the
+      // debounce, a failed push, one dropped while a set-aside file waited
+      // for this merge): republish now that the cloud copy is merged. See
+      // "History: unpublished-change marker". Never for a guest (no cloud),
+      // and never while the set-aside latch still holds the push back. A pull
+      // that did not answer for history is stopped by pushHistoryNow's own gate.
+      if (
+        gen === accountGen &&
+        activeScope() !== "guest" &&
+        getHistoryScope() === historyScope &&
+        !historyNeedsCloudMerge() &&
+        readHistoryUnpushed(historyScope) !== null
+      ) {
+        debouncedPush("history");
+      }
     }
   })();
   return pullAllInflight;
@@ -1147,32 +1260,71 @@ export async function syncPushNow(namespace: SyncNamespace): Promise<void> {
     deferredPushes.add(namespace);
     return;
   }
+  if (namespace === "history") {
+    if (!(await pushHistoryNow())) {
+      throw new Error("held until the cloud copy has been merged here; it publishes after the next pull");
+    }
+    return;
+  }
+  if (namespace === "settings") {
+    if (activeScope() === "guest") return;
+    if (!lastEtag.has("settings") && !settingsCloudAbsent) {
+      throw new Error("held until a pull has answered for this account's settings; it publishes after the next pull");
+    }
+  }
+  // Rust answers with the session of the moment it runs: once the account
+  // changed, an answer must not stamp its etag on the new account, and a 412's
+  // server blob must not be merged into the new account's store.
+  const gen = accountGen;
+  // Read BEFORE the blob: an edit after this point changes the marker, so a
+  // successful push of the older blob does not clear it.
+  const seenSettingsEdit = namespace === "settings" ? readSettingsUnpushed() : null;
   const local = await readLocal(namespace);
-  if (local == null) return; // nothing to push yet
+  if (local == null || gen !== accountGen) return; // nothing to push yet
   const ifMatch = lastEtag.get(namespace) ?? null;
   const result = await invoke<PushOutcome>("sync_push", {
     namespace,
     data: sanitizeForPush(namespace, local),
     ifMatch,
   });
+  if (gen !== accountGen) return;
   if (result.status === "ok") {
     lastEtag.set(namespace, result.etag);
     persistEtags();
+    if (namespace === "settings") noteSettingsPushLanded(seenSettingsEdit);
     return;
   }
   // 412 conflict: merge server into local, retry push with the
   // server's etag so the proxy accepts the merged result.
   const merger = MERGERS[namespace];
   const merged = merger(local, result.server.data);
-  await writeLocal(namespace, merged);
+  if (namespace === "settings") {
+    // An edit since the read makes `local` stale, and the merge above never saw its
+    // stamp (the round trip is the window). Its own armed push takes this 412 with
+    // the edit in it. A kept local blob has nothing to apply, as in the pull.
+    if (readSettingsUnpushed() !== seenSettingsEdit) return;
+    if (merged !== local) await writeLocal(namespace, merged);
+  } else {
+    await writeLocal(namespace, merged);
+  }
+  if (gen !== accountGen) return;
   const retry = await invoke<PushOutcome>("sync_push", {
     namespace,
     data: sanitizeForPush(namespace, merged),
     ifMatch: result.server.etag,
   });
+  if (gen !== accountGen) return;
   if (retry.status === "ok") {
     lastEtag.set(namespace, retry.etag);
     persistEtags();
+    if (namespace === "settings") noteSettingsPushLanded(seenSettingsEdit);
+  } else if (namespace === "settings") {
+    // Keep the etag of the copy just merged, as history does: the next pull takes
+    // a 200 and the merge decides, with the edit still marked. No etag would hold
+    // the push and read as "never merged", which hands the cloud the win.
+    lastEtag.set(namespace, result.server.etag);
+    persistEtags();
+    console.warn("[sync] push settings conflicted twice; the next pull merges again");
   } else {
     // Two consecutive conflicts is rare (third device writing
     // mid-merge). Drop the etag so the next attempt force-overwrites;
@@ -1181,6 +1333,203 @@ export async function syncPushNow(namespace: SyncNamespace): Promise<void> {
     persistEtags();
     console.warn(`[sync] push ${namespace} conflicted twice; force-overwrite next attempt`);
   }
+}
+
+// ── Settings: unpublished-change marker ────────────────────────────────────
+//
+// Same hole as history's marker below: an edit whose push never landed (app
+// closed inside the debounce, a failed push) has no way out once the next pull
+// is a 304. Set on every local edit, cleared by a push that landed with no edit
+// after it or by a pull whose blob won. One key per sync scope, removed when
+// clean and on an account change, so it stays bounded.
+
+const SETTINGS_UNPUSHED_PREFIX = "aura:sync:settings-unpushed:";
+
+function settingsUnpushedKey(): string {
+  return `${SETTINGS_UNPUSHED_PREFIX}${activeScope()}`;
+}
+
+function readSettingsUnpushed(): string | null {
+  try { return localStorage.getItem(settingsUnpushedKey()); } catch { return null; }
+}
+
+/** Cleared only when no edit came after `seen`, so one made mid-push stays marked. */
+function clearSettingsUnpushed(seen: string | null): void {
+  if (seen === null) return;
+  try {
+    if (localStorage.getItem(settingsUnpushedKey()) === seen) localStorage.removeItem(settingsUnpushedKey());
+  } catch { /* best effort */ }
+}
+
+/** Last pull's answer for settings was 404. With no etag held, the only state
+ *  that may push: a null If-Match overwrites unconditionally, and anything else
+ *  means this device has not merged the cloud copy (its pull failed). Same rule
+ *  as historyCloudAbsent. A device holding an etag does not need it (a 412 merges). */
+let settingsCloudAbsent = false;
+
+function noteSettingsPushLanded(seen: string | null): void {
+  settingsCloudAbsent = false;
+  clearSettingsUnpushed(seen);
+}
+
+// ── History: compact cloud encoding ─────────────────────────────────────────
+//
+// WIRE. The `history` blob is a JSON array: the newest rows in plain form (at
+// most 500 / 256 KiB), then ONE trailing element
+// `{"v":2,"enc":"gzip-b64","n":N,"data":"..."}` holding the next N rows as
+// base64 of the same gzip compact form the local file uses (history_store.rs
+// "WIRE SHAPE"), built and read in Rust. The proxy needs no change: it stores
+// any JSON body under an allowlisted name, and "history" already is one. A
+// local history whose blob would pass the 1 MiB limit is TRIMMED IN THE CLOUD
+// COPY ONLY to the newest rows that fit (roughly 24k rows of a measured real
+// history; every row of a 10k one fits); the local file keeps everything.
+//
+// MIXED VERSIONS (read from v2.2.4's sync.ts, historyStore.ts and App.tsx).
+// v2.2.4 PUSHES ITS WHOLE LOCAL LIST ON ITS FIRST LOCAL EDIT, whatever that
+// list holds, made with the etag its login pull took (so the proxy accepts it).
+// Its launch push never leaves: setHistoryScope arms the debounce and
+// clearSyncEtags cancels it in the same tick. Its merge,
+// mergeHistory(local, server), reads only an array and keeps elements with a
+// string `id` and `played_at`. That is why the blob is an ARRAY whose head is
+// the newest rows in plain form (up to 500, history_store.rs "WIRE SHAPE")
+// with the compact envelope as one trailing element its merge skips. A bare
+// envelope object gave it nothing to merge, so a fresh v2.2.4 install (or a
+// downgrade, whose localStorage copy the migration removed) replaced the cloud
+// copy with its next play alone. That also needs it to take a 200, which is
+// why the history etag is out of its sight (see the ETag tracker above).
+//
+// With the array, the old client's push is its own rows (at most 1000) plus
+// the newest head: the cloud copy is never emptied, but it does lose the
+// envelope's older rows until a newer client syncs. Any newer client then
+// pulls the plain array, reads it as legacy, unions it into its file (nothing
+// lost locally), and because it holds rows that array lacks it pushes the full
+// blob back at once (pullHistory). Rows whose ONLY copy was the envelope (their
+// device gone) and which are older than the head can be lost by such an
+// overwrite: an old client cannot preserve what it cannot read. No ping-pong:
+// the old client pushes only on its own changes.
+
+/** Merge a pulled history blob into `scope` (the history scope the pull was
+ *  made for). False when the store is not hydrated or the scope changed. */
+async function pullHistory(data: unknown, scope: string): Promise<boolean> {
+  const out = await mergeHistoryFromCloud(data, { scope });
+  if (!out) return false;
+  if (out.legacy && out.localOnly > 0) {
+    // An older Aura overwrote the envelope with its own array (see above).
+    console.info(`[sync] history: cloud copy is a legacy array missing ${out.localOnly} local row(s); re-publishing`);
+    debouncedPush("history");
+  }
+  return true;
+}
+
+// ── History: unpublished-change marker ─────────────────────────────────────
+//
+// Only a LOCAL edit pushes history (a hydration or a cloud merge would just
+// re-upload what was pulled). So an edit whose push never landed had no other
+// way out: the 5 s debounce dies with the page when the app is closed from the
+// end screen, a push can fail on the network or 412 twice, and one made while
+// a set-aside file waits for its cloud merge is dropped. The next launch's
+// pull is then a 304 and nothing pushes, and other devices miss those plays
+// until some later edit on THIS device. The marker records "this history scope has a local change
+// the cloud has not taken" in localStorage, set on every local edit and
+// cleared only by a push that landed with no edit after it; every completed
+// pull republishes while it is set (`syncPullAll`). One key per history scope,
+// removed when clean, so it stays bounded.
+
+const HISTORY_UNPUSHED_PREFIX = "aura:sync:history-unpushed:";
+
+function historyUnpushedKey(historyScope: string): string {
+  return `${HISTORY_UNPUSHED_PREFIX}${historyScope}`;
+}
+
+function readHistoryUnpushed(historyScope: string): string | null {
+  try { return localStorage.getItem(historyUnpushedKey(historyScope)); } catch { return null; }
+}
+
+/** A local history edit in `historyScope` that the cloud has not taken yet.
+ *  The value only has to change per edit (the push compares it). */
+function markHistoryUnpushed(historyScope: string): void {
+  try { localStorage.setItem(historyUnpushedKey(historyScope), String(Date.now())); } catch { /* best effort */ }
+}
+
+/** A push of `historyScope` landed. Cleared only when no edit came after the
+ *  value read before the encode, so a play made mid-push stays marked. */
+function clearHistoryUnpushed(historyScope: string, seen: string | null): void {
+  if (seen === null) return;
+  try {
+    if (localStorage.getItem(historyUnpushedKey(historyScope)) === seen) {
+      localStorage.removeItem(historyUnpushedKey(historyScope));
+    }
+  } catch { /* best effort */ }
+}
+
+/** Last pull's answer for history was 404. The ONLY state that may push with a
+ *  null If-Match: the proxy accepts that unconditionally, so anything else would
+ *  overwrite a cloud copy this device has never merged, the only copy left when
+ *  no other device is alive. Etag-less + not absent means the pull failed or its
+ *  merge threw (a future envelope version), and pushHistoryNow waits. Reset by
+ *  clearSyncEtags; a device holding an etag does not need it (a 412 merges). */
+let historyCloudAbsent = false;
+
+/** A history push answered: the new etag, unless the account changed while it
+ *  was in flight (it belongs to the account just left). */
+function stampHistoryEtag(gen: number, etag: string, landed: boolean): void {
+  if (gen !== accountGen) return;
+  lastEtag.set("history", etag);
+  if (landed) historyCloudAbsent = false;
+  persistEtags();
+}
+
+/** True when the push landed (or a guest has nothing to push to); false when it
+ *  is held, with the unpushed marker still set so the next pull retries it. */
+async function pushHistoryNow(): Promise<boolean> {
+  // Checked when the debounce fires, before the encode: sync_push refuses a
+  // guest anyway, after a full gzip and a round trip of the blob.
+  if (activeScope() === "guest") return true;
+  if (!lastEtag.has("history") && !historyCloudAbsent) return false;
+  const gen = accountGen;
+  // Read BEFORE the encode: an edit after this point changes the marker, so
+  // a successful push of the older list does not clear it.
+  const seenUnpushed = readHistoryUnpushed(getHistoryScope());
+  // Null when not hydrated, or when a set-aside file still waits for its
+  // cloud merge: in both cases the list is not the whole history.
+  const first = await encodeHistoryForCloud();
+  if (!first) return false;
+  if (gen !== accountGen) return false; // encoded for the account just left
+  const result = await invoke<PushOutcome>("sync_push", {
+    namespace: "history",
+    data: first.payload,
+    ifMatch: lastEtag.get("history") ?? null,
+  });
+  if (result.status === "ok") {
+    stampHistoryEtag(gen, result.etag, true);
+    clearHistoryUnpushed(first.scope, seenUnpushed);
+    noteHistoryCloudPushed(first);
+    return true;
+  }
+  // 412: union the server copy into the file, then publish the union. A blob
+  // this build cannot read (a future envelope version) throws here, and we
+  // stop rather than overwrite what a newer client wrote.
+  if (gen !== accountGen) return false;
+  if (!(await mergeHistoryFromCloud(result.server.data, { scope: first.scope }))) return false;
+  const merged = await encodeHistoryForCloud();
+  if (!merged || merged.scope !== first.scope || gen !== accountGen) return false;
+  const retry = await invoke<PushOutcome>("sync_push", {
+    namespace: "history",
+    data: merged.payload,
+    ifMatch: result.server.etag,
+  });
+  if (retry.status === "ok") {
+    stampHistoryEtag(gen, retry.etag, true);
+    clearHistoryUnpushed(merged.scope, seenUnpushed);
+    noteHistoryCloudPushed(merged);
+    return true;
+  }
+  // Keep the etag of the copy just merged, which is now stale: the next attempt
+  // takes a 412 and merges again. The retry's own etag names rows not merged
+  // here, and no etag at all would be a blind overwrite.
+  stampHistoryEtag(gen, result.server.etag, false);
+  console.warn("[sync] push history conflicted twice; the next attempt merges again");
+  return false;
 }
 
 /** Drop one namespace from the proxy. */
@@ -1193,7 +1542,8 @@ export async function syncDelete(namespace: SyncNamespace): Promise<void> {
 /** Drop every blob for the active account and clear local etags. */
 export async function syncPurge(): Promise<void> {
   await invoke("sync_purge");
-  clearSyncEtags();
+  dropStoredScopeState();
+  resetSyncSession();
 }
 
 /** Query the proxy for the current per-namespace status. */
@@ -1205,6 +1555,17 @@ export async function syncStatus(): Promise<SyncStatus> {
 
 const PUSH_DEBOUNCE_MS = 5000;
 const debounceTimers: Map<SyncNamespace, ReturnType<typeof setTimeout>> = new Map();
+
+/** Drop a push armed but not yet sent. Settings > Storage reloads a store it
+ *  just cleared (manual-state, skip-marks, notifications), and that reload's
+ *  change event must not publish the emptied blob: their clear is local (the
+ *  proxy would take it as an overwrite). A HISTORY clear is published on purpose
+ *  (see clearHistoryChecked) and does not come through here. */
+export function dropPendingPush(namespace: SyncNamespace): void {
+  const existing = debounceTimers.get(namespace);
+  if (existing) clearTimeout(existing);
+  debounceTimers.delete(namespace);
+}
 
 function debouncedPush(namespace: SyncNamespace): void {
   const existing = debounceTimers.get(namespace);
@@ -1218,6 +1579,30 @@ function debouncedPush(namespace: SyncNamespace): void {
 
 let triggersInstalled = false;
 
+/** Machine-local backend fields, stripped from the blob both ways (see
+ *  readSettingsBlob): changing only these must not make this device's blob win. */
+const MACHINE_LOCAL_BACKEND_KEYS = ["download_dir", "screenshot_dir", "gpu_acceleration"];
+
+/** Is this settings event a local edit worth a stamp and a push? Not a cloud
+ *  pull's own write, and not a save that changed nothing: SettingsView saves on
+ *  mount, and stamping that would let a device overwrite another's edit just by
+ *  opening Settings. No detail at all still counts: the manual dispatch sites
+ *  send none. */
+function isLocalSettingsEdit(e: Event): boolean {
+  const detail = (e as CustomEvent<{ fromCloud?: boolean; keys?: string[] }>).detail;
+  if (detail?.fromCloud) return false;
+  return !(Array.isArray(detail?.keys) && detail.keys.length === 0);
+}
+
+/** A local settings edit: stamp it, mark it unpublished, schedule the push. A
+ *  guest has no cloud, and an edit there must not reach the next account. */
+function noteLocalSettingsEdit(): void {
+  if (activeScope() === "guest") return;
+  bumpSettingsUpdatedAt();
+  try { localStorage.setItem(settingsUnpushedKey(), String(Date.now())); } catch { /* best effort */ }
+  debouncedPush("settings");
+}
+
 /**
  * Install change-event listeners that schedule debounced pushes for
  * each namespace. Idempotent. Call once from App.tsx after the first
@@ -1229,32 +1614,58 @@ export function installSyncTriggers(): void {
   triggersInstalled = true;
 
   // Bump the persisted settings updated_at on every local change
-  // event — covers manual-dispatch sites (SettingsView's
-  // update_settings invoke, AniSkipMenu, PlayerOverlay,
+  // event: covers manual-dispatch sites (AniSkipMenu, PlayerOverlay,
   // userDataBackup restore) that don't route through saveAuraSettings.
   // Skipped when detail.fromCloud is true so the cloud-pull write
-  // path doesn't fight the merger.
-  window.addEventListener("aura:settings-changed", (e) => {
-    const detail = (e as CustomEvent<{ fromCloud?: boolean }>).detail;
-    if (!detail?.fromCloud) bumpSettingsUpdatedAt();
-  });
-
-  // A cloud pull's own write is not a local change: pushing it back would
+  // path doesn't fight the merger. Pushing that write back would also
   // re-upload the blob just merged (new etag, so the other device pulls
   // and pushes it again). Same rule as history / skip-marks' silent writes.
   window.addEventListener("aura:settings-changed", (e) => {
-    const detail = (e as CustomEvent<{ fromCloud?: boolean }>).detail;
-    if (!detail?.fromCloud) debouncedPush("settings");
+    if (isLocalSettingsEdit(e)) noteLocalSettingsEdit();
   });
-  window.addEventListener("aura:keybindings-changed", () => { bumpSettingsUpdatedAt(); debouncedPush("settings"); });
-  window.addEventListener("aura:history-changed",         () => debouncedPush("history"));
+  // A backend write landed (Settings' update_settings, set_theme). Its own event,
+  // not `aura:settings-changed`: that one drives the skip re-stamp and many
+  // re-reads, and a text field patches on every keystroke. A keybinding edit comes
+  // through here too; `aura:keybindings-changed` also fires for a patch that
+  // changed nothing, so it is not listened to.
+  window.addEventListener("aura:backend-settings-changed", (e) => {
+    if (!isLocalSettingsEdit(e)) return;
+    const keys = (e as CustomEvent<{ keys?: string[] }>).detail?.keys;
+    if (keys?.every((k) => MACHINE_LOCAL_BACKEND_KEYS.includes(k))) return;
+    noteLocalSettingsEdit();
+  });
+  // Only a LOCAL edit pushes: hydration and a cloud merge also fire this
+  // event (so the view re-renders), and pushing on those would re-upload the
+  // blob just pulled.
+  window.addEventListener("aura:history-changed", (e) => {
+    const reason = historyChangeReason(e);
+    if (reason === "mutation") {
+      // Signed in only: a guest's edits have no cloud to reach.
+      if (activeScope() !== "guest") markHistoryUnpushed(getHistoryScope());
+      debouncedPush("history");
+    }
+    // A history file set aside as unreadable, or missing, waits for the cloud
+    // copy before anything may be pushed: pull now rather than at the next tick.
+    if (reason === "hydrated" && historyNeedsCloudMerge() && activeScope() !== "guest") {
+      const repull = () => {
+        if (!historyNeedsCloudMerge() || activeScope() === "guest") return;
+        lastPullCompletedAt = 0;
+        void syncPullAll();
+      };
+      // At launch the sweep started in the same tick as the load, BEFORE the
+      // load reported the file set aside, so it sent the history etag and
+      // gets a 304 that merges nothing. syncPullAll would hand back that very
+      // sweep, so run a fresh one AFTER it; repull re-checks the latch, so a
+      // sweep that did merge (or found no cloud copy) costs nothing more.
+      const inflight = pullAllInflight;
+      if (inflight) void inflight.then(repull, repull);
+      else repull();
+    }
+  });
   // API-key changes ride along with the settings blob (the
   // encrypted api_keys field is built inside readSettingsBlob).
   // Treat as a settings change for both timestamp + push purposes.
-  window.addEventListener("aura:api-keys-changed", () => {
-    bumpSettingsUpdatedAt();
-    debouncedPush("settings");
-  });
+  window.addEventListener("aura:api-keys-changed", noteLocalSettingsEdit);
   window.addEventListener("aura:manual-watched-changed",  () => debouncedPush("manual-state"));
   window.addEventListener("aura:skip-marks-changed",      () => debouncedPush("skip-marks"));
   window.addEventListener("aura:auto-bumped-changed",     () => debouncedPush("auto-bumped"));
@@ -1272,30 +1683,21 @@ export function installSyncTriggers(): void {
 
 /**
  * Background pull on a 5-minute cadence so changes from another device
- * land without requiring a sign-out/sign-in cycle. Pauses while a
- * video is loaded so we don't compete with playback for bandwidth.
- * Returns a teardown function.
+ * land without requiring a sign-out/sign-in cycle. Returns a teardown
+ * function.
  */
 export function startBackgroundPull(): () => void {
   const INTERVAL_MS = 5 * 60 * 1000;
   let timer: ReturnType<typeof setInterval> | null = null;
-  let paused = false;
 
-  // Skip the 5-minute pull while a video is loaded (don't compete with playback
-  // for bandwidth) AND while the window is minimized / occluded (nothing is
+  // Skip the 5-minute pull while the window is minimized / occluded (nothing is
   // showing the synced state; a catch-up fires on restore below). This is the
-  // only ungated cloud call in the tray — the release/notification keep-alive
+  // only ungated cloud call in the tray: the release/notification keep-alive
   // is separate (NotificationsScanner) and intentionally stays running.
   const tick = () => {
-    if (paused || isWindowHidden()) return;
+    if (isWindowHidden()) return;
     void syncPullAll();
   };
-
-  const onPlay  = () => { paused = true;  };
-  const onStop  = () => { paused = false; };
-
-  window.addEventListener("aura:playback-started", onPlay);
-  window.addEventListener("aura:playback-ended",   onStop);
 
   // One catch-up pull the instant the window is restored from hidden, so a
   // change made on another device while Aura sat in the tray lands promptly
@@ -1305,7 +1707,7 @@ export function startBackgroundPull(): () => void {
   let wasHidden = isWindowHidden();
   const unsubVisibility = subscribeWindowVisibility(() => {
     const nowHidden = isWindowHidden();
-    if (wasHidden && !nowHidden && !paused) void syncPullAll();
+    if (wasHidden && !nowHidden) void syncPullAll();
     wasHidden = nowHidden;
   });
 
@@ -1313,7 +1715,5 @@ export function startBackgroundPull(): () => void {
   return () => {
     if (timer) clearInterval(timer);
     unsubVisibility();
-    window.removeEventListener("aura:playback-started", onPlay);
-    window.removeEventListener("aura:playback-ended",   onStop);
   };
 }

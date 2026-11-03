@@ -22,6 +22,7 @@ import { useEpisodesBehind } from "../LibraryContext";
 import { libraryItemSeriesId } from "../libraryNormalize";
 import { useReleaseSignalsVersion, hasAnyReleaseSignal, getReleaseSignal } from "../releaseSignalStore";
 import { useManualWatchedVersion } from "../manualWatched";
+import { useWindowHidden } from "../windowVisibility";
 import { useAvailableEarlyVersion } from "../releaseCountdown";
 import {
   isAiring, isAiringSeriesLike, isAnimeItem,
@@ -69,6 +70,11 @@ const SORT_OPTIONS: { id: SortMode; label: string }[] = [
   { id: "alpha",   label: "A - Z" },
 ];
 
+function localDayStart(): number {
+  const n = new Date();
+  return new Date(n.getFullYear(), n.getMonth(), n.getDate()).getTime();
+}
+
 export default function AiringView({ library, addons, onSelectMeta }: Props) {
   const [details, setDetails] = useState<Map<string, MetaDetail | null>>(new Map());
   const [loading, setLoading] = useState(false);
@@ -80,6 +86,25 @@ export default function AiringView({ library, addons, onSelectMeta }: Props) {
   // An episode found out early (availableEarly.ts) moves a show's next air
   // time, its airing state and its behind count.
   const availableVersion = useAvailableEarlyVersion();
+  // Air windows and behind counts are relative to today, so re-derive them at
+  // local midnight. Same timer as CalendarView's todayMs: wakes once per day and
+  // re-snaps on the hidden -> visible transition after a sleep.
+  const hidden = useWindowHidden();
+  const [dayMs, setDayMs] = useState(localDayStart);
+  useEffect(() => {
+    setDayMs(localDayStart());
+    let timer = 0;
+    const arm = () => {
+      const n = new Date();
+      const nextMidnight = new Date(n.getFullYear(), n.getMonth(), n.getDate() + 1).getTime();
+      timer = window.setTimeout(() => {
+        setDayMs(localDayStart());
+        arm();
+      }, Math.max(1_000, nextMidnight - Date.now()));
+    };
+    arm();
+    return () => window.clearTimeout(timer);
+  }, [hidden]);
 
   // Cheap candidate pre-filter (no network). With cloud signals we trust
   // next_aired; without them (guest / release-search off) we scan every
@@ -185,7 +210,7 @@ export default function AiringView({ library, addons, onSelectMeta }: Props) {
     }
     return keys;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [airingItems, details, libById, manualVersion, signalsVersion, availableVersion]);
+  }, [airingItems, details, libById, manualVersion, signalsVersion, availableVersion, dayMs]);
 
   const sorted = useMemo(() => {
     const arr = [...airingItems];
@@ -221,7 +246,7 @@ export default function AiringView({ library, addons, onSelectMeta }: Props) {
     }
     return [{ key: "all", label: "", items: sorted }];
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sorted, groupBy, details, availableVersion]);
+  }, [sorted, groupBy, details, availableVersion, dayMs]);
 
   const setGroup = (g: GroupBy) => { setGroupBy(g); saveAuraSettings({ ...loadAuraSettings(), airingGroupBy: g }); };
   const setSortMode = (m: SortMode) => { setSort(m); saveAuraSettings({ ...loadAuraSettings(), airingSort: m }); };
@@ -232,7 +257,7 @@ export default function AiringView({ library, addons, onSelectMeta }: Props) {
 
   return (
     <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
-      <div className="flex-1 overflow-y-auto" style={{ scrollbarWidth: "thin", scrollbarColor: "rgba(255,255,255,0.08) transparent" }}>
+      <div className="aura-page-scroller flex-1 overflow-y-auto" style={{ scrollbarWidth: "thin", scrollbarColor: "rgba(255,255,255,0.08) transparent" }}>
         <div className="mx-auto px-6 py-6 space-y-5" style={{ maxWidth: PAGE_CONTENT_MAX_W }}>
           {/* Header */}
           <div className="flex items-end justify-between gap-4 flex-wrap">

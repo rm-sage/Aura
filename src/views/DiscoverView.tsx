@@ -279,7 +279,7 @@ function DiscoverBody({ addons, onSelectMeta }: Props) {
     <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
       <div
         ref={scrollRef}
-        className="flex-1 overflow-y-auto"
+        className="aura-page-scroller flex-1 overflow-y-auto"
         style={{ scrollbarWidth: "thin", scrollbarColor: "rgba(255,255,255,0.08) transparent" }}
       >
         <div className="mx-auto px-6 py-6 space-y-5" style={{ maxWidth: PAGE_CONTENT_MAX_W }}>

@@ -335,6 +335,17 @@ export default function SubtitleSyncPanel({
     };
   }, [open]);
 
+  // Esc closes (capture phase, or App's listener would exit playback and the
+  // overlay's would leave fullscreen).
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); onClose(); }
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [open, onClose]);
+
   // ── Active subtitle track ────────────────────────────────────────────
   const subTracks = useMemo(() => tracks.filter((t) => t.type === "sub"), [tracks]);
   const activeSub = useMemo(() => subTracks.find((t) => t.selected) ?? null, [subTracks]);
@@ -750,6 +761,7 @@ export default function SubtitleSyncPanel({
               onChange={(e) => setQuery(e.target.value)}
               onKeyDown={onSearchKeyDown}
               placeholder="Search the lines… (Enter jumps to the next match)"
+              data-aura-search
               spellCheck={false}
               className="w-full h-9 bg-white/8 border border-white/12 rounded-lg px-3
                          text-[13.5px] placeholder:text-white/55 outline-none focus:border-white/30

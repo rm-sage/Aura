@@ -762,6 +762,10 @@ export default function DevConsole() {
   // scrolled up" and stuck the Resume-autoscroll prompt on with nobody
   // having touched the scrollbar.
   const prevScrollTopRef = useRef(0);
+  // The furthest down since auto-scroll last re-armed. Comparing against this rather than
+  // the previous event keeps the rule independent of the frame rate: a smoothed wheel
+  // notch on a fast display moves under 2 px between scroll events.
+  const scrollHighWaterRef = useRef(0);
 
   // Stable push function — buffers when paused so we can release later.
   const push = useMemo(() => {
@@ -1161,6 +1165,7 @@ export default function DevConsole() {
           value={search}
           onChange={(e) => setSearch(e.target.value)}
           placeholder="filter…"
+          data-aura-search
           spellCheck={false}
           className="bg-black/40 border border-white/10 rounded-sm px-2 py-0.5
                      text-[11px] outline-none focus:border-white/25 transition-colors w-40
@@ -1243,9 +1248,11 @@ export default function DevConsole() {
             // scrolling up the way the old distance-only check was during
             // fast log bursts.
             const distFromBottom = el.scrollHeight - curTop - el.clientHeight;
+            if (curTop > scrollHighWaterRef.current) scrollHighWaterRef.current = curTop;
             if (distFromBottom <= 24) {
+              scrollHighWaterRef.current = curTop;
               setAutoScroll((prev) => (prev ? prev : true));
-            } else if (curTop < prevTop - 2) {
+            } else if (curTop < prevTop - 2 || curTop < scrollHighWaterRef.current - 2) {
               setAutoScroll((prev) => (prev ? false : prev));
             }
           }}

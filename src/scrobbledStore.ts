@@ -3,6 +3,7 @@
 
 import { safeSetItem } from "./storageQuota";
 import type { ScrobbleService } from "./scrobbleConn";
+import { getHistory, historySize, isHistoryLoaded } from "./historyStore";
 
 // ---------------------------------------------------------------------------
 // scrobbledStore — a local record of which History entries have already been
@@ -24,20 +25,62 @@ import type { ScrobbleService } from "./scrobbleConn";
 // service's own gate absorbs — never a duplicate play.
 //
 // STORAGE — `aura:scrobbled:<scope>`, a flat array of "<service>::<id>::<played_at>"
-// keys. Bounded at MAX_KEYS with oldest-first eviction (Set preserves insertion
-// order), per the standing "never ship an unbounded cache" rule.
+// keys, bounded per the standing "never ship an unbounded cache" rule. The
+// bound FOLLOWS the history, which no longer has a row cap: 1.5 marks per row
+// per service (three services), never under MIN_KEYS (the old fixed cap) and
+// never over MAX_KEYS_CEILING, which keeps the key list near 3 MB of the
+// origin's localStorage quota whatever the history grows to.
 //
 // Marks are deliberately KEPT when a history entry is removed or the history is
 // cleared: cloud sync can re-add the very same (id, played_at) row later, and a
 // surviving mark is what stops that row from being scrobbled a second time.
+// Only when the bound is hit do those ORPHANED marks go first (oldest first),
+// and only then the oldest live marks; a live row's mark is worth more than a
+// mark for a row that may never come back. While the history has not hydrated
+// nothing is evicted below the ceiling, since "live" cannot be judged yet.
 // ---------------------------------------------------------------------------
 
 const STORAGE_KEY_PREFIX = "aura:scrobbled:";
 const CHANGE_EVENT = "aura:scrobbled-changed";
-/** 1.5x the most marks a full 1000-row history can need (one per row per
- *  service, three services), so a history that is all scrobbled still leaves
- *  room for re-watches before a live row's mark is evicted. */
-const MAX_KEYS = 4500;
+/** The floor of the bound: the old fixed cap, 1.5x what a 1000-row history
+ *  could need (one mark per row per service, three services). */
+const MIN_KEYS = 4500;
+/** Hard ceiling, for safety: ~30k keys of ~50 chars. A history past ~6,700
+ *  fully scrobbled rows starts losing its oldest marks here, which costs one
+ *  redundant (service-deduped) call per row in a later bulk run, never a
+ *  duplicate play. */
+const MAX_KEYS_CEILING = 30_000;
+const MARKS_PER_ROW = 3 * 1.5;
+
+function keyCap(): number {
+  if (!isHistoryLoaded()) return MAX_KEYS_CEILING;
+  return Math.min(MAX_KEYS_CEILING, Math.max(MIN_KEYS, Math.ceil(historySize() * MARKS_PER_ROW)));
+}
+
+/** Bring the set back under the cap: orphaned marks first, then the oldest.
+ *  Set iterates in insertion order, so both passes go oldest first. */
+function evictOverCap(): void {
+  const cap = keyCap();
+  if (_keys.size <= cap) return;
+  let excess = _keys.size - cap;
+  if (isHistoryLoaded()) {
+    const live = new Set(getHistory().map((e) => `${e.id}::${e.played_at}`));
+    for (const k of _keys) {
+      if (excess <= 0) break;
+      // "<service>::<id>::<played_at>": the row key is everything after the
+      // service, which never contains "::".
+      if (!live.has(k.slice(k.indexOf("::") + 2))) {
+        _keys.delete(k);
+        excess--;
+      }
+    }
+  }
+  for (const k of _keys) {
+    if (excess <= 0) break;
+    _keys.delete(k);
+    excess--;
+  }
+}
 
 let _scope = "guest";
 let _keys: Set<string> = new Set();
@@ -90,15 +133,7 @@ export function markScrobbled(
   const key = markKey(service, id, playedAt);
   if (_keys.has(key)) return;
   _keys.add(key);
-  if (_keys.size > MAX_KEYS) {
-    // Set iterates in insertion order, so this drops the oldest marks first.
-    const excess = _keys.size - MAX_KEYS;
-    let dropped = 0;
-    for (const k of _keys) {
-      if (dropped++ >= excess) break;
-      _keys.delete(k);
-    }
-  }
+  evictOverCap();
   persist();
   window.dispatchEvent(new CustomEvent(CHANGE_EVENT));
 }
@@ -107,7 +142,7 @@ export function markScrobbled(
  *
  *  `markScrobbled` serializes the whole key set and re-renders the History view
  *  on every call, so a bulk run that marked each row individually would do one
- *  localStorage write and one full re-render PER PUSH (up to 1000 rows x 3
+ *  localStorage write and one full re-render PER PUSH (a whole history x 3
  *  services). The bulk runner therefore accumulates its successes and flushes
  *  them through here in chunks. */
 export function markScrobbledMany(
@@ -124,14 +159,7 @@ export function markScrobbledMany(
     added++;
   }
   if (added === 0) return;
-  if (_keys.size > MAX_KEYS) {
-    const excess = _keys.size - MAX_KEYS;
-    let dropped = 0;
-    for (const k of _keys) {
-      if (dropped++ >= excess) break;
-      _keys.delete(k);
-    }
-  }
+  evictOverCap();
   persist();
   window.dispatchEvent(new CustomEvent(CHANGE_EVENT));
 }
@@ -214,6 +242,15 @@ export function markIneligibleMany(scope: string, service: ScrobbleService, ids:
     }
   }
   safeSetItem(ineligibleKey(_ineligibleScope), JSON.stringify(_ineligible));
+  window.dispatchEvent(new CustomEvent(CHANGE_EVENT));
+}
+
+/** Settings > Storage just cleared one of these keys: drop both mirrors so the
+ *  next read comes from storage, or the next write would put every cleared
+ *  entry back. */
+export function reloadScrobbledFromStorage(): void {
+  _hydrated = false;
+  _ineligibleHydrated = false;
   window.dispatchEvent(new CustomEvent(CHANGE_EVENT));
 }
 

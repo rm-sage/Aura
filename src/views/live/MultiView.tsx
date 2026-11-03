@@ -475,6 +475,7 @@ function ChannelPicker({
           value={q}
           onChange={(e) => setQ(e.target.value)}
           placeholder="Search channels to add…"
+          data-aura-search
           className="h-10 px-3 mb-3 rounded-xl bg-white/5 border border-white/10 text-[13px]
                      text-white/90 placeholder:text-white/30 focus:outline-none focus:border-ln-accent/40"
         />

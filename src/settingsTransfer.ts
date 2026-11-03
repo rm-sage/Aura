@@ -16,7 +16,7 @@
 //     3. providers — addon-DEPENDENT prefs encoded by manifest_id INSTEAD
 //                    of URL. On import, each id is resolved against the
 //                    importing user's installed addons; ids that don't
-//                    match an installed addon are silently dropped (the
+//                    match an installed addon are dropped and counted (the
 //                    user can install the missing addon then re-import).
 //                    Covers the home / metadata / stream / search
 //                    provider lists AND the hero carousel source. This
@@ -36,7 +36,8 @@
 //       defaultMetadataAddonId:    string | null,
 //       streamAddonIds:            string[] | null,
 //       searchAddonIds:            string[] | null,
-//       heroCatalog: { addonId, mediaType, catalogId } | null
+//       heroCatalog: { addonId, mediaType, catalogId } | null,
+//       occurrences?: { ... }     // which install of a repeated manifest_id
 //     }
 //   }
 //
@@ -44,7 +45,16 @@
 //   - backend / aura: shallow-overwrite by field. Unknown fields dropped.
 //   - providers: each id resolved to the installed addon's URL via
 //     manifest_id match; unresolvable ids dropped from the imported list
-//     (preserving the relative order of the resolvable ones).
+//     (preserving the relative order of the resolvable ones). A stream or
+//     search list that names ids of which NONE resolve is left out of the
+//     patch: it says nothing about this user's addons, and an empty override
+//     would switch every addon off (same reasoning as electHomeAddons' note on
+//     a stale override). An explicit [] from the exporter still applies.
+//   - Two installs can share a manifest_id. `occurrences` says which one was
+//     meant (the nth installed with that id), so raw urls, which carry config
+//     tokens, stay out of this shareable blob. Addon order can differ between
+//     machines, so it is best effort; a choice that has to fall back to the
+//     first install is counted as `ambiguous` and reported.
 //
 // V1 BLOBS still parse — providers block is missing, so providers stay
 // at their current values on the importing side. No-op forward-compat.
@@ -151,6 +161,11 @@ const PORTABLE_AURA_FIELDS = [
   // A view preference, but a portable one: someone who wants the power-user
   // rows on one machine wants them on the next.
   "showAdvancedSettings",
+  // How scrolling feels: a preference that follows the user.
+  "smoothWheelScroll",
+  // Which debrid providers the title-bar status monitor checks. A preference
+  // about the user's services, which are the same on every machine.
+  "monitoredProviders",
 ] as const;
 export type PortableAuraField = typeof PORTABLE_AURA_FIELDS[number];
 
@@ -167,6 +182,19 @@ export interface PortableProvidersBlob {
   streamAddonIds:            string[] | null;
   searchAddonIds:            string[] | null;
   heroCatalog:               { addonId: string; mediaType: string; catalogId: string } | null;
+  /** Absent on blobs from before it existed. */
+  occurrences?:              ProviderOccurrences;
+}
+
+/** For each id above, its position among the installed addons with that
+ *  manifest_id. The lists are parallel to their id lists. */
+export interface ProviderOccurrences {
+  defaultHome?:     number;
+  additionalHome?:  number[];
+  defaultMetadata?: number;
+  stream?:          number[];
+  search?:          number[];
+  hero?:            number;
 }
 
 export interface SettingsBlob {
@@ -195,6 +223,14 @@ function urlToId(url: string | null, addons: AddonRef[]): string | null {
   return match?.manifest_id || null;
 }
 
+/** The url's position among the installed addons sharing its manifest_id,
+ *  or undefined when it is not installed. */
+function urlToOccurrence(url: string | null, addons: AddonRef[]): number | undefined {
+  const id = urlToId(url, addons);
+  if (!id) return undefined;
+  return addons.filter((a) => a.manifest_id === id).findIndex((a) => a.url === url);
+}
+
 /** Build the providers block by resolving every URL field to its
  *  manifest_id. URLs that don't match an installed addon (e.g. the
  *  user removed it after picking it as default) drop to null. */
@@ -210,6 +246,18 @@ function buildProvidersBlob(
       if (typeof u !== "string") continue;
       const id = urlToId(u, addons);
       if (id) out.push(id);
+    }
+    return out;
+  };
+
+  // Parallel to `ids`: the same urls survive, in the same order.
+  const occs = (urls: unknown): number[] | undefined => {
+    if (!Array.isArray(urls)) return undefined;
+    const out: number[] = [];
+    for (const u of urls) {
+      if (typeof u !== "string") continue;
+      const n = urlToOccurrence(u, addons);
+      if (n !== undefined) out.push(n);
     }
     return out;
   };
@@ -230,6 +278,14 @@ function buildProvidersBlob(
     streamAddonIds:           ids(aura.streamAddonUrls),
     searchAddonIds:           ids(aura.searchAddonUrls),
     heroCatalog,
+    occurrences: {
+      defaultHome:     urlToOccurrence(aura.defaultHomeAddonUrl as string | null, addons),
+      additionalHome:  occs(aura.additionalHomeAddonUrls),
+      defaultMetadata: urlToOccurrence(aura.defaultMetadataAddonUrl as string | null, addons),
+      stream:          occs(aura.streamAddonUrls),
+      search:          occs(aura.searchAddonUrls),
+      hero:            hc?.addonUrl ? urlToOccurrence(hc.addonUrl, addons) : undefined,
+    },
   };
 }
 
@@ -270,55 +326,81 @@ export interface ResolvedImport {
   unresolvedCount: number;
 }
 
-/** id → url (or null). Inverse of `urlToId`. */
-function idToUrl(id: string | null, addons: AddonRef[]): string | null {
-  if (!id) return null;
-  const match = addons.find((a) => a.manifest_id === id);
-  return match?.url || null;
-}
-
 /** Apply the providers block to the importing user's addon list.
- *  Returns an aura-shape patch with URLs resolved + a count of ids
- *  that couldn't be matched. */
+ *  Returns an aura-shape patch with URLs resolved, a count of ids that
+ *  couldn't be matched, and a count of choices that landed on another install
+ *  of the same addon because the blob could not say which one was meant. */
 export function resolveProviders(
   providers: PortableProvidersBlob | undefined,
   addons: AddonRef[],
-): { aura: Record<string, unknown>; unresolved: number } {
-  if (!providers) return { aura: {}, unresolved: 0 };
+): { aura: Record<string, unknown>; unresolved: number; ambiguous: number } {
+  if (!providers) return { aura: {}, unresolved: 0, ambiguous: 0 };
   let unresolved = 0;
-  const resolveList = (ids: string[] | null): string[] | null => {
+  let ambiguous = 0;
+  const occ = providers.occurrences;
+  const installsOf = (id: string) => addons.filter((a) => a.manifest_id === id);
+  /** One pinned addon. `n` undefined is a blob from before occurrences. */
+  const resolveOne = (id: string | null, n: number | undefined): string | null => {
+    if (!id) return null;
+    const installs = installsOf(id);
+    if (installs.length === 0) return null;
+    const exact = n === undefined ? (installs.length === 1 ? installs[0] : undefined) : installs[n];
+    if (!exact) ambiguous += 1;
+    return (exact ?? installs[0]).url;
+  };
+  const resolveList = (ids: string[] | null, ns: number[] | undefined): string[] | null => {
     if (ids == null) return null;
-    const out: string[] = [];
-    for (const id of ids) {
-      const url = idToUrl(id, addons);
-      if (url) out.push(url);
-      else unresolved += 1;
-    }
-    return out;
+    const indexed = ns?.length === ids.length ? ns : null;
+    const out = new Set<string>(); // a repeat that lands on one install collapses
+    const seen = new Map<string, number>();
+    ids.forEach((id, i) => {
+      const kth = seen.get(id) ?? 0;
+      seen.set(id, kth + 1);
+      const installs = installsOf(id);
+      if (installs.length === 0) {
+        unresolved += 1;
+        return;
+      }
+      // No index: the kth repeat of an id means its kth install, and only a
+      // list naming it fewer times than there are installs leaves a real doubt.
+      const exact = installs[indexed ? indexed[i] : kth];
+      const inDoubt = !indexed && kth === 0 && installs.length > ids.filter((x) => x === id).length;
+      if (!exact || inDoubt) ambiguous += 1;
+      out.add((exact ?? installs[0]).url);
+    });
+    return [...out];
+  };
+  /** undefined: named ids, none installed, so leave the field out of the patch
+   *  (see IMPORT MERGE STRATEGY). */
+  const resolveOverride = (ids: string[] | null, ns: number[] | undefined): string[] | null | undefined => {
+    const out = resolveList(ids, ns);
+    return ids && ids.length > 0 && out && out.length === 0 ? undefined : out;
   };
 
   const aura: Record<string, unknown> = {};
   if (providers.defaultHomeAddonId !== undefined) {
-    const url = idToUrl(providers.defaultHomeAddonId, addons);
+    const url = resolveOne(providers.defaultHomeAddonId, occ?.defaultHome);
     if (url) aura.defaultHomeAddonUrl = url;
     else if (providers.defaultHomeAddonId) unresolved += 1;
   }
   if (providers.additionalHomeAddonIds) {
-    aura.additionalHomeAddonUrls = resolveList(providers.additionalHomeAddonIds) ?? [];
+    aura.additionalHomeAddonUrls = resolveList(providers.additionalHomeAddonIds, occ?.additionalHome) ?? [];
   }
   if (providers.defaultMetadataAddonId !== undefined) {
-    const url = idToUrl(providers.defaultMetadataAddonId, addons);
+    const url = resolveOne(providers.defaultMetadataAddonId, occ?.defaultMetadata);
     if (url) aura.defaultMetadataAddonUrl = url;
     else if (providers.defaultMetadataAddonId) unresolved += 1;
   }
   if (providers.streamAddonIds !== undefined) {
-    aura.streamAddonUrls = resolveList(providers.streamAddonIds);
+    const urls = resolveOverride(providers.streamAddonIds, occ?.stream);
+    if (urls !== undefined) aura.streamAddonUrls = urls;
   }
   if (providers.searchAddonIds !== undefined) {
-    aura.searchAddonUrls = resolveList(providers.searchAddonIds);
+    const urls = resolveOverride(providers.searchAddonIds, occ?.search);
+    if (urls !== undefined) aura.searchAddonUrls = urls;
   }
   if (providers.heroCatalog) {
-    const url = idToUrl(providers.heroCatalog.addonId, addons);
+    const url = resolveOne(providers.heroCatalog.addonId, occ?.hero);
     if (url) {
       aura.heroCatalog = {
         addonUrl: url,
@@ -329,7 +411,7 @@ export function resolveProviders(
       unresolved += 1;
     }
   }
-  return { aura, unresolved };
+  return { aura, unresolved, ambiguous };
 }
 
 /** Pretty-printed JSON for the file download / textarea. Indent=2 keeps
@@ -432,6 +514,13 @@ export function parseImportInput(raw: string): SettingsBlob | null {
         catalogId: hcRaw.catalogId,
       };
     }
+    const nth = (v: unknown): number | undefined =>
+      typeof v === "number" && Number.isInteger(v) && v >= 0 ? v : undefined;
+    const nthList = (v: unknown): number[] | undefined =>
+      Array.isArray(v) && v.every((x) => nth(x) !== undefined) ? (v as number[]) : undefined;
+    const occRaw = provRaw.occurrences && typeof provRaw.occurrences === "object"
+      ? provRaw.occurrences as Record<string, unknown>
+      : null;
     providers = {
       defaultHomeAddonId:       stringOrNull(provRaw.defaultHomeAddonId),
       additionalHomeAddonIds:   stringArrOrNull(provRaw.additionalHomeAddonIds) ?? [],
@@ -439,6 +528,14 @@ export function parseImportInput(raw: string): SettingsBlob | null {
       streamAddonIds:           stringArrOrNull(provRaw.streamAddonIds),
       searchAddonIds:           stringArrOrNull(provRaw.searchAddonIds),
       heroCatalog,
+      occurrences: occRaw ? {
+        defaultHome:     nth(occRaw.defaultHome),
+        additionalHome:  nthList(occRaw.additionalHome),
+        defaultMetadata: nth(occRaw.defaultMetadata),
+        stream:          nthList(occRaw.stream),
+        search:          nthList(occRaw.search),
+        hero:            nth(occRaw.hero),
+      } : undefined,
     };
   }
 

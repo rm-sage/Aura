@@ -581,7 +581,7 @@ function relativeTime(ts: number): string {
   // "Just now" threshold and the first whole minute rendered "0m ago" - a string
   // that is simply wrong. It was always reachable, but a mount-render only
   // sampled it by luck; now that the panel ticks, a row walks through that band
-  // on a cadence. Rounding matches the two sibling formatters (SyncStatusChip's
+  // on a cadence. Rounding matches the two sibling formatters (ServiceStatusChip's
   // formatAgo and SettingsView's), where 45 s reads "1 min ago".
   const min = Math.round(diff / 60_000);
   if (min < 60) return `${min}m ago`;

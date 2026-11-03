@@ -1131,8 +1131,19 @@ pub async fn open_oauth_popup_webview(
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
          (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36";
 
+    // No native find bar here either (src/searchHotkey.ts is the main page's
+    // half). Only blocks the browser's default: a page's own use of the key
+    // still works, and nothing here can reach Aura. Virtual keys as in that
+    // file's isLetter: a non-Latin layout's e.key is not the letter the
+    // accelerator reads. Keep the two in step.
+    const POPUP_NO_FIND_SCRIPT: &str = r#"window.addEventListener("keydown",function(e){
+        if(e.metaKey||e.altKey)return;var k=(e.key||"").toLowerCase();
+        if(k==="f3"?!e.ctrlKey:e.ctrlKey&&(k==="g"||e.keyCode===71||((k==="f"||e.keyCode===70)&&!e.shiftKey)))e.preventDefault();
+    },true);"#;
+
     let mut builder = WebviewBuilder::new(label.clone(), WebviewUrl::External(parsed))
-        .user_agent(POPUP_USER_AGENT);
+        .user_agent(POPUP_USER_AGENT)
+        .initialization_script(POPUP_NO_FIND_SCRIPT);
     // Same browser arguments as the main webview (they share one user data
     // folder, and WebView2 refuses mismatched environment options there).
     if let Some(args) = crate::webview_browser_args() {

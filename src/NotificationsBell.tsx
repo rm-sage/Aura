@@ -103,12 +103,19 @@ export default function NotificationsBell({ library }: { library: LibraryItem[] 
       if (target.closest?.("[data-notifications-bell]")) return;
       requestClose();
     };
-    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") requestClose(); };
+    // Capture phase, and stopped there: the window-level Escape handlers (App's,
+    // the catalog page's) would otherwise close the page under the panel too.
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      e.preventDefault();
+      e.stopPropagation();
+      requestClose();
+    };
     window.addEventListener("mousedown", onDown);
-    window.addEventListener("keydown", onKey);
+    window.addEventListener("keydown", onKey, true);
     return () => {
       window.removeEventListener("mousedown", onDown);
-      window.removeEventListener("keydown", onKey);
+      window.removeEventListener("keydown", onKey, true);
     };
   }, [open, requestClose]);
 

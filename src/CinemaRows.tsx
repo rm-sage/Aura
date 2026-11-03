@@ -808,7 +808,7 @@ function CWReleaseCountdown({ seriesId, episodes }: { seriesId: string; episodes
       <span
         title={`Next episode airs ${formatTargetDate(targetMs)}`}
         className="pointer-events-auto inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full
-                   bg-black/72 backdrop-blur-sm border border-white/15
+                   bg-black/72 border border-white/15
                    text-white text-[12.5px] font-semibold tabular-nums"
         style={{ textShadow: "0 1px 2px rgba(0,0,0,0.9)" }}
       >
@@ -993,7 +993,7 @@ export const ContinueWatchingCard = memo(function ContinueWatchingCard(
           {badge && (
             <span
               className="absolute top-1.5 left-1.5 px-2 py-1 rounded
-                         bg-black/75 backdrop-blur-sm border border-white/15
+                         bg-black/75 border border-white/15
                          text-white/90 text-[13px] font-mono font-semibold
                          tracking-wider tabular-nums"
               aria-label={`Resume at ${badge}`}

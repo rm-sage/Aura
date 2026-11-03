@@ -6,7 +6,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { PhysicalPosition } from "@tauri-apps/api/dpi";
 import { invoke } from "@tauri-apps/api/core";
 import Tooltip from "./Tooltip";
-import SyncStatusChip from "./SyncStatusChip";
+import ServiceStatusChip from "./ServiceStatusChip";
 import DownloadsButton from "./DownloadsButton";
 
 // Movement (CSS px, either axis) before an armed press becomes a real drag.
@@ -328,13 +328,13 @@ export default function TitleBar({ subtitle, opaque }: Props) {
         )}
       </div>
 
-      {/* Sync status chip — left of the spacer, anchored to the start of
-          the bar. Reflects Aura Cloud connection + freshness at a glance
-          (gray cloud = guest, green check = recently synced, amber alert
-          = stale, rose X = error). Click jumps to Settings → Cloud Sync
-          (sec-cloud-sync) once that section ships. */}
+      {/* Service status chip, left of the spacer, anchored to the start of
+          the bar. The worst state across Aura's server, Cloud sync, the
+          Watch Together relay, the installed addons and the monitored debrid
+          providers (green check / amber alert / rose X / gray idle). Click
+          opens its panel. */}
       <div className="relative flex items-stretch h-full pl-2" data-no-drag>
-        <SyncStatusChip />
+        <ServiceStatusChip />
         {/* After the chip, never before: this button expands to ~200px when
             something is downloading, and expanding to the LEFT of a status
             icon would shove that icon sideways several times a session. Here

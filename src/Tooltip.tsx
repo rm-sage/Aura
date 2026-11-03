@@ -195,10 +195,14 @@ export default function Tooltip({ text, content, pos = "right", shortcut, delay 
     showTimer.current = setTimeout(() => setOpen(true), delay);
   };
 
-  const handleClickLike = () => {
+  // `blur` drops focus after a mouse press. Never after a keyboard press: focus
+  // on <body> loses the user's place, and inside a panel it lets the next Space
+  // or arrow reach the player.
+  const handleClickLike = (blur: boolean) => {
     setDismissed(true);
     setOpen(false);
     cancelShow();
+    if (!blur) return;
     requestAnimationFrame(() => {
       const el = document.activeElement;
       if (el instanceof HTMLElement) el.blur();
@@ -247,8 +251,10 @@ export default function Tooltip({ text, content, pos = "right", shortcut, delay 
     <span
       ref={triggerRef}
       className={`relative inline-flex${className ? ` ${className}` : ""}`}
-      onClick={handleClickLike}
-      onContextMenu={handleClickLike}
+      // detail is the click count: 0 for Enter / Space. Read on the click only,
+      // since a contextmenu event can carry 0 from a mouse too.
+      onClick={(e) => handleClickLike(e.detail !== 0)}
+      onContextMenu={() => handleClickLike(true)}
       onMouseEnter={() => { setDismissed(false); scheduleShow(); }}
       onMouseLeave={() => { setDismissed(false); cancelShow(); setOpen(false); }}
       onFocusCapture={() => { setDismissed(false); scheduleShow(); }}

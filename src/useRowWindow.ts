@@ -97,10 +97,13 @@ export function useRowWindow(
         setCols((prev) => (prev === c ? prev : c));
       }
       const card = gridRef.current?.firstElementChild as HTMLElement | null;
-      const h = card?.offsetHeight ?? 0;
+      // The laid-out height, unrounded: a rounded stride moves every visible row up to
+      // half a pixel each time the window crosses a row. Not getBoundingClientRect, which
+      // includes a card's hover scale.
+      const h = card ? parseFloat(getComputedStyle(card).height) || card.offsetHeight : 0;
       if (h > 0) {
         const s = h + gap;
-        setRowStride((prev) => (Math.abs(prev - s) < 0.5 ? prev : s));
+        setRowStride((prev) => (Math.abs(prev - s) < 0.01 ? prev : s));
       }
       const wrapRect = wrapper.getBoundingClientRect();
       const scrollRect = scroll.getBoundingClientRect();

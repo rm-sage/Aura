@@ -102,12 +102,34 @@ export function bindingMatches(spec: string | null | undefined, e: KeyboardEvent
   return chord != null && chordMatches(chord, e);
 }
 
+/** True while a Settings row is waiting for a key. A listener in the capture
+ *  phase runs before that row's and has to stand aside by asking. */
+let keyCaptureActive = false;
+export function setKeyCaptureActive(on: boolean): void {
+  keyCaptureActive = on;
+}
+export function isKeyCaptureActive(): boolean {
+  return keyCaptureActive;
+}
+
 export function isTypingTarget(t: EventTarget | null): boolean {
   if (!(t instanceof HTMLElement)) return false;
   const tag = t.tagName;
   if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return true;
   if (t.isContentEditable) return true;
   return false;
+}
+
+/** The mounted hook's latest options, for isChordBound. */
+let liveOptions: { current: Required<Pick<Options, "bindings" | "handlers" | "enabled">> } | null = null;
+
+/** Will useKeybindings act on this keydown? For a built-in chord that yields to
+ *  the user's own binding (Ctrl+F, searchHotkey.ts). */
+export function isChordBound(e: KeyboardEvent): boolean {
+  if (!liveOptions || !liveOptions.current.enabled || isTypingTarget(e.target)) return false;
+  const { bindings, handlers } = liveOptions.current;
+  return Object.entries(bindings).some(([action, spec]) =>
+    !!handlers[action as KeybindAction] && bindingMatches(spec, e));
 }
 
 export function useKeybindings({ bindings, handlers, enabled = true }: Options) {
@@ -145,8 +167,12 @@ export function useKeybindings({ bindings, handlers, enabled = true }: Options) 
       }
     };
 
+    liveOptions = ref;
     window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      if (liveOptions === ref) liveOptions = null;
+    };
   }, []);
 }
 

@@ -408,12 +408,12 @@ export default function CinemaSuite({
         signalKind = "SDR";
       }
 
-      // Buffer fill % — the demuxer-cache-duration vs the configured
-      // 180 s ceiling from player.rs. Clamped 0..100 so a momentarily
-      // over-filled queue (mpv occasionally over-shoots) doesn't
-      // render "112 %".
-      const CACHE_CEILING_SECS = 180;
-      const fillRaw = (demuxerSecs as number) / CACHE_CEILING_SECS * 100;
+      // Buffer fill %: the demuxer-cache-duration vs the engine's live
+      // cache-secs (the Forward buffer setting; 180 s is its default, for a
+      // missed read). Clamped 0..100 so a momentarily over-filled queue
+      // (mpv occasionally over-shoots) doesn't render "112 %".
+      const cacheCeilingSecs = (cacheSecs as number) > 0 ? (cacheSecs as number) : 180;
+      const fillRaw = (demuxerSecs as number) / cacheCeilingSecs * 100;
       const buffer_fill_pct = Math.max(0, Math.min(100, isFinite(fillRaw) ? fillRaw : 0));
 
       setOsdStats({

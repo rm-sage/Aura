@@ -1,7 +1,7 @@
 // Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { createContext, useContext, useEffect, useState, useCallback } from "react";
+import { createContext, useContext, useEffect, useRef, useState, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { ThemeId, AppSettings } from "./types";
 
@@ -128,10 +128,46 @@ export default function ThemeEngine({ children }: Props) {
       .finally(() => setReady(true));
   }, []);
 
+  // A theme written by anything but the dropdown (import, reset, cloud pull, a
+  // scope swap) is applied here, never written back. A read that started before
+  // a local pick, or while one is landing, must not flip the UI back: the pick's
+  // own landing event re-reads.
+  const picks = useRef({ gen: 0, pending: 0 });
+  useEffect(() => {
+    const reread = (e: Event) => {
+      const keys = (e as CustomEvent<{ keys?: string[] }>).detail?.keys;
+      if (Array.isArray(keys) && !keys.includes("theme")) return;
+      if (picks.current.pending > 0) return;
+      const gen = picks.current.gen;
+      invoke<AppSettings>("get_settings")
+        .then((s) => {
+          if (gen !== picks.current.gen || !isValidThemeId(s.theme)) return;
+          if (document.documentElement.getAttribute("data-theme") === s.theme) return;
+          setThemeState(s.theme);
+          applyTheme(s.theme);
+        })
+        .catch(() => {});
+    };
+    window.addEventListener("aura:backend-settings-changed", reread);
+    window.addEventListener("aura:session-changed", reread);
+    return () => {
+      window.removeEventListener("aura:backend-settings-changed", reread);
+      window.removeEventListener("aura:session-changed", reread);
+    };
+  }, []);
+
   const setTheme = useCallback((next: ThemeId) => {
+    picks.current.gen += 1;
+    picks.current.pending += 1;
     setThemeState(next);
     applyTheme(next);
-    invoke("set_theme", { theme: next }).catch(() => {});
+    invoke("set_theme", { theme: next }).then(
+      () => {
+        picks.current.pending -= 1;
+        window.dispatchEvent(new CustomEvent("aura:backend-settings-changed", { detail: { keys: ["theme"] } }));
+      },
+      () => { picks.current.pending -= 1; },
+    );
   }, []);
 
   return <Ctx.Provider value={{ theme, setTheme, ready }}>{children}</Ctx.Provider>;

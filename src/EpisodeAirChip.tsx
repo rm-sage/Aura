@@ -32,7 +32,7 @@ export default function EpisodeAirChip({ targetMs }: { targetMs: number }) {
     <div className="absolute inset-x-0 bottom-1.5 flex justify-center pointer-events-none z-10">
       <span
         className="inline-flex items-center gap-1 whitespace-nowrap px-2 py-0.5 rounded-full
-                   bg-black/72 backdrop-blur-sm border border-white/15
+                   bg-black/72 border border-white/15
                    text-white text-[11px] font-semibold tabular-nums"
         style={{ textShadow: "0 1px 2px rgba(0,0,0,0.9)" }}
       >

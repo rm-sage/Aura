@@ -31,6 +31,8 @@ import {
 import {
   closeDownloadsPanel,
   closeDownloadsPanelImmediate,
+  isPlayerActive,
+  keepPanelKeysFromPlayer,
   useDownloadsPanelPhase,
 } from "./downloadsPanel";
 
@@ -70,6 +72,9 @@ export default function DownloadsPanelHost({ isFullscreen }: { isFullscreen: boo
 
   const onKeyDown = useCallback((e: KeyboardEvent) => {
     if (e.key === "Escape") {
+      // A row's menu takes this Esc. Not stopped: its own capture listener runs
+      // next, closes the menu and keeps the key from App.
+      if (document.querySelector("[data-aura-context-menu]")) return;
       e.stopPropagation();
       closeDownloadsPanel();
     }
@@ -93,6 +98,8 @@ export default function DownloadsPanelHost({ isFullscreen }: { isFullscreen: boo
       // A menu raised FROM a row is not a DOM descendant of the panel, because
       // the singleton menu host lives elsewhere in the tree.
       if (t.closest("[data-aura-context-menu]")) return;
+      // The Performance Monitor floats over the app, it is not part of the page.
+      if (t.closest("[data-perf-monitor]")) return;
       closeDownloadsPanel();
     };
 
@@ -102,9 +109,11 @@ export default function DownloadsPanelHost({ isFullscreen }: { isFullscreen: boo
     // alone.
     window.addEventListener("mousedown", onMouseDown, true);
     window.addEventListener("keydown", onKeyDown, true);
+    const releaseKeys = keepPanelKeysFromPlayer("[data-downloads-panel]");
     return () => {
       window.removeEventListener("mousedown", onMouseDown, true);
       window.removeEventListener("keydown", onKeyDown, true);
+      releaseKeys();
     };
   }, [phase, onKeyDown]);
 
@@ -138,6 +147,8 @@ export default function DownloadsPanelHost({ isFullscreen }: { isFullscreen: boo
   }, [jobs]);
 
   if (phase === "closed" || isFullscreen) return null;
+
+  const inPlayback = isPlayerActive();
 
   const body = (
     <div
@@ -246,19 +257,25 @@ export default function DownloadsPanelHost({ isFullscreen }: { isFullscreen: boo
         <p className="flex-1 min-w-0 text-[11px] text-white/35 truncate" title={root || undefined}>
           {root || "No download folder set yet"}
         </p>
-        <button
-          type="button"
-          onClick={() => {
-            window.dispatchEvent(
-              new CustomEvent("aura:open-settings", { detail: { section: "sec-downloads" } }),
-            );
-            closeDownloadsPanel();
-          }}
-          className="text-[11px] px-2 py-1 rounded-md text-white/50 hover:text-white
-                     hover:bg-white/10 transition-colors flex-shrink-0"
-        >
-          Settings
-        </button>
+        {/* Not during playback: the page would switch under the player and the
+            detail page the user came from would be closed. */}
+        <Tooltip text={inPlayback ? "Available after playback" : "Open Downloads settings"} pos="top">
+          <button
+            type="button"
+            disabled={inPlayback}
+            onClick={() => {
+              window.dispatchEvent(
+                new CustomEvent("aura:open-settings", { detail: { section: "sec-downloads" } }),
+              );
+              closeDownloadsPanel();
+            }}
+            className="text-[11px] px-2 py-1 rounded-md text-white/50 hover:text-white
+                       hover:bg-white/10 transition-colors flex-shrink-0
+                       disabled:opacity-40 disabled:pointer-events-none"
+          >
+            Settings
+          </button>
+        </Tooltip>
       </footer>
     </div>
   );

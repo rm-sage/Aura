@@ -26,6 +26,7 @@
 // visit.
 
 import { check, type Update } from "@tauri-apps/plugin-updater";
+import { flushHistoryNow } from "./historyStore";
 
 /** Shape the rest of Aura's UI consumes. Matches the prior export
  *  exactly so the App.tsx / UpdatePopup / SettingsView call sites
@@ -46,20 +47,30 @@ export interface UpdateInfo {
  *  (which produces a new resource). */
 let cachedUpdate: Update | null = null;
 
+/** The download + install running now. A second press joins it. */
+let installInFlight: Promise<boolean> | null = null;
+
+function infoOf(update: Update): UpdateInfo {
+  return {
+    version:        update.version,
+    currentVersion: update.currentVersion,
+    date:           update.date,
+    body:           update.body,
+  };
+}
+
 /** Probe the configured update endpoint via the plugin. Returns
  *  null when no update is available OR the plugin can't verify the
- *  manifest signature. */
+ *  manifest signature. During an install it answers with the update being
+ *  installed: a null from a network blip would send the bell's second press
+ *  to its browser fallback mid-download. */
 export async function checkForUpdatePlugin(): Promise<UpdateInfo | null> {
+  if (installInFlight && cachedUpdate) return infoOf(cachedUpdate);
   try {
     const update = await check();
     cachedUpdate = update;
     if (!update) return null;
-    return {
-      version:        update.version,
-      currentVersion: update.currentVersion,
-      date:           update.date,
-      body:           update.body,
-    };
+    return infoOf(update);
   } catch (e) {
     console.warn(`[updater] check failed: ${String(e)}`);
     cachedUpdate = null;
@@ -71,16 +82,33 @@ export async function checkForUpdatePlugin(): Promise<UpdateInfo | null> {
  *  false on any failure. Caller MUST run a successful
  *  `checkForUpdatePlugin()` first — the plugin needs the resource
  *  the check produced to know which manifest + signature to
- *  install. (We don't auto-rerun the check here: a stale result
- *  doesn't fail the install, but back-to-back network round-trips
- *  would add latency the user will notice.) */
-export async function downloadAndInstallUpdatePlugin(): Promise<boolean> {
-  if (!cachedUpdate) {
+ *  install. (We don't auto-rerun the check here: back-to-back network
+ *  round-trips would add latency the user will notice.) */
+export function downloadAndInstallUpdatePlugin(): Promise<boolean> {
+  if (installInFlight) return installInFlight;
+  // Captured once: download() records its bytes on the object it ran on, so
+  // install() on any other one throws "called before download".
+  const update = cachedUpdate;
+  if (!update) {
     console.warn("[updater] download_and_install called without a prior successful check");
-    return false;
+    return Promise.resolve(false);
   }
+  installInFlight = runInstall(update).finally(() => { installInFlight = null; });
+  return installInFlight;
+}
+
+async function runInstall(update: Update): Promise<boolean> {
   try {
-    await cachedUpdate.downloadAndInstall();
+    // install() ends in std::process::exit on Windows, without the window's
+    // close path, so history_store.rs's exit flush never runs and a change
+    // still inside its ~1.5 s write coalescing would be lost. Flush AFTER the
+    // download and right before the install: flushing before the download
+    // (one downloadAndInstall call) left the whole download, tens of seconds
+    // with the UI usable from the notifications bell, for a play or a
+    // History removal to land unsaved. flushHistoryNow never throws.
+    await update.download();
+    await flushHistoryNow();
+    await update.install();
     return true;
   } catch (e) {
     console.warn(`[updater] download_and_install failed: ${String(e)}`);

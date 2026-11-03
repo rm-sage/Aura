@@ -78,7 +78,7 @@ export function WatchedBadgeStatic({
         aria-label="Watched"
         title="Watched"
         className={`inline-flex items-center justify-center w-[22px] h-[22px] rounded-full
-                    bg-emerald-500/85 backdrop-blur-md text-white
+                    bg-emerald-500/85 text-white
                     border border-emerald-200/30 shadow-[0_2px_8px_rgba(0,0,0,0.45)]
                     ${className ?? ""}`}
       >
@@ -97,7 +97,7 @@ export function WatchedBadgeStatic({
         aria-label="Skipped"
         title="Skipped"
         className={`inline-flex items-center justify-center w-[22px] h-[22px] rounded-full
-                    bg-purple-500/85 backdrop-blur-md text-white
+                    bg-purple-500/85 text-white
                     border border-purple-200/30 shadow-[0_2px_8px_rgba(0,0,0,0.45)]
                     ${className ?? ""}`}
       >
@@ -117,7 +117,7 @@ export function WatchedBadgeStatic({
         aria-label="Planned"
         title="Planned"
         className={`inline-flex items-center justify-center w-[22px] h-[22px] rounded-full
-                    bg-ln-accent/85 backdrop-blur-md text-white
+                    bg-ln-accent/85 text-white
                     border border-blue-200/30 shadow-[0_2px_8px_rgba(0,0,0,0.45)]
                     ${className ?? ""}`}
       >

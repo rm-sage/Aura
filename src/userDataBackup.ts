@@ -13,9 +13,13 @@
 //     watched mark, so restoring one without the other leaves either orphaned
 //     purple tags on unwatched episodes or silently-watched episodes that were
 //     actually skipped.
-//   • aura:history:<historyScope> - local watch history log. NOTE the
-//     different scope: history keys on the stable user_id, everything else
-//     here on the auth_key prefix, so the payload carries both.
+//   • watch history for <historyScope>. NOT localStorage any more: it lives
+//     in a Rust-owned file (history_store.rs), and backup.rs fills
+//     `values.history` from that store when the payload says
+//     `historyFromStore`, as the same JSON-array string it always was, so old
+//     and new snapshots restore through one path. NOTE the different scope:
+//     history keys on the stable user_id, everything else here on the
+//     auth_key prefix, so the payload carries both.
 //   • aura:auto-bumped-series:v1 — auto-bumped flags (cross-scope).
 //   • aura:settings:v1           — AuraSettings (cross-scope).
 //
@@ -44,13 +48,25 @@
 import { invoke } from "@tauri-apps/api/core";
 import { reloadManualWatchedFromStorage } from "./manualWatched";
 import { reloadSkipMarksFromStorage } from "./skipMarks";
-import { getHistoryScope, reloadHistoryFromStorage } from "./historyStore";
+import { reloadAutoBumpedFromStorage } from "./autoBumped";
+import {
+  getHistoryScope,
+  historyReady,
+  isHistoryLoaded,
+  historyLoadError,
+  afterPendingHistoryWrites,
+  replaceHistoryForScope,
+  historyChangeReason,
+  type HistoryEntry,
+} from "./historyStore";
 
 // Storage keys we snapshot. Keep in sync with manualWatched.ts /
 // historyStore.ts / auraSettings.ts / autoBumped.ts.
 const KEYS = {
   manualState:    "aura:manual-state:",        // suffix: scope
   skipMarks:      "aura:skip-marks:",          // suffix: scope
+  /** The pre-file localStorage home of history, cleared on restore so the
+   *  one-time migration cannot union stale rows back over a restored list. */
   history:        "aura:history:",             // suffix: scope
   autoBumped:     "aura:auto-bumped-series:v1",
   auraSettings:   "aura:settings:v1",
@@ -59,6 +75,8 @@ const KEYS = {
 const AUTO_DEBOUNCE_MS = 30_000;       // 30 s of inactivity before auto-snapshot
 const AUTO_MAX_KEEP    = 10;           // rolling backup count per scope
 const AUTO_REASON_KEY  = "auto-snapshot";
+/** Reasons a person asked for (mirrors backup.rs `history_optional`). */
+const USER_REASONS = new Set(["manual", "pre-restore", "pre-cleanup"]);
 /** Fired when the active backup scope changes, so readers can re-derive. */
 export const BACKUP_SCOPE_EVENT = "aura:backup-scope-changed";
 const SCOPE_EVENT = BACKUP_SCOPE_EVENT;
@@ -83,6 +101,16 @@ export interface BackupPayload {
    *  NOTHING and a restore then removed the real log. Absent on v1 snapshots,
    *  which fall back to `scope` so they keep their original behaviour. */
   historyScope?: string;
+  /** Set by collectBackupPayload: `values.history` is filled in Rust from the
+   *  history store (backup.rs), so a large history never crosses IPC per
+   *  snapshot. Removed before the body is written; never present on disk. */
+  historyFromStore?: boolean;
+  /** Set (by createSnapshot or backup.rs) on a snapshot taken while the
+   *  history file could not be read: it holds every other store but NO
+   *  history, and a restore of it leaves the live history untouched rather
+   *  than reading the missing value as "empty". Only user-initiated reasons
+   *  are ever written this way (an automatic one is skipped instead). */
+  historyUnavailable?: boolean;
   /** ISO timestamp for human display. */
   capturedAt: string;
   /** localStorage values verbatim — Aura's other modules know how to
@@ -110,20 +138,27 @@ export interface BackupMeta {
 
 /** Read every relevant localStorage entry for the given scope into a
  *  payload struct. Pass `null` keys through verbatim so absence vs.
- *  empty-string survives the round-trip. */
-export function collectBackupPayload(scope: string): BackupPayload {
+ *  empty-string survives the round-trip. History is NOT read here: the
+ *  payload asks Rust to fill it from the store (`historyFromStore`), so only
+ *  call this after `historyReady()` (createSnapshot does). */
+export function collectBackupPayload(
+  scope: string,
+  opts?: { withoutHistory?: boolean },
+): BackupPayload {
   const safeScope = (scope ?? "").trim() || "guest";
   // Ask the store, do not re-derive. See BackupPayload.historyScope.
   const hScope = getHistoryScope().trim() || safeScope;
+  const withoutHistory = !!opts?.withoutHistory;
   return {
     schemaVersion: 2,
     scope: safeScope,
     historyScope: hScope,
+    ...(withoutHistory ? { historyUnavailable: true } : { historyFromStore: true }),
     capturedAt: new Date().toISOString(),
     values: {
       manualState:  localStorage.getItem(`${KEYS.manualState}${safeScope}`),
       skipMarks:    localStorage.getItem(`${KEYS.skipMarks}${safeScope}`),
-      history:      localStorage.getItem(`${KEYS.history}${hScope}`),
+      history:      null,
       autoBumped:   localStorage.getItem(KEYS.autoBumped),
       auraSettings: localStorage.getItem(KEYS.auraSettings),
     },
@@ -136,7 +171,13 @@ export function collectBackupPayload(scope: string): BackupPayload {
  *  individual stores listen for so live-bound UI re-reads.
  *
  *  WARNING: this overwrites the user's current state. Callers MUST
- *  surface a confirmation prompt before invoking. */
+ *  surface a confirmation prompt before invoking.
+ *
+ *  THROWS, before writing anything, when the snapshot carries history for
+ *  the scope in use and that scope's history file cannot be read right now.
+ *  Rust refuses the history write then (history_store.rs require_readable),
+ *  so going ahead would apply every other store and silently drop the
+ *  history half, a partial restore with "Restored." on screen. */
 export function applyBackupPayload(payload: BackupPayload): void {
   const safeScope = (payload.scope ?? "").trim() || "guest";
   // v1 snapshots have no historyScope; falling back to `scope` reproduces
@@ -144,6 +185,15 @@ export function applyBackupPayload(payload: BackupPayload): void {
   // it came from rather than being redirected to a key it never captured.
   const hScope = (payload.historyScope ?? "").trim() || safeScope;
   const v = payload.values ?? {} as BackupPayload["values"];
+  const restoreHistory = !payload.historyUnavailable;
+  if (
+    restoreHistory &&
+    hScope === getHistoryScope() &&
+    !isHistoryLoaded() &&
+    historyLoadError() !== null
+  ) {
+    throw new Error("watch history can't be read right now, so nothing was restored. Try again in a moment.");
+  }
 
   const writeOrRemove = (key: string, value: string | null) => {
     if (value == null) {
@@ -155,13 +205,41 @@ export function applyBackupPayload(payload: BackupPayload): void {
 
   writeOrRemove(`${KEYS.manualState}${safeScope}`, v.manualState);
   writeOrRemove(`${KEYS.skipMarks}${safeScope}`, v.skipMarks ?? null);
-  writeOrRemove(`${KEYS.history}${hScope}`,        v.history);
   writeOrRemove(KEYS.autoBumped,                   v.autoBumped);
+
+  // History goes into the store. Null meant "the key was absent" when the
+  // snapshot was taken, which restored as an empty history, so it still does.
+  // A string that does not parse is left out rather than restored as empty:
+  // wiping the live history over an unreadable snapshot helps nobody.
+  let restored: HistoryEntry[] | null = [];
+  if (!restoreHistory) {
+    // Taken while the history file could not be read: it holds no history,
+    // which is not the same as an empty one.
+    restored = null;
+  } else if (v.history != null) {
+    try {
+      const parsed = JSON.parse(v.history);
+      restored = Array.isArray(parsed) ? (parsed as HistoryEntry[]) : null;
+    } catch {
+      restored = null;
+    }
+  }
+  if (restored) {
+    // Drop any not-yet-migrated localStorage copy first, so the next load of
+    // that scope cannot union pre-restore rows back in.
+    try { localStorage.removeItem(`${KEYS.history}${hScope}`); } catch {}
+    replaceHistoryForScope(hScope, restored);
+  } else if (!restoreHistory) {
+    console.info("[backup] snapshot was taken without history; history left as it is");
+  } else {
+    console.warn("[backup] snapshot history does not parse; history left as it is");
+  }
   writeOrRemove(KEYS.auraSettings,                 v.auraSettings);
 
-  // RELOAD the in-memory mirrors, do not merely re-render.
+  // RELOAD the in-memory mirrors, do not merely re-render. (History is
+  // already live: replaceHistoryForScope updated its in-memory list.)
   //
-  // manualWatched, skipMarks and historyStore each hydrate from localStorage
+  // manualWatched, skipMarks and autoBumped each hydrate from localStorage
   // ONCE and short-circuit every read afterwards, so writing the keys above and
   // firing a change event only re-rendered components that then read the
   // PRE-RESTORE values. The restore appeared to do nothing until the app was
@@ -171,7 +249,7 @@ export function applyBackupPayload(payload: BackupPayload): void {
   // which has no mirror of its own.
   reloadManualWatchedFromStorage();
   reloadSkipMarksFromStorage();
-  reloadHistoryFromStorage();
+  reloadAutoBumpedFromStorage();
   window.dispatchEvent(new CustomEvent("aura:settings-changed"));
 }
 
@@ -185,14 +263,36 @@ export async function createSnapshot(
   reason: string,
   scope: string,
   maxKeep: number = AUTO_MAX_KEEP,
+  /** A snapshot file in `scope` this one's prune must not remove (the one a
+   *  Restore is rolling back to). */
+  protect?: string,
 ): Promise<BackupMeta | null> {
   try {
-    const payload = collectBackupPayload(scope);
+    // Never snapshot a history that has not hydrated: Rust would read the
+    // file, which is right, but a restore of the pre-hydration moment is not
+    // what anyone means. And wait for queued history writes, so the store
+    // Rust reads includes the play that triggered this snapshot.
+    //
+    // historyReady() is false only when the load FAILED (the file cannot be
+    // read). An automatic snapshot is skipped then: a history-less one would
+    // roll the good snapshots out of the auto bucket. A user-initiated one
+    // (a manual press, the pre-restore rollback, a pre-cleanup) is still taken
+    // WITHOUT history, because the other stores are readable and skipping it
+    // left a Restore with no way back.
+    const ready = await historyReady();
+    if (!ready && !USER_REASONS.has(reason)) {
+      console.warn("[backup] history is not loaded; snapshot skipped");
+      return null;
+    }
+    if (!ready) console.warn(`[backup] history is not readable; ${reason} snapshot taken without it`);
+    await afterPendingHistoryWrites();
+    const payload = collectBackupPayload(scope, { withoutHistory: !ready });
     const meta = await invoke<BackupMeta>("create_user_backup", {
       scope,
       reason,
       payload,
       maxKeep,
+      protect: protect ?? null,
     });
     return meta;
   } catch (err) {
@@ -283,8 +383,11 @@ export function startAutoBackup(initialScope: string): () => void {
   autoScopeSnapshot = initialScope?.trim() || "guest";
   autoEnabled = true;
   const onChange = () => scheduleAutoSnapshot();
+  // History also fires on hydration and cloud merges; only a local edit is
+  // a reason to snapshot.
+  const onHistory = (e: Event) => { if (historyChangeReason(e) === "mutation") onChange(); };
   window.addEventListener("aura:manual-watched-changed", onChange);
-  window.addEventListener("aura:history-changed",        onChange);
+  window.addEventListener("aura:history-changed",        onHistory);
   window.addEventListener("aura:settings-changed",       onChange);
   // The startup snapshot is DEFERRED to the first setAutoBackupScope call.
   //
@@ -306,7 +409,7 @@ export function startAutoBackup(initialScope: string): () => void {
       autoSnapshotTimer = null;
     }
     window.removeEventListener("aura:manual-watched-changed", onChange);
-    window.removeEventListener("aura:history-changed",        onChange);
+    window.removeEventListener("aura:history-changed",        onHistory);
     window.removeEventListener("aura:settings-changed",       onChange);
   };
 }

@@ -83,11 +83,6 @@ export default function SeasonSelect({
       setOpen(false);
     };
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
-        setOpen(false);
-        triggerRef.current?.focus();
-        return;
-      }
       if (e.key === "ArrowDown") {
         e.preventDefault();
         setHighlight((h) => {
@@ -120,6 +115,21 @@ export default function SeasonSelect({
       window.removeEventListener("keydown", onKey);
     };
   }, [open, seasons, highlight, onChange]);
+
+  // Capture phase, and stopped there: the window-level Escape handlers (App's,
+  // EpisodePanel's) would otherwise close the page or drawer under the dropdown.
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      e.preventDefault();
+      e.stopPropagation();
+      setOpen(false);
+      triggerRef.current?.focus();
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [open]);
 
   // Reset highlight when opening so the cursor lands on the current season.
   useEffect(() => {
@@ -196,6 +206,7 @@ export default function SeasonSelect({
       {open && (
         <div
           ref={popoverRef}
+          data-season-select-popover=""
           role="listbox"
           className="absolute left-0 z-40 overflow-y-auto
                      bg-black/85 backdrop-blur-2xl

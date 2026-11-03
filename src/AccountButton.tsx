@@ -9,7 +9,7 @@ import SidePill, { SIDE_PILL_LEFT_PX, SIDE_PILL_TOP_PX } from "./SidePill";
 // ---------------------------------------------------------------------------
 // AccountButton — compact circular Aura logo button + popover, anchored
 // fixed at the top-left of the app body (below the title bar's
-// SyncStatusChip). Replaces the older sidebar-top profile slot so the
+// ServiceStatusChip). Replaces the older sidebar-top profile slot so the
 // account UI sits in the natural "user identity" corner instead of being
 // stacked above the navigation rows.
 //
@@ -55,12 +55,19 @@ export default function AccountButton({
       const onTriggerBtn  = target?.closest?.("[data-profile-trigger]");
       if (!insidePopover && !onTriggerBtn) setOpen(false);
     };
-    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") setOpen(false); };
+    // Capture phase, and stopped there: the window-level Escape handlers (App's,
+    // the catalog page's) would otherwise close the page under the popover too.
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      e.preventDefault();
+      e.stopPropagation();
+      setOpen(false);
+    };
     window.addEventListener("mousedown", onMouseDown);
-    window.addEventListener("keydown", onKey);
+    window.addEventListener("keydown", onKey, true);
     return () => {
       window.removeEventListener("mousedown", onMouseDown);
-      window.removeEventListener("keydown", onKey);
+      window.removeEventListener("keydown", onKey, true);
     };
   }, [open]);
 

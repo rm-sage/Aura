@@ -9,6 +9,7 @@ import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { checkForUpdatePlugin, downloadAndInstallUpdatePlugin } from "../updaterPlugin";
 import StorageReport from "../StorageReport";
+import { getHistoryCloudTrim } from "../historyStore";
 import RuntimeComponentsSection from "../RuntimeComponentsSection";
 import Changelog from "../Changelog";
 import { useIdleGatedInterval } from "../useIdleGate";
@@ -35,7 +36,7 @@ import type { AddonEntry, ThemeId, KeybindAction } from "../types";
 import type { UserSession } from "../LoginView";
 import { KEYBIND_ACTIONS } from "../types";
 import { useTheme, THEME_LABELS, THEME_DESCRIPTIONS } from "../ThemeEngine";
-import { prettyBinding, formatBinding, parseBinding } from "../useKeybindings";
+import { prettyBinding, formatBinding, parseBinding, setKeyCaptureActive } from "../useKeybindings";
 import {
   loadAuraSettings,
   saveAuraSettings,
@@ -674,9 +675,12 @@ function SubLangFilterInput({
       .split(",")
       .map((s) => s.trim().toLowerCase())
       .filter((s) => /^[a-z]{2,3}$/.test(s));
-    lastSyncedRef.current = parsed.join(", ");
-    setDraft(parsed.join(", "));
-    onCommit(parsed);
+    const next = parsed.join(", ");
+    lastSyncedRef.current = next;
+    setDraft(next);
+    // Against the prop, so a failed save stays retryable. A blur that changed
+    // nothing must not stamp and push over another device's edit.
+    if (next !== joined) onCommit(parsed);
   };
 
   return (
@@ -740,9 +744,10 @@ function AudioPriorityInput({
       .split(",")
       .map((s) => s.trim().toLowerCase())
       .filter((s) => s === "original" || /^[a-z]{2,3}$/.test(s));
-    lastSyncedRef.current = parsed.join(", ");
-    setDraft(parsed.join(", "));
-    onCommit(parsed);
+    const next = parsed.join(", ");
+    lastSyncedRef.current = next;
+    setDraft(next);
+    if (next !== joined) onCommit(parsed);
   };
 
   return (
@@ -1132,6 +1137,13 @@ interface AuraStats {
 // base64 / paste base64 / pick file).
 // ---------------------------------------------------------------------------
 
+/** update_settings' answers for a patch it will not take (settings.rs), as
+ *  opposed to a save that failed: only these are worth retrying per field. */
+function isPatchRejection(e: unknown): boolean {
+  const message = String(e);
+  return message.startsWith("Invalid settings patch") || message.startsWith("Unknown theme");
+}
+
 function BackupRestoreSection({
   backend, addons, onApply, onResetComplete,
 }: {
@@ -1181,6 +1193,8 @@ function BackupRestoreSection({
       // defaults instead of pointing at whatever the user had pinned.
       try { localStorage.removeItem("aura:settings:v1"); } catch {}
       window.dispatchEvent(new CustomEvent("aura:settings-changed"));
+      // No key list: everything changed, the theme included.
+      window.dispatchEvent(new CustomEvent("aura:backend-settings-changed"));
       onResetComplete();
       setStatus({ kind: "ok", message: "All settings reset to defaults." });
     } catch (e) {
@@ -1196,7 +1210,10 @@ function BackupRestoreSection({
   // Stays async since `get_api_key` is a Tauri command; calling
   // sites await the blob.
   const hydrateBackendWithKeyringKeys = useCallback(async (includeKeys: boolean): Promise<Record<string, unknown>> => {
-    const merged: Record<string, unknown> = { ...(backend as unknown as Record<string, unknown>) };
+    // A fresh read: the page's copy misses a theme picked this visit and a cloud
+    // pull. A failed read still exports the copy rather than nothing.
+    const fresh = await invoke<BackendSettings>("get_settings").catch(() => backend);
+    const merged: Record<string, unknown> = { ...(fresh as unknown as Record<string, unknown>) };
     // API keys are OS-keyring CREDENTIALS. The export string is designed to be
     // shared (it pastes into a messenger), so by default we do NOT bake them in:
     // a user swapping configs with a friend would otherwise hand over their
@@ -1281,15 +1298,35 @@ function BackupRestoreSection({
         if (value.trim()) importedKeys.push([name, value.trim()]);
       }
 
-      await onApply(backendPatch as Partial<BackendSettings>);
+      // update_settings deserializes the merged object as one unit, so one bad
+      // field rejects the whole patch. Field by field only then: each call
+      // rewrites settings.json. A failed SAVE is not retried, it ends the import.
+      const backendKeys = Object.keys(backendPatch);
+      const rejected: string[] = [];
+      if (backendKeys.length > 0) {
+        try {
+          await onApply(backendPatch as Partial<BackendSettings>);
+        } catch (e) {
+          if (!isPatchRejection(e)) throw e;
+          for (const key of backendKeys) {
+            try {
+              await onApply({ [key]: backendPatch[key] } as Partial<BackendSettings>);
+            } catch (fieldError) {
+              if (!isPatchRejection(fieldError)) throw fieldError;
+              rejected.push(key);
+            }
+          }
+        }
+      }
 
       // Now write the imported keys to the keyring. Best-effort -
       // if the keyring fails (Linux without Secret Service), nothing
       // is left in settings.json either (the user can re-paste the
       // key manually). Skip empty values so we don't overwrite an
       // existing keyring entry with nothing.
+      let keysWritten = 0;
       for (const [name, value] of importedKeys) {
-        await invoke("set_api_key", { name, value }).catch(() => {});
+        await invoke("set_api_key", { name, value }).then(() => { keysWritten += 1; }, () => {});
       }
       if (importedKeys.length > 0) {
         window.dispatchEvent(new CustomEvent("aura:api-keys-changed"));
@@ -1309,23 +1346,30 @@ function BackupRestoreSection({
         // provider fields arrive separately via resolveProviders below.)
         Object.assign(next, blob.aura);
       }
-      const { aura: providerAura, unresolved } = resolveProviders(blob.providers, addons);
+      const { aura: providerAura, unresolved, ambiguous } = resolveProviders(blob.providers, addons);
       // Each resolved provider field overlays the current Aura
       // settings. The resolveProviders return shape uses the same
       // field names as AuraSettings, so a direct merge applies.
       Object.assign(next, providerAura);
       saveAuraSettings(next);
+      // What actually landed, not what the blob held.
       const fields =
-        Object.keys(blob.backend).length
+        backendKeys.length - rejected.length
+        + keysWritten
         + Object.keys(blob.aura ?? {}).length
         + Object.keys(providerAura).length;
-      const tail = unresolved > 0
-        ? ` (${unresolved} provider id${unresolved === 1 ? "" : "s"} skipped, not installed)`
-        : "";
-      setStatus({
-        kind: "ok",
-        message: `Imported ${fields} setting${fields === 1 ? "" : "s"}${tail}.`,
-      });
+      const notes: string[] = [];
+      if (unresolved > 0) {
+        notes.push(`${unresolved} provider id${unresolved === 1 ? "" : "s"} skipped, not installed`);
+      }
+      if (ambiguous > 0) {
+        notes.push(`${ambiguous} provider choice${ambiguous === 1 ? "" : "s"} matched another install of the same addon, check Settings`);
+      }
+      const tail = notes.length > 0 ? ` (${notes.join("; ")})` : "";
+      const imported = `Imported ${fields} setting${fields === 1 ? "" : "s"}`;
+      setStatus(rejected.length > 0
+        ? { kind: "error", message: `${imported}; could not apply: ${rejected.join(", ")}${tail}.` }
+        : { kind: "ok", message: `${imported}${tail}.` });
     } catch (e) {
       setStatus({ kind: "error", message: `Import failed: ${String(e)}` });
     }
@@ -1606,10 +1650,18 @@ function LocalDataBackupsSubsection() {
       // wasn't what they expected. This is the recommended pattern in
       // userDataBackup.ts's header - practising what we preach here
       // is what makes the recovery story actually trustworthy.
-      await createSnapshot("pre-restore", meta.scope);
+      // Read FIRST: a corrupt target must not push a good row out of the
+      // bucket, and the snapshot's own prune must not delete the target (the
+      // oldest row, the usual rollback), hence `protect`.
       const payload = await readSnapshot(meta.scope, meta.fileName);
       if (!payload) {
         setStatus({ kind: "error", message: "Couldn't read snapshot." });
+        await refresh();
+        return;
+      }
+      const rollback = await createSnapshot("pre-restore", meta.scope, undefined, meta.fileName);
+      if (!rollback) {
+        setStatus({ kind: "error", message: "Restore stopped: Aura couldn't save a snapshot of your current data to roll back to. Nothing was changed." });
         return;
       }
       applyBackupPayload(payload);
@@ -2458,6 +2510,9 @@ function CloudSyncSection({ authKey }: { authKey: string | null }) {
               const ago = ns.updated_at ? formatAgo(tickNow - ns.updated_at * 1000) : "Never";
               const sizeKb = ns.size != null ? formatBytes(ns.size) : "-";
               const overQuota = ns.size != null && ns.size > 1024 * 1024 * 0.95;
+              // A history too big for one blob syncs its newest rows only
+              // (history_store.rs cloud_encode_rows); say so, never silently.
+              const trim = ns.name === "history" ? getHistoryCloudTrim() : null;
               return (
                 <div key={ns.name}
                      className="flex items-center justify-between gap-3 px-3 py-2 text-[12px]">
@@ -2467,6 +2522,9 @@ function CloudSyncSection({ authKey }: { authKey: string | null }) {
                     </p>
                     <p className="text-white/40 text-[10.5px] mt-0.5">
                       {ago} · <span className={overQuota ? "text-amber-300/80" : ""}>{sizeKb}</span>
+                      {trim && trim.included < trim.total && (
+                        <> · Cloud copy holds the newest {trim.included.toLocaleString()} of {trim.total.toLocaleString()} entries</>
+                      )}
                     </p>
                   </div>
                   <button
@@ -3314,17 +3372,6 @@ function SettingsSearchInput({
   const hasMatches = (matchCount ?? 0) > 0;
   const showStepper = hasMatches && (matchCount ?? 0) > 1;
 
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
-        e.preventDefault();
-        ref.current?.focus();
-      }
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, []);
-
   return (
     <div className={compact ? "space-y-1.5" : "flex items-center gap-2"}>
       <div
@@ -3356,6 +3403,7 @@ function SettingsSearchInput({
           autoCorrect="off"
           autoCapitalize="off"
           placeholder="Search settings…"
+          data-aura-search
           onFocus={() => setFocused(true)}
           onBlur={() => setFocused(false)}
           onChange={(e) => onChange(e.target.value)}
@@ -3617,12 +3665,30 @@ function tocLeafShown(leaf: TocLeaf, adv: AdvancedView): boolean {
  *  parks the element `topInset`px below the container top (mirrors the
  *  sections' scroll-mt-6); `block: "center"` vertically centers it. Jumps
  *  instantly under reduced motion. Shared by every settings section-scroll
- *  (the TOC + the search-match navigation) so they feel identical. */
+ *  (the TOC + the search-match navigation) so they feel identical.
+ *  Returns how long the animation runs in ms (0 when it jumps or does not
+ *  move), so the TOC can hold its clicked highlight for exactly that long. */
+// The running animation's pending rAF id per scroll container. A new scroll
+// cancels the old one first: each frame writes an ABSOLUTE scrollTop, so two
+// loops left running together fight, and the longer one wins after the
+// shorter ends. The page then came to rest on the FIRST target while the
+// TOC's click pin held the SECOND leaf, with no later scroll event to
+// correct it. A WeakMap so a container that unmounts is not kept alive.
+const settingsScrollAnim = new WeakMap<HTMLElement, number>();
+
 function fastScrollToSettingsEl(
   scrollRoot: HTMLElement,
   el: HTMLElement,
   opts?: { block?: "start" | "center"; topInset?: number },
-): void {
+): number {
+  // Cancel before measuring, and on every early return below too: a jump or
+  // a no-op scroll is still the latest request, and an older loop left
+  // running would carry the page away from it.
+  const prev = settingsScrollAnim.get(scrollRoot);
+  if (prev !== undefined) {
+    cancelAnimationFrame(prev);
+    settingsScrollAnim.delete(scrollRoot);
+  }
   const block = opts?.block ?? "start";
   const topInset = opts?.topInset ?? 24;
   const rootRect = scrollRoot.getBoundingClientRect();
@@ -3634,11 +3700,11 @@ function fastScrollToSettingsEl(
     : rel - topInset;
   const target = Math.max(0, Math.min(raw, scrollRoot.scrollHeight - scrollRoot.clientHeight));
   const dist = Math.abs(target - start);
-  if (dist < 2) return;
+  if (dist < 2) return 0;
   // Reduced motion: jump instantly, no animated scroll.
   if (document.documentElement.getAttribute("data-reduced-motion") === "true") {
     scrollRoot.scrollTop = target;
-    return;
+    return 0;
   }
   const duration = Math.min(280, Math.max(130, dist * 0.32));
   const startTs = performance.now();
@@ -3646,9 +3712,11 @@ function fastScrollToSettingsEl(
   const stepScroll = (now: number) => {
     const t = Math.min(1, (now - startTs) / duration);
     scrollRoot.scrollTop = start + (target - start) * easeOutCubic(t);
-    if (t < 1) requestAnimationFrame(stepScroll);
+    if (t < 1) settingsScrollAnim.set(scrollRoot, requestAnimationFrame(stepScroll));
+    else settingsScrollAnim.delete(scrollRoot);
   };
-  requestAnimationFrame(stepScroll);
+  settingsScrollAnim.set(scrollRoot, requestAnimationFrame(stepScroll));
+  return duration;
 }
 
 interface SettingsTocProps {
@@ -3673,12 +3741,31 @@ interface SettingsTocProps {
     currentMatchIdx: number;
     onStepMatch: (delta: 1 | -1) => void;
   };
+  /** A deep link's target, a new object per jump: its leaf is pinned. */
+  pin?: { id: string } | null;
 }
 
-function SettingsToc({ scrollRoot, groups, advanced, search }: SettingsTocProps) {
+function SettingsToc({ scrollRoot, groups, advanced, search, pin }: SettingsTocProps) {
   // Always-expanded layout - the collapsing UX added complexity that the
   // user found more annoying than helpful. Every leaf is visible at once.
   const [activeId, setActiveId] = useState<string>(groups[0]?.sections[0]?.id ?? "");
+  // A TOC click pins its leaf while the programmatic scroll it started runs:
+  // the spy would otherwise re-judge every animation frame and, for a short
+  // section the scroll cannot bring up to the reading line, move the
+  // highlight off what the user just clicked. Released when it expires or on
+  // the first sign of the user scrolling themselves (see the spy effect).
+  // `graceUntil` lets a pin outlive its section not being listed or mounted yet.
+  const clickLockRef = useRef<{ id: string; until: number; graceUntil?: number } | null>(null);
+
+  // A deep link parks its section near the end of the page, where the ramp
+  // below would light a later leaf. Its pin has no timer: the link re-scrolls
+  // up to 550 ms later and sections above can still resize, each firing a scroll
+  // event the spy would re-judge, so only the user's own scrolling releases it.
+  useEffect(() => {
+    if (!pin) return;
+    setActiveId(pin.id);
+    clickLockRef.current = { id: pin.id, until: Infinity, graceUntil: performance.now() + 700 };
+  }, [pin]);
 
   const scrollToSection = (id: string) => {
     if (!scrollRoot) return;
@@ -3687,7 +3774,10 @@ function SettingsToc({ scrollRoot, groups, advanced, search }: SettingsTocProps)
     setActiveId(id);
     // Snappy shared scroll instead of the browser-fixed native smooth
     // scrollIntoView (see fastScrollToSettingsEl).
-    fastScrollToSettingsEl(scrollRoot, el, { block: "start" });
+    const duration = fastScrollToSettingsEl(scrollRoot, el, { block: "start" });
+    // 150 ms past the animation covers its last scroll event and the spy's
+    // rAF after it (an instant jump, duration 0, still fires one of each).
+    clickLockRef.current = { id, until: performance.now() + duration + 150 };
   };
 
   // Keep the active highlight in sync with whichever section the user
@@ -3705,11 +3795,33 @@ function SettingsToc({ scrollRoot, groups, advanced, search }: SettingsTocProps)
   //      anything gated by `{backend && (...)}` (Playback, Window,
   //      Integrations, Performance) was missing from the cache and
   //      never highlighted - the spy walk silently skipped over them.
-  //   4. (current) Same rAF-debounced walk, but query DOM each frame
+  //   4. Same rAF-debounced walk, but query DOM each frame
   //      instead of caching. 18 querySelector(`#id`) lookups per frame
   //      is microsecond-cheap and means async section mounts (backend
   //      resolution, conditional renders) join the spy walk the moment
   //      they appear.
+  //   5. (current) The reading line (active = last section whose top is at
+  //      or above it) was a fixed 20 % down the viewport, which is wrong at
+  //      both ENDS of the scroll range. At the top, a short first section
+  //      (Stream Providers with advanced off) put the second one's top
+  //      inside the top 20 % at scrollTop 0, so "Spoilers" lit up on a page
+  //      the user had not scrolled. At the bottom, a short trailing section
+  //      can never scroll up to the 20 % line, so it could never be active,
+  //      and a TOC click on one was overridden by the very scroll it
+  //      started. Now the line rides with the scroll position near the
+  //      ends: it starts at the sections' 24 px scroll inset at scrollTop 0
+  //      and moves down 1 px per px scrolled until it reaches 20 %, holds
+  //      there through the middle, and over the last 80 % of a viewport of
+  //      scroll moves down 1 px per px again until it reaches the viewport
+  //      bottom at the end of the range, so every section, however short,
+  //      gets a stretch of scroll in which it is the active one. A page too
+  //      short for both ramps (a very tall window) interpolates the line
+  //      linearly from the inset to the bottom over its whole scroll range,
+  //      which is the same two slopes merged. The line's position in
+  //      CONTENT coordinates only ever grows with scrollTop, so the
+  //      highlight still advances strictly in document order. A TOC click
+  //      also pins its leaf for the length of its scroll, and a deep link
+  //      until the user scrolls (clickLockRef).
   // The walk covers only the listed leaves (`groups`), and re-primes when
   // they change, so Show advanced settings can never leave the highlight on
   // a section that just went away. A `hidden` section is skipped as well:
@@ -3717,12 +3829,49 @@ function SettingsToc({ scrollRoot, groups, advanced, search }: SettingsTocProps)
   useEffect(() => {
     if (!scrollRoot) return;
     const ALL_SECTIONS = groups.flatMap((g) => g.sections);
+    // Mirrors fastScrollToSettingsEl's default topInset (the sections'
+    // scroll-mt-6): where a TOC click parks a section's top.
+    const INSET = 24;
+    const READ_FRACTION = 0.2;
 
     let raf: number | null = null;
     const update = () => {
       raf = null;
+      const lock = clickLockRef.current;
+      if (lock) {
+        // Honour the pin only while it is live AND its section is still on
+        // screen: a groups change (advanced off, a search query) that hid it
+        // must not leave the highlight on a leaf that went away.
+        const lockedEl = ALL_SECTIONS.some((s) => s.id === lock.id)
+          ? scrollRoot.querySelector<HTMLElement>(`#${lock.id}`)
+          : null;
+        const now = performance.now();
+        const onScreen = !!lockedEl && !lockedEl.hidden;
+        if (now < lock.until && (onScreen || now < (lock.graceUntil ?? 0))) return;
+        clickLockRef.current = null;
+      }
       const rootRect = scrollRoot.getBoundingClientRect();
-      const threshold = rootRect.top + 0.2 * rootRect.height;
+      const h = scrollRoot.clientHeight;
+      const maxScroll = Math.max(0, scrollRoot.scrollHeight - h);
+      const s = Math.min(Math.max(0, scrollRoot.scrollTop), maxScroll);
+      const base = READ_FRACTION * h;
+      const topRamp = Math.max(0, base - INSET); // scroll spent reaching 20 %
+      const bottomRamp = h - base;               // scroll spent reaching the bottom
+      let offset: number;
+      if (maxScroll <= 0) {
+        offset = INSET;
+      } else if (maxScroll < topRamp + bottomRamp) {
+        offset = INSET + (s / maxScroll) * (h - INSET);
+      } else if (s < topRamp) {
+        offset = INSET + s;
+      } else if (maxScroll - s < bottomRamp) {
+        offset = h - (maxScroll - s);
+      } else {
+        offset = base;
+      }
+      // +1 absorbs sub-pixel layout so a section parked exactly on the inset
+      // (scrollTop 0, or a TOC click) counts as reached.
+      const threshold = rootRect.top + offset + 1;
       let candidate: string | null = null;
       let firstFound: string | null = null;
       for (const s of ALL_SECTIONS) {
@@ -3751,11 +3900,25 @@ function SettingsToc({ scrollRoot, groups, advanced, search }: SettingsTocProps)
     update();
     requestAnimationFrame(update);
 
+    // Any sign the user is scrolling themselves ends a TOC click's pin at
+    // once, so a wheel during the animation is spied normally. These all
+    // fire BEFORE the click event of a TOC press (pointerdown, or keydown
+    // for Enter / Space), so a click re-pins after its own release.
+    const releaseLock = () => { clickLockRef.current = null; };
+
     scrollRoot.addEventListener("scroll", onScroll, { passive: true });
+    scrollRoot.addEventListener("wheel", releaseLock, { passive: true });
+    scrollRoot.addEventListener("touchstart", releaseLock, { passive: true });
+    scrollRoot.addEventListener("pointerdown", releaseLock);
+    window.addEventListener("keydown", releaseLock);
     window.addEventListener("resize", onScroll);
     return () => {
       if (raf != null) cancelAnimationFrame(raf);
       scrollRoot.removeEventListener("scroll", onScroll);
+      scrollRoot.removeEventListener("wheel", releaseLock);
+      scrollRoot.removeEventListener("touchstart", releaseLock);
+      scrollRoot.removeEventListener("pointerdown", releaseLock);
+      window.removeEventListener("keydown", releaseLock);
       window.removeEventListener("resize", onScroll);
     };
   }, [scrollRoot, groups]);
@@ -3870,7 +4033,7 @@ interface KeybindRowProps {
   lostTo?: string;
 }
 
-function KeybindRow({ label, description, code, onChange, lostTo }: KeybindRowProps) {
+function KeybindRow({ action, label, description, code, onChange, lostTo }: KeybindRowProps) {
   const [capturing, setCapturing] = useState(false);
   const ref = useRef<HTMLButtonElement>(null);
 
@@ -3906,8 +4069,12 @@ function KeybindRow({ label, description, code, onChange, lostTo }: KeybindRowPr
       onChange(spec);
       setCapturing(false);
     };
+    setKeyCaptureActive(true);
     window.addEventListener("keydown", onKey, { capture: true });
-    return () => window.removeEventListener("keydown", onKey, { capture: true } as any);
+    return () => {
+      setKeyCaptureActive(false);
+      window.removeEventListener("keydown", onKey, { capture: true } as any);
+    };
   }, [capturing, onChange]);
 
   // Only while it is still unbound: rebinding it, or a reset, ends the glow.
@@ -3916,6 +4083,9 @@ function KeybindRow({ label, description, code, onChange, lostTo }: KeybindRowPr
     <button
       ref={ref}
       onClick={() => setCapturing(true)}
+      data-settings-row=""
+      data-settings-label={label}
+      data-settings-description={description}
       className={`w-full flex items-center justify-between gap-4 px-3 py-2.5 rounded-lg
                   text-left transition-colors
                   ${capturing
@@ -3944,7 +4114,12 @@ function KeybindRow({ label, description, code, onChange, lostTo }: KeybindRowPr
                         : "bg-white/8 text-white/75 border border-white/12"
                     }`}
       >
-        {capturing ? "Press a key…" : code ? prettyBinding(code) : "Unbound"}
+        {capturing
+          ? "Press a key…"
+          : code
+            // Its hotkey is known as Alt+~, and pressing it with Shift works too.
+            ? (action === "perf-monitor" ? prettyBinding(code).replace("`", "~") : prettyBinding(code))
+            : "Unbound"}
       </kbd>
     </button>
   );
@@ -4870,6 +5045,8 @@ interface CrashReportingConfig {
 export default function SettingsView({ addons, session }: Props) {
   const [aura, setAura] = useState<AuraSettings>(loadAuraSettings);
   const [backend, setBackend] = useState<BackendSettings | null>(null);
+  const backendRef = useRef(backend);
+  backendRef.current = backend;
   // Keybinding rows whose key moved to another row this visit, and the label
   // of the row it went to. Kept here so the red rows clear when Settings is
   // left (this view unmounts) rather than on a timer the user might miss.
@@ -4972,6 +5149,27 @@ export default function SettingsView({ addons, session }: Props) {
       .catch(() => { hydratedRef.current = true; });
   }, []);
 
+  // This page outlives a sign-in / sign-out (a new scope's file) and a cloud
+  // pull: re-read rather than keep showing, and editing, the old values.
+  useEffect(() => {
+    const reread = () => {
+      invoke<BackendSettings>("get_settings").then(setBackend).catch(() => {});
+    };
+    const onSession = () => {
+      setKeysLostTo({}); // those red rows belonged to the old scope
+      reread();
+    };
+    const onBackendChange = (e: Event) => {
+      if ((e as CustomEvent<{ fromCloud?: boolean }>).detail?.fromCloud) reread();
+    };
+    window.addEventListener("aura:session-changed", onSession);
+    window.addEventListener("aura:backend-settings-changed", onBackendChange);
+    return () => {
+      window.removeEventListener("aura:session-changed", onSession);
+      window.removeEventListener("aura:backend-settings-changed", onBackendChange);
+    };
+  }, []);
+
   // Load + watch the crash-reporting sidecar. Refresh whenever the
   // consent modal or another tab writes - keeps both surfaces in sync
   // (`aura:crash-reporting-changed` is the canonical event).
@@ -5007,41 +5205,65 @@ export default function SettingsView({ addons, session }: Props) {
     [queueSavedToast],
   );
 
-  // Patch a backend setting and round-trip through update_settings.
+  // Patch a backend setting and round-trip through update_settings. Rejects when
+  // the patch is refused or cannot be saved: the import reports that. The live
+  // controls go through patchBackend below.
+  const applyBackendPatch = useCallback(async (patch: Partial<BackendSettings>) => {
+    const updated = await invoke<BackendSettings>("update_settings", { patch });
+    // Against the state BEFORE the write (`updated` already holds the patch), by
+    // value (arrays): a patch that changed nothing must not stamp and push over
+    // another device's edit.
+    const before = backendRef.current as unknown as Record<string, unknown> | null;
+    const after = updated as unknown as Record<string, unknown>;
+    const changedKeys = Object.keys(patch).filter(
+      (k) => !before || JSON.stringify(before[k]) !== JSON.stringify(after[k]),
+    );
+    backendRef.current = updated;
+    setBackend(updated);
+    queueSavedToast();
+    // Live-apply subtitle styling - when the user adjusts size/colour/etc.
+    // we want the change to show up immediately in the active player
+    // without waiting for the next stream load.
+    if (Object.keys(patch).some((k) => k.startsWith("subtitle_"))) {
+      invoke("apply_subtitle_style").catch(() => {});
+    }
+    // The title bar's close button changes behaviour with this one setting
+    // (a click hides to tray, so it grows a hold-to-quit affordance), and it
+    // reads the value itself rather than taking a prop. Nudge it so the
+    // toggle applies immediately instead of on next launch.
+    //
+    // Deliberately narrow: `aura:settings-changed` also drives an AuraSkip
+    // re-stamp and a sync-chip refresh, so firing it on EVERY backend patch
+    // would cause pointless churn on unrelated settings.
+    if ("minimize_to_tray_on_close" in patch) {
+      window.dispatchEvent(new Event("aura:settings-changed"));
+    }
+    // The scrobble toggles get their own signal for the same reason the
+    // above is narrow. `scrobbleConn` caches both of them in a module-level
+    // snapshot that resolves once per session, and without this the cached
+    // answer never changed: turning scrobbling off and then skipping a
+    // filler run still pushed plays to Trakt / AniList.
+    if ("scrobble_enabled" in patch || "auto_scrobble_enabled" in patch) {
+      window.dispatchEvent(new Event("aura:scrobble-settings-changed"));
+    }
+    // The player's chord labels read the map themselves.
+    if ("keybindings" in patch) {
+      window.dispatchEvent(new CustomEvent("aura:keybindings-changed"));
+    }
+    // The narrow signal for every backend edit, with the keys it touched: sync
+    // stamps and pushes on it, App and ThemeEngine re-read only for theirs.
+    window.dispatchEvent(new CustomEvent("aura:backend-settings-changed", {
+      detail: { keys: changedKeys },
+    }));
+  }, [queueSavedToast]);
+
   const patchBackend = useCallback(async (patch: Partial<BackendSettings>) => {
     try {
-      const updated = await invoke<BackendSettings>("update_settings", { patch });
-      setBackend(updated);
-      queueSavedToast();
-      // Live-apply subtitle styling - when the user adjusts size/colour/etc.
-      // we want the change to show up immediately in the active player
-      // without waiting for the next stream load.
-      if (Object.keys(patch).some((k) => k.startsWith("subtitle_"))) {
-        invoke("apply_subtitle_style").catch(() => {});
-      }
-      // The title bar's close button changes behaviour with this one setting
-      // (a click hides to tray, so it grows a hold-to-quit affordance), and it
-      // reads the value itself rather than taking a prop. Nudge it so the
-      // toggle applies immediately instead of on next launch.
-      //
-      // Deliberately narrow: `aura:settings-changed` also drives an AuraSkip
-      // re-stamp and a sync-chip refresh, so firing it on EVERY backend patch
-      // would cause pointless churn on unrelated settings.
-      if ("minimize_to_tray_on_close" in patch) {
-        window.dispatchEvent(new Event("aura:settings-changed"));
-      }
-      // The scrobble toggles get their own signal for the same reason the
-      // above is narrow. `scrobbleConn` caches both of them in a module-level
-      // snapshot that resolves once per session, and without this the cached
-      // answer never changed: turning scrobbling off and then skipping a
-      // filler run still pushed plays to Trakt / AniList.
-      if ("scrobble_enabled" in patch || "auto_scrobble_enabled" in patch) {
-        window.dispatchEvent(new Event("aura:scrobble-settings-changed"));
-      }
+      await applyBackendPatch(patch);
     } catch {
       // ignore - UI keeps its optimistic state
     }
-  }, [queueSavedToast]);
+  }, [applyBackendPatch]);
 
   const setLocal = (patch: Partial<AuraSettings>) =>
     setAura((prev) => ({ ...prev, ...patch }));
@@ -5077,11 +5299,12 @@ export default function SettingsView({ addons, session }: Props) {
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const [scrollEl, setScrollEl] = useState<HTMLDivElement | null>(null);
   useEffect(() => { setScrollEl(scrollRef.current); }, []);
+  const [tocPin, setTocPin] = useState<{ id: string } | null>(null);
 
   // Consume the section anchor set by App's aura:open-settings handler
   // (window.location.hash). Without this, deep-linking to a Settings
-  // section (Trakt re-auth notification, scrobble onboarding, the
-  // SyncStatusChip) switched the view but never scrolled.
+  // section (Trakt re-auth notification, scrobble onboarding, the title
+  // bar's ServiceStatusChip) switched the view but never scrolled.
   useEffect(() => {
     if (!scrollEl) return;
     let raf = 0;
@@ -5102,6 +5325,7 @@ export default function SettingsView({ addons, session }: Props) {
       // an advanced one) until the user leaves Settings. The section renders
       // on the next commit; the settle-window re-runs below reach it there.
       setRevealedSections((prev) => (prev.has(id) ? prev : new Set(prev).add(id)));
+      setTocPin({ id });
       const scrollToTarget = () => {
         const el = scrollEl.querySelector<HTMLElement>(`#${window.CSS.escape(id)}`);
         if (el) el.scrollIntoView({ behavior: "auto", block: "start" });
@@ -5262,7 +5486,7 @@ export default function SettingsView({ addons, session }: Props) {
     <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
       <div
         ref={scrollRef}
-        className="flex-1 overflow-y-auto flex items-center justify-center"
+        className="aura-page-scroller flex-1 overflow-y-auto flex items-center justify-center"
         style={{ scrollbarWidth: "thin", scrollbarColor: "rgba(255,255,255,0.08) transparent" }}
       >
         {/* Outer centering container: caps total width so the layout sits
@@ -5303,6 +5527,7 @@ export default function SettingsView({ addons, session }: Props) {
             <SettingsToc
               scrollRoot={scrollEl}
               groups={tocGroups}
+              pin={tocPin}
               advanced={{
                 value: aura.showAdvancedSettings,
                 onChange: (v) => setLocal({ showAdvancedSettings: v }),
@@ -5520,7 +5745,7 @@ export default function SettingsView({ addons, session }: Props) {
           <Section id="sec-hover-panel" title="Hover Meta Panel">
             <SettingDropdown
               label="How the meta panel opens"
-              description="When the mini-meta panel beside a catalog card opens: on hover, on a mouse button you choose, or on a long press of a poster (best for trackpads)."
+              description="When the mini-meta panel beside a catalog card opens: on hover, on a mouse button you choose, or on a long press of a poster (best for trackpads). On hover, hold Alt to keep the panel still and move onto it when it covers other cards."
               value={aura.metaPanelActivation}
               required
               options={[
@@ -6058,9 +6283,12 @@ export default function SettingsView({ addons, session }: Props) {
                     code={backend.keybindings[a.id] ?? ""}
                     lostTo={keysLostTo[a.id]}
                     onChange={async (next) => {
-                      const { map: updatedMap, moved } = rebindKey(backend.keybindings, a.id, next);
+                      // A patch replaces the whole map, so start from the active
+                      // scope's current one: this page's copy can predate a
+                      // sign-in, a sign-out or a cloud pull.
+                      const fresh = await invoke<BackendSettings>("get_settings").catch(() => backend);
+                      const { map: updatedMap, moved } = rebindKey(fresh.keybindings, a.id, next);
                       await patchBackend({ keybindings: updatedMap });
-                      window.dispatchEvent(new CustomEvent("aura:keybindings-changed"));
                       setKeysLostTo((prev) => {
                         const nextLost = { ...prev };
                         delete nextLost[a.id];
@@ -6125,6 +6353,12 @@ export default function SettingsView({ addons, session }: Props) {
               ]}
               required
               onChange={(v) => v && setLocal({ reduceMotion: v as AuraSettings["reduceMotion"] })}
+            />
+            <SettingToggle
+              label="Smooth mouse wheel"
+              description="Blends wheel notches into one continuous motion. Off uses the browser's own scrolling, which stops between notches. Touchpads are not affected."
+              value={aura.smoothWheelScroll}
+              onChange={(v) => setLocal({ smoothWheelScroll: v })}
             />
           </Section>
 
@@ -6435,7 +6669,7 @@ export default function SettingsView({ addons, session }: Props) {
             <BackupRestoreSection
               backend={backend}
               addons={addons}
-              onApply={async (patch) => { await patchBackend(patch); }}
+              onApply={applyBackendPatch}
               onResetComplete={() => {
                 // Force the SettingsView to re-pull fresh backend
                 // defaults so the UI controls reflect the wipe.

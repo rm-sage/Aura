@@ -194,6 +194,24 @@ identifier = "allow-manga-chapters"
 description = "Allows the frontend to read which manga chapters an anime series, its story arcs and its episodes adapt"
 commands.allow = ["manga_chapters"]
 
+# ── Service status (title-bar monitor; provider endpoints are a fixed Rust table) ──
+[[permission]]
+identifier = "allow-service-status"
+description = "Allows the frontend to check Aura's server, the installed addons, the Watch Together relay and the debrid providers the user chose to monitor"
+commands.allow = ["service_status"]
+
+# ── Performance Monitor window (read-only figures about Aura's own processes) ──
+[[permission]]
+identifier = "allow-perf-monitor"
+description = "Allows the Performance Monitor window to read the CPU, memory, I/O, GPU and playback figures of Aura's own process tree"
+commands.allow = ["perf_monitor"]
+
+# ── Watch history (Rust-owned compact file per scope; one tagged command) ──
+[[permission]]
+identifier = "allow-history-store"
+description = "Allows the frontend to load and change the watch history kept under app_data_dir/history, and to encode or merge its Aura Cloud copy"
+commands.allow = ["history_store"]
+
 # ── Phase 4: OpenSubtitles ────────────────────────────────────────────────────
 [[permission]]
 identifier = "allow-subtitles"

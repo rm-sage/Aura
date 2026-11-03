@@ -5786,7 +5786,7 @@ function StreamsPanel({
         </div>
       )}
       <div
-        className="relative flex-1 min-h-0 overflow-y-auto overflow-x-hidden px-2 py-3"
+        className="aura-page-scroller relative flex-1 min-h-0 overflow-y-auto overflow-x-hidden px-2 py-3"
         style={{ scrollbarWidth: "thin", scrollbarColor: "rgba(255,255,255,0.08) transparent" }}
       >
         {loading && streams.length === 0 ? (
