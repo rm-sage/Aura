@@ -8,7 +8,8 @@
 // 50-90 with spikes past 50 ms on the real pages, although none of them matters
 // alone and no script was slow. Paused, the same scroll holds 205-235 fps. They are
 // slow enough that stopping for the length of a scroll does not read as a stop. The
-// rule lives in App.css (`data-aura-scrolling`).
+// rule lives in App.css (`data-aura-scrolling`) and names each loop: flipping an
+// attribute that a universal selector hangs off recalculates the whole document.
 //
 // `scroll` rather than `wheel`: a wheel over the player changes the volume, and only
 // real movement should stop anything. Capture phase, because scroll does not bubble.

@@ -155,7 +155,6 @@ function ToastItem({ toast }: { toast: ToastEntry }) {
 
   return (
     <div
-      data-aura-no-scroll-pause=""
       role="status"
       aria-live="polite"
       className={`pointer-events-auto px-4 py-2.5 rounded-xl

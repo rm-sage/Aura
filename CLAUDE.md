@@ -1528,9 +1528,11 @@ old-format and new-format samples and diff the field sets. Node runs the `.ts` f
   wheels stay native. It keeps its own wheel latch, stops at a fixed ancestor (the native chain follows the containing
   block, and modals render inside page scrollers) and leaves a non-overflowing `overscroll-behavior` element to the
   browser. Because it runs on the main thread, `src/scrollPause.ts` sets `data-aura-scrolling` on `<html>` during a
-  scroll the user is driving, which pauses every keyframe animation (Library rAF 55 to 227 fps; no single loop accounts
-  for it) and freezes `.card-grow` hover. A hover panel's open timer waits for it. Wall-clock transient UI opts out with
-  `data-aura-no-scroll-pause`. A page's main scroller takes `.aura-page-scroller` (`will-change: scroll-position`):
+  scroll the user is driving, which pauses every decorative loop (Library rAF 55 to 227 fps; no single loop accounts
+  for it) and freezes `.card-grow` hover. A hover panel's open timer waits for it. The rule in App.css is a LIST of
+  loops, never `*`: a universal selector recalculates the whole document each flip, an 8-12 ms stall the spring shows
+  as a skip. A new loop that repaints belongs in that list. The spring's tail closes at a steady speed (`nextStep`),
+  because with whole-pixel offsets its own tail plays as lone 1 px steps up to 46 ms apart. A page's main scroller takes `.aura-page-scroller` (`will-change: scroll-position`):
   below 150% scale Chromium otherwise re-rasters a non-opaque scroller as it moves (3.2 raster tasks per frame, 0.12
   with it; text rendering unchanged). Small card controls take no `backdrop-blur`. Row stride is unrounded
   (`parseFloat` of the computed height, never the rect, which includes a hover scale).

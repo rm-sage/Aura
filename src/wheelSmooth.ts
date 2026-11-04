@@ -39,6 +39,21 @@ export function springStep(x: number, v: number, omega: number, h: number): Spri
   return { x: (x + k * h) * e, v: (v - k * omega * h) * e };
 }
 
+/** The spring's own tail takes as long as the whole move and, with scroll offsets in whole
+ *  pixels, plays as lone 1 px steps up to 46 ms apart. Close the last stretch at a steady
+ *  speed instead: one step per frame at 240 Hz, and nothing the eye tracks as a stop. */
+const TAIL_SPEED = 240;
+const TAIL_PX = 16;
+
+/** The next position and speed. `prevX` is the distance before this step. */
+export function nextStep(prevX: number, v: number, omega: number, h: number): SpringState {
+  const s = springStep(prevX, v, omega, h);
+  const closing = s.x * s.v <= 0;
+  if (!closing || Math.abs(s.x) >= TAIL_PX || Math.abs(s.v) >= TAIL_SPEED) return s;
+  const left = Math.max(0, Math.abs(prevX) - TAIL_SPEED * h);
+  return { x: Math.sign(prevX) * left, v: -Math.sign(prevX) * TAIL_SPEED };
+}
+
 /** A mouse notch, as opposed to the fine deltas of a touchpad or free-spin wheel. */
 export function isWholeNotch(wheelDeltaY: number): boolean {
   return wheelDeltaY !== 0 && wheelDeltaY % NOTCH_UNITS === 0;
@@ -98,10 +113,10 @@ export function installWheelSmooth(isEnabled: () => boolean): () => void {
         r.y += moved;
         r.target += moved;
       }
-      const s = springStep(r.y - r.target, r.v, OMEGA, h);
+      const s = nextStep(r.y - r.target, r.v, OMEGA, h);
       r.y = r.target + s.x;
       r.v = s.v;
-      const done = !el.isConnected || (Math.abs(s.x) < 0.5 && Math.abs(s.v) < 5);
+      const done = !el.isConnected || (Math.abs(s.x) < 0.5 && Math.abs(s.v) <= TAIL_SPEED);
       if (done) r.y = r.target;
       el.scrollTop = r.y;
       r.landed = el.scrollTop;

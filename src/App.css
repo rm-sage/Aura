@@ -2402,16 +2402,35 @@ html[data-aura-scrolling] .card-grow:hover {
 }
 
 /* Held still while anything scrolls (src/scrollPause.ts). Measured on Library: 55 fps
-   with spikes past 50 ms running, 227 fps paused, and no single loop accounts for it,
-   which is why this is every animation and not a list. */
-html[data-aura-scrolling] *,
-html[data-aura-scrolling] *::before,
-html[data-aura-scrolling] *::after {
+   with spikes past 50 ms running, 227 fps paused, and no single loop accounts for it, so
+   this is every decorative loop on a browsing page. A list and never `*`: a universal
+   selector recalculates the whole document each time the attribute flips, an 8-12 ms
+   stall that the wheel spring, on the main thread, shows as a skip. A new loop that
+   repaints belongs here. */
+html[data-aura-scrolling] .aura-sweep,
+html[data-aura-scrolling] .aura-sweep::after,
+html[data-aura-scrolling] .aura-ambient,
+html[data-aura-scrolling] .aura-ambient::before,
+html[data-aura-scrolling] .aura-title,
+html[data-aura-scrolling] .aura-hero-title,
+html[data-aura-scrolling] .aura-logo-a,
+html[data-aura-scrolling] .aura-row-title,
+html[data-aura-scrolling] .image-loader-skeleton,
+html[data-aura-scrolling] .detail-backdrop-skeleton,
+html[data-aura-scrolling] .aura-glow,
+html[data-aura-scrolling] .aura-bell-ringing,
+html[data-aura-scrolling] .aura-bell-badge-bouncing,
+html[data-aura-scrolling] .aura-latest-aired-caret,
+html[data-aura-scrolling] .aura-pill-alert,
+html[data-aura-scrolling] .aura-pill-live-dot,
+html[data-aura-scrolling] .aura-dl-alert,
+html[data-aura-scrolling] .aura-poster-retry-dot,
+html[data-aura-scrolling] .aura-popup-breathe,
+html[data-aura-scrolling] .aura-popup-card-breathe,
+html[data-aura-scrolling] .aura-popup-card-pulse,
+html[data-aura-scrolling] .hover-glow:hover,
+html[data-aura-scrolling] .aura-bar-btn:hover {
   animation-play-state: paused !important;
-}
-/* A toast's lifetime runs on a timer: held at its first frame, it would expire unseen. */
-html[data-aura-scrolling] [data-aura-no-scroll-pause] {
-  animation-play-state: running !important;
 }
 
 html[data-aura-idle="true"] .aura-sweep,

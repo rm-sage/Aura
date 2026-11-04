@@ -137,7 +137,6 @@ function FlyUpItem({ toast }: { toast: ToastEntry }) {
   return (
     <div
       ref={ref}
-      data-aura-no-scroll-pause=""
       role="status"
       aria-live="polite"
       className={`absolute px-3.5 py-1.5 rounded-full
