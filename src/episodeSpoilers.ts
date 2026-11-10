@@ -12,7 +12,7 @@
 //   is NOT watched, where "watched" is exactly what
 //   `useWatchedVariant(video.id)` (NO mediaType arg → no series demotion)
 //   resolves to "watched":
-//     • manual mark "watched" wins, else
+//     • any manual mark wins ("watched" is watched, the others are not), else
 //     • `useLibraryProgress(video.id)`:
 //         – direct library item → progressFromState (ratio ≥ 0.9 ⇒ watched)
 //         – else series-root position-implied: an episode that precedes the
@@ -92,8 +92,10 @@ export function isEpisodeWatched(
   episodeId: string,
 ): boolean {
   if (!episodeId) return false;
-  // Manual mark wins (right-click "Mark watched" / auto-advance path).
-  if (getManualWatchedState(episodeId) === "watched") return true;
+  // Manual marks win, in useWatchedVariant's order: an in-progress mark is not
+  // watched even when the position inference below would imply it.
+  const manual = getManualWatchedState(episodeId);
+  if (manual) return manual === "watched";
   // useLibraryProgress: direct entry first.
   const item = byId.get(episodeId);
   if (item) return progressWatched(item.state ?? {});

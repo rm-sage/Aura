@@ -336,7 +336,7 @@ export function useStoryArcs(
   groupingId?: string,
 ): { arcs: ArcResult | null; loading: boolean } {
   const [arcs, setArcs] = useState<ArcResult | null>(null);
-  const [loading, setLoading] = useState(false);
+  const [settledKey, setSettledKey] = useState<string | null>(null);
 
   const eligible =
     !!detail &&
@@ -350,25 +350,33 @@ export function useStoryArcs(
       production_countries: detail.production_countries,
     });
 
+  // Derived, not set from the effect: a flag raised there is still false for the commit
+  // that first has this request. In a remembered Arcs mode that one commit rendered the
+  // season list, which spent the resume target on a row about to be replaced by the
+  // skeleton, so the arc it belonged to never opened.
+  const requestKey = eligible
+    ? `${seriesId}|${groupingId ?? ""}|${detail.videos.length}|${detail.tmdb_id ?? ""}`
+    : null;
+  const loading = requestKey !== null && settledKey !== requestKey;
+
   useEffect(() => {
     if (!eligible || !detail || !seriesId) {
       setArcs(null);
       return;
     }
     let cancelled = false;
-    setLoading(true);
     (async () => {
       if (!(await storyArcsAvailable())) {
         if (!cancelled) {
           setArcs(null);
-          setLoading(false);
+          setSettledKey(requestKey);
         }
         return;
       }
       const result = await fetchStoryArcs(detail, seriesId, groupingId);
       if (!cancelled) {
         setArcs(withNewerEpisodes(result, detail.videos, detail.background ?? null));
-        setLoading(false);
+        setSettledKey(requestKey);
       }
     })();
     return () => {
@@ -540,6 +548,17 @@ export function orderGroupings(groupings: ArcGrouping[]): ArcGrouping[] {
  *  groupings (the caller then leaves the backend's own pick alone). */
 export function preferredGroupingId(groupings: ArcGrouping[]): string | undefined {
   return orderGroupings(groupings)[0]?.id;
+}
+
+/** True while `result` is a grouping about to be replaced by the one asked for (or, with
+ *  none pinned, by the preferred default the panels adopt). Arc ids are per grouping, so
+ *  an arc opened from this result vanishes when the other arrives: anything that opens
+ *  an arc once, for a resume or a notification, has to wait for the final result. */
+export function arcResultIsInterim(result: ArcResult | null, groupingId?: string): boolean {
+  if (!result || result.groupings.length < 2) return false;
+  const target = groupingId ?? preferredGroupingId(result.groupings);
+  return !!target && target !== result.grouping_id
+    && result.groupings.some((g) => g.id === target);
 }
 
 // ---------------------------------------------------------------------------

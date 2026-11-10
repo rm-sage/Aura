@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactElement } from "react";
-import { createPortal } from "react-dom";
+import { createPortal, flushSync } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import type {
   AddonEntry,
@@ -15,7 +15,22 @@ import type {
   VideoEntry,
 } from "../types";
 import { isVideoAired } from "../types";
-import { computeReleaseCountdowns, formatCountdown, formatTargetDate, isInTheaters, nextAiringEpisode, useAvailableEarlyVersion, useCountdownNow } from "../releaseCountdown";
+import { computeReleaseCountdowns, describeReleaseBasis, formatCountdown, inTheatersHover, isInTheaters, nextAiringEpisode, releaseDayWhere, useAvailableEarlyVersion, useCountdownNow, useMovieEarly, type ReleaseBasis } from "../releaseCountdown";
+import ReleaseBasisTag, { EarlyReleaseTag } from "../ReleaseBasisTag";
+import {
+  classifyMovieStreams,
+  describeMovieEarly,
+  earlyRecordFor,
+  earlyTag,
+  isDigitalReleaseFilterNotice,
+  isOutEarly,
+  isVerifiedFlag,
+  noteMovieCheck,
+  EARLY_CHECKING_HOVER,
+  EARLY_CHECKING_HOVER_ESTIMATE,
+  type MovieEarlyEvidence,
+  type MovieEarlyRecord,
+} from "../movieEarly";
 import { countEpisodeEvidence, noteStreamsFound } from "../availableEarly";
 import { useMovieReleaseDates } from "../releaseDates";
 import EpisodeAirChip from "../EpisodeAirChip";
@@ -95,6 +110,7 @@ function streamCacheDelete(key: string): void {
 }
 import { useEpisodeProgress, useLibraryMap, useResumeVideoId, useEpisodesBehind } from "../LibraryContext";
 import { isEpisodeWatched } from "../episodeSpoilers";
+import { seasonScrollAnchor } from "../seasonScroll";
 import { isSkipped, useSkipMarksVersion } from "../skipMarks";
 import { connectedServices, useScrobbleConnections } from "../scrobbleConn";
 import { mergedKindFlags } from "../nextUp";
@@ -124,7 +140,7 @@ import {
 } from "../heroBackdrop";
 import { shrinkPoster, screenWidthHint } from "../posterSize";
 import ErrorBoundary from "../ErrorBoundary";
-import { parseStream, chipStyleFor, looksLikeTamTaro, type ChipKind } from "../streamMeta";
+import { parseStream, chipStyleFor, indexerNames, looksLikeTamTaro, type ChipKind } from "../streamMeta";
 import NoProvidersWarning from "../NoProvidersWarning";
 import { streamMatchKey } from "../watchTogether/streamMatch";
 import Tooltip from "../Tooltip";
@@ -137,7 +153,7 @@ import {
 } from "../mangaChapters";
 import GroupingToggle from "../EpisodeGroupingToggle";
 import {
-  absoluteEpisodeMap, arcArtFor, arcPositionOf, arcsLikelyAvailable, arcYearRange, absoluteEpisodeHint, formatAbsoluteEpisode, loadArcMode, peekCachedArcs, preferredGroupingId, saveArcMode, stripArcKindSuffix, useStoryArcs,
+  absoluteEpisodeMap, arcArtFor, arcPositionOf, arcResultIsInterim, arcsLikelyAvailable, arcYearRange, absoluteEpisodeHint, formatAbsoluteEpisode, loadArcMode, peekCachedArcs, preferredGroupingId, saveArcMode, stripArcKindSuffix, useStoryArcs,
   type EpisodeGrouping, type StoryArc,
 } from "../storyArcs";
 
@@ -1429,11 +1445,46 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
     detail?.mal_id != null ||
     detail?.kitsu_id != null ||
     detail?.anidb_id != null;
-  // Accurate Digital + Theatrical dates (MDBList) — drives the accurate
-  // Digital countdown (replacing the +45-day estimate) and the "In
-  // Theaters" tag. null for non-movies / before the fetch lands, in which
-  // case the countdown falls back to the labeled estimate and the tag hides.
+  // Theatrical + Digital dates for the user's region (TMDB per-country rows,
+  // then MDBList): drives the movie countdowns with their basis tag and the
+  // "In Theaters" tag. null for non-movies / before the fetch lands, in which
+  // case the countdowns fall back to the addon date and the tagged Estimate,
+  // and the "In Theaters" tag hides.
   const releaseDates = useMovieReleaseDates(meta.id, detail?.media_type ?? meta.media_type);
+  // Early-release check (movieEarly.ts): a film's own stream fetch, read
+  // against its Digital date while that is still ahead. The fetch reports its
+  // classified answer here; the effect records it once the Digital date is
+  // known (the dates can land after the streams), and the countdown reads the
+  // record back. No fetch of its own: the page fetches streams anyway.
+  const [movieCheck, setMovieCheck] = useState<{ id: string; evidence: MovieEarlyEvidence | null } | null>(null);
+  // Checked against the Digital countdown's day once the dates have landed
+  // (the countdown shows the Estimate until then, so a check before it would
+  // be against a guess that is about to change). A KNOWN date (TMDB or
+  // MDBList) makes a find "Out early"; the +45-day Estimate means no date has
+  // been announced, so a find there is "Streams available" (the record's
+  // `estimate`), never "early".
+  const movieDigital = !isEpisodic && detail && releaseDates
+    ? computeReleaseCountdowns(detail, Date.now(), releaseDates)
+        .find((c) => c.kind === "digital") ?? null
+    : null;
+  const movieDigitalMs = movieDigital?.targetMs ?? null;
+  const movieDigitalEstimate = movieDigital?.basis === "estimated";
+  useEffect(() => {
+    if (!movieCheck || movieCheck.id !== meta.id) return;
+    noteMovieCheck(meta.id, movieDigitalMs, movieCheck.evidence, Date.now(), movieDigitalEstimate);
+  }, [movieCheck, movieDigitalMs, movieDigitalEstimate, meta.id]);
+  const movieEarly = useMovieEarly(!isEpisodic ? meta.id : null);
+  // The stream list's note describes THAT list (this page's current answer),
+  // not the stored record, which can be a stronger earlier one.
+  const earlyNote = movieDigital && movieCheck?.id === meta.id && movieCheck.evidence
+    ? earlyBannerFor(
+        {
+          ...movieCheck.evidence, checkedAt: Date.now(), digitalMs: movieDigital.targetMs,
+          ...(movieDigitalEstimate ? { estimate: true } : {}),
+        },
+        releaseDayWhere(movieDigital),
+      )
+    : null;
   const [aggregateRatings, setAggregateRatings] = useState<AggregateRating[]>([]);
   useEffect(() => {
     setAggregateRatings([]);
@@ -1588,6 +1639,10 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
     }
     const targetId = isEpisodic ? episodicId! : meta.id;
     const queryAddons = streamQueryAddons(addons);
+    // A film's answer is its early-release check only when a stream provider
+    // was really asked (after a reload the addon list starts empty, and that
+    // empty answer is not "nothing out yet").
+    const asksProviders = queryAddons.some(isStreamProvider);
     // Dedupe key: addon-url set + media_type + targetId. The set is
     // hashed via JSON to keep it stable; addon order doesn't change
     // within a render batch so JSON.stringify is sufficient.
@@ -1612,6 +1667,9 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
       ? activeVideo.streams
       : detailVideos?.find((v) => v.id === targetId)?.streams;
     if (pageEmbedded && pageEmbedded.length > 0) {
+      // The early-release note describes the list shown; an embedded list is
+      // not the fan-out an earlier run may have checked.
+      if (!isEpisodic) setMovieCheck(null);
       const origin = detailOriginRef.current;
       const reread = refreshedEmbedded && refreshedEmbedded.of === detailVideos ? refreshedEmbedded : null;
       const embedded = reread ? reread.videos.find((v) => v.id === targetId)?.streams ?? [] : pageEmbedded;
@@ -1672,6 +1730,8 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
     setStreamsLoading(true);
     setStreams([]);
     setStreamMeta({ errors: [], warnings: [], info: [], stats: [] });
+    // The previous run's answer must not be recorded once this one started.
+    if (!isEpisodic) setMovieCheck(null);
 
     // 3-minute in-memory cache — closing and reopening the same
     // episode shouldn't refetch from every addon. Skips both the
@@ -1690,6 +1750,7 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
         } else {
           setStreams(cached.streams ?? []);
           setStreamMeta(cached.metadata ?? { errors: [], warnings: [], info: [], stats: [] });
+          if (!isEpisodic && asksProviders) setMovieCheck({ id: targetId, evidence: classifyStreamAnswer(cached) });
         }
         setStreamsLoading(false);
         return () => { cancelled = true; };
@@ -1712,6 +1773,9 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
         if (isEpisodic) {
           const list = Array.isArray(r) ? r : r.streams ?? [];
           noteStreamsFound(detailVideos?.find((v) => v.id === targetId) ?? null, countEpisodeEvidence(list));
+        } else if (!Array.isArray(r) && asksProviders) {
+          // A film's answer is its early-release check (movieEarly.ts).
+          setMovieCheck({ id: targetId, evidence: classifyStreamAnswer(r) });
         }
         // Tauri may emit either the new `{ streams, metadata }` envelope or
         // (for the brief moment a stale dev build is running) the legacy
@@ -2278,7 +2342,7 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
                 Together they keep the mid-tone mono text and the accent
                 countdown legible on any backdrop. */}
             <div
-              className="flex items-center justify-center gap-3 flex-wrap text-[14px] font-mono uppercase tracking-[0.14em]"
+              className="flex flex-col items-center gap-1.5 text-[14px] font-mono uppercase tracking-[0.14em]"
               style={{
                 textShadow: "0 1px 4px rgba(0,0,0,0.92), 0 0 10px rgba(0,0,0,0.6)",
                 // SYMMETRIC plate. The original was anchored left and faded out
@@ -2298,6 +2362,7 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
                 borderRadius: "10px",
               }}
             >
+              <div className="flex items-center justify-center gap-3 flex-wrap">
               {/* Anime chip leads the strip when applicable so the
                   classification reads first; the type chip (Movies /
                   Series) follows. Detection now folds in the meta-
@@ -2378,18 +2443,24 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
                   {episodesBehind} episode{episodesBehind === 1 ? "" : "s"} behind
                 </span>
               )}
-              {/* Persistent "In Theaters" tag — shown while a film's
+              </div>
+              {/* A film's release lines: the "In Theaters" badge and each
+                  countdown on a line of its own under the facts row, so two
+                  of them never share a wrapped line with the facts (user's
+                  call). Nothing renders here for a series or a released film. */}
+              {/* Persistent "In Theaters" tag: shown while a film's
                   theatrical run is active (theatrical date passed, not yet
-                  digital, within the freshness window) per MDBList dates.
-                  Unlike the cinematic countdown (which vanishes once
-                  `released` passes), this is a static badge, not a ticking
-                  value. Movies only; hidden until accurate dates resolve. */}
+                  digital, within the freshness window) per the regional
+                  dates. Unlike the cinematic countdown (which vanishes once
+                  the date passes), this is a static badge, not a ticking
+                  value. Its hover says no run has a published end date.
+                  Movies only; hidden until the dates resolve. */}
               {detail && isInTheaters(detail.media_type ?? meta.media_type, releaseDates) && (
                 <span
                   className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-sm
                              bg-amber-500/20 border border-amber-400/40 text-amber-100
-                             text-[12px] font-semibold backdrop-blur-sm"
-                  title="Currently in theaters"
+                             text-[12px] font-semibold backdrop-blur-sm cursor-help"
+                  title={inTheatersHover(releaseDates)}
                 >
                   <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
                     <path d="M22 10V6c0-1.1-.9-2-2-2H4c-1.1 0-1.99.9-1.99 2v4c1.1 0 1.99.9 1.99 2s-.89 2-2 2v4c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2v-4c-1.1 0-2-.9-2-2s.9-2 2-2z" />
@@ -2397,12 +2468,13 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
                   In Theaters
                 </span>
               )}
-              {/* Live release countdown(s) — MOVIES ONLY here. Series/anime
-                  next-episode/premiere countdowns now live on the episode
-                  list (the next-airing row's chip), so the meta strip carries
-                  only a film's cinematic / digital dates. The Digital date is
-                  the authoritative MDBList value when known; otherwise the
-                  ~45-day PVOD estimate (rendered with a "~" prefix).
+              {/* Live release countdown(s): MOVIES ONLY here. Series/anime
+                  next-episode/premiere countdowns live on the episode list
+                  (the next-airing row's chip), so the meta strip carries
+                  only a film's cinematic / digital dates, each tagged
+                  Confirmed (a TMDB per-country date), Reported (MDBList or
+                  the addon) or Estimate (the ~45-day PVOD window), with the
+                  hover saying which country and source.
                   computeReleaseCountdowns returns only upcoming dates, so
                   nothing renders for fully-released content. */}
               {detail && computeReleaseCountdowns(detail, Date.now(), releaseDates)
@@ -2412,8 +2484,19 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
                   key={c.kind}
                   label={c.label}
                   targetMs={c.targetMs}
-                  estimated={c.estimated}
-                  title={`${c.label}${c.estimated ? " (estimated)" : ""}: ${formatTargetDate(c.targetMs)}`}
+                  basis={c.basis}
+                  title={describeReleaseBasis(c, releaseDates?.region)?.hover}
+                  // The Digital date carries the early-release check: "Checking"
+                  // while this page's stream fetch is out, then its answer. On
+                  // the +45-day Estimate it reads as "Streams available".
+                  early={c.kind === "digital" && !isEpisodic && releaseDates
+                    ? {
+                        record: earlyRecordFor(movieEarly, c.targetMs, c.basis === "estimated"),
+                        checking: streamsLoading,
+                        official: releaseDayWhere(c),
+                        estimate: c.basis === "estimated",
+                      }
+                    : undefined}
                 />
               ))}
             </div>
@@ -2812,6 +2895,7 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
             streams={streams}
             streamMeta={streamMeta}
             streamsLoading={streamsLoading}
+            earlyNote={earlyNote}
             groupedStreams={groupedStreams}
             // Cour-specific catalog entries carry the season in their
             // title ("Dorohedoro Season 2", "… 2nd Season", "… Part 2",
@@ -2935,28 +3019,89 @@ function Stat({ label, value }: { label: string; value: string }) {
 // Accent-coloured sibling of Stat for the live release countdown — same
 // baseline layout as the surrounding meta tiles so it sits cleanly in the
 // strip, but tinted with the theme accent + a clock glyph to read as a
-// "time until" element rather than a static fact. `title` carries the full
-// target date for hover.
+// "time until" element rather than a static fact. `basis` adds the
+// Confirmed / Reported / Estimate tag (ReleaseBasisTag, shared with the hover
+// panel) and `title` the matching hover text (describeReleaseBasis).
 //
 // Owns its OWN 1 s tick via useCountdownNow so only this leaf re-renders
 // every second — DetailViewBody (cast grid, episode list, ratings) must NOT
 // tick. The parent computes the countdown SET once and passes targetMs.
-function CountdownStat({ label, targetMs, title, estimated }: { label: string; targetMs: number; title?: string; estimated?: boolean }) {
+function CountdownStat({ label, targetMs, title, basis, early }: {
+  label: string;
+  targetMs: number;
+  title?: string;
+  basis?: ReleaseBasis;
+  /** A film's Digital date: its early-release record (movieEarly.ts), whether
+   *  the page's stream fetch (the check) is still out, and the official
+   *  release named for the hover ("Tue, Nov 17, 2026 in the United States"). */
+  early?: { record: MovieEarlyRecord | null; checking: boolean; official: string; estimate?: boolean };
+}) {
   const now = useCountdownNow();
+  const wording = early?.record ? describeMovieEarly(early.record, early.official) : null;
+  const tag = early ? earlyTag(early.record, early.checking, early.estimate) : null;
+  const out = isOutEarly(early?.record?.kind);
+  // Out early: the value says so and the official date's basis tag steps
+  // aside (it describes a date the copies beat); the hover keeps both.
+  const checkingHover = early?.estimate ? EARLY_CHECKING_HOVER_ESTIMATE : EARLY_CHECKING_HOVER;
+  const hover = [title, wording?.hover ?? (tag?.tone === "checking" ? checkingHover : null)]
+    .filter(Boolean).join(" ");
   return (
-    <span className="inline-flex items-center gap-1.5" title={title}>
+    <span className="inline-flex flex-wrap items-center justify-center gap-1.5 max-w-full" title={hover || undefined}>
       <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor"
            strokeWidth="2" className="text-ln-accent/80" aria-hidden>
         <circle cx="12" cy="12" r="9" />
         <path d="M12 7v5l3 2" strokeLinecap="round" strokeLinejoin="round" />
       </svg>
       <span className="text-ln-accent/70 text-[11px] tracking-[0.2em]">{label}</span>
-      <span className="text-ln-accent text-[14px] font-semibold tabular-nums">
-        {/* "~" marks an estimated (PVOD-window) date vs an authoritative one. */}
-        {estimated ? "~" : ""}{formatCountdown(targetMs, now)}
+      <span className={`text-[14px] font-semibold tabular-nums ${out ? "text-emerald-300" : "text-ln-accent"}`}>
+        {out && wording?.value ? wording.value : formatCountdown(targetMs, now)}
       </span>
+      {basis && !out && <ReleaseBasisTag basis={basis} size="md" />}
+      {tag && <EarlyReleaseTag tone={tag.tone} label={tag.label} size="md" />}
     </span>
   );
+}
+
+/** The stream list's one-line early-release note. */
+interface EarlyNote {
+  tone: "verified" | "unverified" | "note";
+  text: string;
+  /** Checked against the +45-day Estimate: no digital date is announced, so
+   *  the rows' own hover must not speak of an official release. */
+  estimate?: boolean;
+}
+
+function earlyBannerFor(r: MovieEarlyRecord, official: string): EarlyNote | null {
+  const text = describeMovieEarly(r, official).banner;
+  if (!text) return null;
+  return {
+    tone: r.kind === "verified" ? "verified" : isOutEarly(r.kind) ? "unverified" : "note",
+    text,
+    ...(r.estimate ? { estimate: true } : {}),
+  };
+}
+
+function EarlyReleaseNote({ note }: { note: EarlyNote }) {
+  const tone = note.tone === "verified"
+    ? "bg-emerald-500/10 border-emerald-400/30 text-emerald-100/90"
+    : note.tone === "unverified"
+      ? "bg-amber-500/10 border-dashed border-amber-400/40 text-amber-100/90"
+      : "bg-white/5 border-white/15 text-white/70";
+  return (
+    <div role="note" className={`mx-1 px-3 py-2 rounded-lg border text-[12.5px] leading-snug ${tone}`}>
+      {note.text}
+    </div>
+  );
+}
+
+/** A film's stream answer as early-release evidence (movieEarly.ts). */
+function classifyStreamAnswer(r: StreamFetchResult): MovieEarlyEvidence | null {
+  const md = r.metadata ?? { errors: [], warnings: [], info: [], stats: [] };
+  const notices = [...md.errors, ...md.warnings, ...md.info, ...md.stats];
+  return classifyMovieStreams(r.streams ?? [], notices, {
+    hadErrors: md.errors.length > 0,
+    failedAddons: md.failed_addons ?? 0,
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -3670,6 +3815,8 @@ interface PanelProps {
   streams: StreamEntry[];
   streamMeta: StreamMetadata;
   streamsLoading: boolean;
+  /** A film's early-release line for the top of the stream list. */
+  earlyNote?: EarlyNote | null;
   groupedStreams: [string, StreamEntry[]][];
   /** True while the parent's meta-detail fetch is still in flight
    *  with no addon having returned yet. Lets the EpisodesPanel
@@ -3712,7 +3859,7 @@ interface PanelProps {
 }
 
 function UnifiedPanel({
-  mode, partyStreamKey, isEpisodic, seriesId, seriesMediaType, videos, activeVideo, streams, streamMeta, streamsLoading,
+  mode, partyStreamKey, isEpisodic, seriesId, seriesMediaType, videos, activeVideo, streams, streamMeta, streamsLoading, earlyNote,
   groupedStreams, metaLoading, onPickEpisode, onBackToEpisodes, onPlay, addons, addonsPending, onLeave, menuCtx,
   scrollToVideoId, onScrollHandled, seasonHint, seasonNames, highlightVideoId, seriesArt, detail,
 }: PanelProps) {
@@ -3769,6 +3916,7 @@ function UnifiedPanel({
               streams={streams}
               streamMeta={streamMeta}
               loading={streamsLoading}
+              earlyNote={earlyNote}
               groups={groupedStreams}
               partyStreamKey={partyStreamKey}
               onBack={isEpisodic ? onBackToEpisodes : undefined}
@@ -4829,8 +4977,13 @@ function EpisodesPanel({
     [arcMode, arcResult, openArcId],
   );
 
+  // Armed by a season pick, or by leaving Arcs for the season list, which reuses the
+  // open arc's scroller. Consumed by the landing effect below the scroll effect.
+  const seasonPickedRef = useRef(false);
+
   const switchGrouping = useCallback(
     (next: EpisodeGrouping) => {
+      if (next === "seasons" && grouping === "arcs") seasonPickedRef.current = true;
       setGrouping(next);
       saveArcMode(seriesId, next, groupingId);
       // Entering Arcs mode: land the user on the arc holding the episode they
@@ -4840,7 +4993,7 @@ function EpisodesPanel({
         setOpenArcId(anchor ? arcPositionOf(arcResult, anchor)?.arc.id ?? null : null);
       }
     },
-    [seriesId, groupingId, arcResult, resolvedScrollId, activeVideo?.id],
+    [seriesId, grouping, groupingId, arcResult, resolvedScrollId, activeVideo?.id],
   );
 
   const switchArcGrouping = useCallback(
@@ -4867,13 +5020,14 @@ function EpisodesPanel({
   const hasAppliedArcAnchorRef = useRef(false);
   useEffect(() => {
     if (!arcMode || !arcResult || hasAppliedArcAnchorRef.current) return;
+    if (arcResultIsInterim(arcResult, groupingId)) return;
     const anchorId = highlightVideoId ?? resolvedScrollId ?? activeVideo?.id ?? null;
     if (!anchorId) return;
     const pos = arcPositionOf(arcResult, anchorId);
     if (!pos) return;
     hasAppliedArcAnchorRef.current = true;
     setOpenArcId(pos.arc.id);
-  }, [arcMode, arcResult, highlightVideoId, resolvedScrollId, activeVideo?.id]);
+  }, [arcMode, arcResult, groupingId, highlightVideoId, resolvedScrollId, activeVideo?.id]);
 
   const inSeason = useMemo(() => {
     const list = seasons.length === 0
@@ -4990,8 +5144,53 @@ function EpisodesPanel({
     };
     // `visibleEpisodes.length` + `openArcId`, not `inSeason.length`: in Arcs mode
     // the rendered list is the open arc, so the retry has to re-arm when the arc
-    // changes or the row it is hunting is never in the DOM.
-  }, [scrollToVideoId, resolvedScrollId, season, openArcId, visibleEpisodes.length, onScrollHandled]);
+    // changes or the row it is hunting is never in the DOM. `arcPending` for the same
+    // reason: arcs that resolve to nothing mount the season list with no other dep moved.
+  }, [scrollToVideoId, resolvedScrollId, season, openArcId, visibleEpisodes.length, arcPending, onScrollHandled]);
+
+  // Seasons and an open arc swap their rows inside the same scroller, which would
+  // otherwise keep its scrollTop. Layout effects, so the old offset never paints.
+  // A resume target still wins: the effect above scrolls in a rAF, after these.
+  const libraryById = useLibraryMap();
+  const landList = (episodes: VideoEntry[], pinnedId?: string | null) => {
+    const list = listRef.current;
+    if (!list) return;
+    const target = pinnedId && episodes.some((v) => v.id === pinnedId)
+      ? pinnedId
+      // A skipped episode is stored as a watched mark, but it is not where the
+    // user got to: "Skip the filler" at E110 marks every filler through E220.
+      : seasonScrollAnchor(episodes, (id) => isEpisodeWatched(libraryById, id) && !isSkipped(id));
+    const row = target
+      ? list.querySelector<HTMLElement>(`[data-episode-id="${CSS.escape(target)}"]`)
+      : null;
+    list.scrollTop = row ? row.offsetTop - list.offsetTop : 0;
+  };
+
+  // A season lands only on a pick or on leaving Arcs: the ones Aura selects itself come
+  // with a resume target or open at the top already.
+  const pickSeason = (next: number) => {
+    if (next !== season) seasonPickedRef.current = true;
+    setSeason(next);
+  };
+  useLayoutEffect(() => {
+    if (!seasonPickedRef.current || arcMode) return;
+    seasonPickedRef.current = false;
+    // A notification's ringed row outranks the latest watched one here too.
+    landList(inSeason, highlightId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [season, inSeason, grouping, arcMode, libraryById]);
+
+  // Once per opening of an arc, so a refreshed library or arc result does not move a
+  // list the user is reading. A notification's ringed row outranks the latest watched:
+  // it is why this arc opened.
+  const landedArcRef = useRef<string | null>(null);
+  useLayoutEffect(() => {
+    if (!openArc) { landedArcRef.current = null; return; }
+    if (inArc.length === 0 || landedArcRef.current === openArc.id) return;
+    landedArcRef.current = openArc.id;
+    landList(inArc, highlightId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [openArc, inArc, highlightId, libraryById]);
 
   return (
     <>
@@ -5150,7 +5349,7 @@ function EpisodesPanel({
                 <SeasonSelect
                   seasons={seasons}
                   value={season}
-                  onChange={setSeason}
+                  onChange={pickSeason}
                   names={seasonNames}
                 />
                 <EpisodeCountChip
@@ -5313,9 +5512,8 @@ const KIND_ORDER: MessageKind[] = ["error", "warning", "info", "stats"];
  *  release available yet), the other notices (errors / stats / etc.) are just
  *  noise — keep ONLY the Digital-Release-Filter message(s). */
 function suppressNoisyNotices(metadata: StreamMetadata): StreamMetadata {
-  const isDrf = (m: StreamMessage) =>
-    /digital release filter/i.test(m.title ?? "") ||
-    /digital release filter/i.test(m.description);
+  // By AIOStreams' code; an older AIOStreams without one, by its wording.
+  const isDrf = (m: StreamMessage) => isDigitalReleaseFilterNotice(m);
   const all = [...metadata.errors, ...metadata.warnings, ...metadata.info, ...metadata.stats];
   if (!all.some(isDrf)) return metadata;
   const keep = (rows: StreamMessage[]) => rows.filter(isDrf);
@@ -5668,13 +5866,14 @@ function StreamMessagesEmptyState({ metadata }: { metadata: StreamMetadata }) {
 const STREAM_FORMAT_HINT_KEY = "aura:stream-format-hint-dismissed";
 
 function StreamsPanel({
-  isEpisodic, activeVideo, streams, streamMeta, loading, groups, partyStreamKey, onBack, onPlay, addons, addonsPending, onLeave, menuCtx, absoluteTag,
+  isEpisodic, activeVideo, streams, streamMeta, loading, earlyNote, groups, partyStreamKey, onBack, onPlay, addons, addonsPending, onLeave, menuCtx, absoluteTag,
 }: {
   isEpisodic: boolean;
   activeVideo: VideoEntry | null;
   streams: StreamEntry[];
   streamMeta: StreamMetadata;
   loading: boolean;
+  earlyNote?: EarlyNote | null;
   groups: [string, StreamEntry[]][];
   partyStreamKey?: string | null;
   onBack?: () => void;
@@ -5817,6 +6016,7 @@ function StreamsPanel({
           )
         ) : (
           <div className="space-y-3">
+            {earlyNote && <EarlyReleaseNote note={earlyNote} />}
             {showHint && (
               <StreamFormatHint
                 onTurnOff={() => { setFormatter(false); dismissHint(); }}
@@ -5852,7 +6052,7 @@ function StreamsPanel({
                       menuCtx,
                     };
                     return formatterOn
-                      ? <StreamRow key={key} {...rowProps} />
+                      ? <StreamRow key={key} {...rowProps} earlyEstimate={!!earlyNote?.estimate} />
                       : <RawStreamRow key={key} {...rowProps} />;
                   })}
                 </div>
@@ -6086,10 +6286,13 @@ function RawStreamRow({
 // ---------------------------------------------------------------------------
 
 function StreamRow({
-  stream, partyMatch, onPlay, menuCtx,
+  stream, partyMatch, onPlay, menuCtx, earlyEstimate,
 }: {
   stream: StreamEntry;
   partyMatch?: boolean;
+  /** The film has no announced digital date (its check ran against the
+   *  +45-day Estimate), so an early flag is not "before the official date". */
+  earlyEstimate?: boolean;
   onPlay: () => void;
   menuCtx: StreamMenuContext;
 }) {
@@ -6106,11 +6309,11 @@ function StreamRow({
   // Title-line content. Display title is preferred; fall back to the
   // legacy `primary` string if AIOStreams parsing didn't produce one.
   const headline = parsed.displayTitle ?? parsed.primary ?? "";
-  // Top-right meta strip — release group / indexer. Service ([TB]) and
-  // addon (Comet) live inside the quality box now, so they're omitted here.
-  const topMeta: Array<{ kind: ChipKind; label: string }> = [];
-  if (parsed.releaseGroup) topMeta.push({ kind: "group",   label: parsed.releaseGroup });
-  if (parsed.indexer)      topMeta.push({ kind: "indexer", label: parsed.indexer });
+  // A scraper joins every indexer that had the file; the footer chip names
+  // the first and counts the rest, its hover lists them all.
+  const indexers = indexerNames(parsed.indexer);
+  const chips = useMemo(() => streamRowChips(parsed), [parsed]);
+  const { videoChips, audioChips, sizeChips, swarmChips, langChips, nzbChips, flagChips } = chips;
   // Whether this row's badge slot is taken by Best/Alt Best — the stars
   // anchor below the badge in that case, otherwise to the top-right.
   const hasBadge = parsed.seadexBest || parsed.seadexAlt;
@@ -6119,6 +6322,27 @@ function StreamRow({
   // only — `false`/undefined render the stars as normal. When set, a red
   // "Unreliable" badge takes the stars' top-right slot for this row.
   const unreliable = stream.episode_pack === true;
+  // AIOStreams let this stream through its Digital Release Filter as an early
+  // release of the film (streamData.earlyRelease).
+  const early = stream.early_release ?? null;
+  // Same rule as the countdown's Verified / Unverified (movieEarly.ts).
+  const earlyVerified = isVerifiedFlag(early);
+  const earlyWhen = earlyEstimate
+    ? "no digital release date has been announced for this film"
+    : "out before the official digital release";
+  const earlyHover = early
+    ? early.evidence
+      ? `Early release (verified): ${earlyWhen}. This file's length matches the film's runtime, which is how AIOStreams verified it.`
+      : earlyVerified
+        ? `Early release (verified): ${earlyWhen}. AIOStreams verified the leak from other files.`
+        : `Early release (unverified): ${earlyWhen}. AIOStreams let it through as an early release; no leak check is behind it.`
+    : "";
+  // The headline is clamped to two lines; its hover gives all of it, then
+  // the release filename when that says something more.
+  const headlineHover = [headline, stream.filename]
+    .filter((t, i, a): t is string => !!t && a.indexOf(t) === i)
+    .join("\n") || undefined;
+  const hasFooter = !!parsed.releaseGroup || indexers.length > 0 || parsed.private || parsed.proxyState != null || parsed.seScore != null;
 
   return (
     <button
@@ -6133,11 +6357,19 @@ function StreamRow({
       }}
       className={[
         "relative hover-glow w-full text-left rounded-xl px-4 py-3",
-        "hover:bg-white/[0.08] hover:border-white/18 flex flex-col gap-2.5",
+        "flex flex-col gap-2.5",
         partyMatch
-          ? "bg-ln-accent/[0.10] border border-ln-accent/45 ring-1 ring-ln-accent/40"
-          : "bg-white/[0.04] border border-white/10",
+          ? "bg-ln-accent/[0.10] border border-ln-accent/45 ring-1 ring-ln-accent/40 hover:bg-white/[0.08]"
+          // An early release takes the colour of the note above the list:
+          // emerald when AIOStreams verified the leak, a dashed amber edge
+          // when it only let the stream through.
+          : early && earlyVerified
+            ? "bg-emerald-500/[0.07] border border-emerald-400/35 hover:bg-emerald-500/[0.11] hover:border-emerald-300/50"
+            : early
+              ? "bg-amber-500/[0.04] border border-dashed border-amber-400/45 hover:bg-amber-500/[0.08]"
+              : "bg-white/[0.04] border border-white/10 hover:bg-white/[0.08] hover:border-white/18",
       ].join(" ")}
+      aria-description={early ? earlyHover : undefined}
     >
       {partyMatch && (
         <span className="absolute -top-2 left-3 px-1.5 h-[15px] rounded-full bg-ln-accent text-black
@@ -6171,7 +6403,7 @@ function StreamRow({
               </span>
             )}
             {leftQuality && (
-              <span className="text-emerald-300/95 text-[10.5px] font-mono font-semibold tracking-wider uppercase text-center">
+              <span className="max-w-full text-emerald-300/95 text-[10.5px] font-mono font-semibold tracking-wider uppercase text-center [overflow-wrap:anywhere]">
                 {leftQuality}
               </span>
             )}
@@ -6217,12 +6449,32 @@ function StreamRow({
             cluster (next to the seScore / VPS chips), so the right column
             now starts straight with the title. */}
         <div className="flex-1 min-w-0 flex flex-col gap-1.5 py-0.5">
-          {/* TITLE LINE — display title + library badge + episode. pr-24
-              reserves horizontal clearance so the Best / Alt Best badge
-              and the stars at top-right don't overlap a long title. */}
+          {/* HEADER - the title block, then the Best / Alt Best badge and the
+              stars (or Unreliable) in their own column on the right. In the
+              flow, not absolute: an absolute corner rode over the first chip
+              row and needed a guessed clearance on the title. */}
           {(headline || parsed.episode || parsed.year || parsed.date ||
-            parsed.library || parsed.preloading) && (
-            <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5 pr-24">
+            parsed.library || parsed.preloading || early || hasBadge || unreliable || parsed.stars > 0) && (
+          <div className="flex items-start gap-3">
+            <div className="flex-1 min-w-0 flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
+              {early && (
+                <Tooltip text={earlyHover} pos="top">
+                  <span
+                    className={`self-center inline-flex items-center justify-center w-[18px] h-[18px] rounded-full border
+                                ${earlyVerified
+                                  ? "bg-emerald-500/20 text-emerald-300 border-emerald-400/45"
+                                  : "bg-amber-500/15 text-amber-200 border-dashed border-amber-400/55"}`}
+                    aria-label={earlyHover}
+                  >
+                    <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4"
+                         strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+                      <rect x="3.5" y="5" width="17" height="15.5" rx="2.5" />
+                      <path d="M3.5 10h17M8 3v4M16 3v4" />
+                      {earlyVerified && <path d="M9 15.2l2 2 4-4" />}
+                    </svg>
+                  </span>
+                </Tooltip>
+              )}
               {parsed.library && (
                 <Tooltip text="Already in your debrid library" pos="top">
                   <span className="text-cyan-300/85 text-[12px] leading-none" aria-label="already in your debrid library">☁</span>
@@ -6235,8 +6487,8 @@ function StreamRow({
               )}
               {headline && (
                 <p
-                  className="text-white/95 text-[15px] leading-snug font-semibold break-words selectable line-clamp-2"
-                  title={stream.filename ?? undefined}
+                  className="min-w-0 text-white/95 text-[15px] leading-snug font-semibold [overflow-wrap:anywhere] selectable line-clamp-2"
+                  title={headlineHover}
                 >
                   {headline}
                 </p>
@@ -6255,198 +6507,79 @@ function StreamRow({
                   {parsed.episode}
                 </span>
               )}
+              {/* The file's running time (AIOStreams' streamData only). */}
+              {parsed.duration && (
+                <Tooltip text={`Running time of this file: ${parsed.duration}`} pos="top">
+                  <span className="inline-flex items-center gap-1 text-white/50 text-[11px] font-mono">
+                    <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" aria-hidden>
+                      <circle cx="12" cy="12" r="9" />
+                      <path d="M12 7v5l3 2" strokeLinecap="round" strokeLinejoin="round" />
+                    </svg>
+                    {parsed.duration}
+                  </span>
+                </Tooltip>
+              )}
             </div>
+            {(hasBadge || unreliable || parsed.stars > 0) && (
+              <div className="flex-shrink-0 flex flex-col items-end gap-1.5 -mr-2 -mt-1">
+                {parsed.seadexBest ? (
+                  <span
+                    className="text-[11px] font-semibold uppercase tracking-wider px-2 py-1 rounded
+                               bg-amber-400/20 text-amber-200 border border-amber-300/40
+                               shadow-[0_0_12px_rgba(251,191,36,0.3)]"
+                    aria-label="Best Release"
+                  >
+                    ★ Best Release
+                  </span>
+                ) : parsed.seadexAlt ? (
+                  <span
+                    className="text-[11px] font-semibold uppercase tracking-wider px-2 py-1 rounded
+                               bg-amber-500/15 text-amber-300/90 border border-amber-400/30"
+                    aria-label="Alt Best Release"
+                  >
+                    ★ ALT BEST
+                  </span>
+                ) : null}
+                {/* For a stream AIOStreams flagged as an unverifiable season
+                    pack the stars give way to a red "Unreliable" badge. */}
+                {unreliable ? (
+                  <Tooltip
+                    text="Season pack: the played episode can't be verified and may not be the one you requested."
+                    pos="left"
+                  >
+                    <span
+                      className="text-[11px] font-semibold uppercase tracking-wider px-2 py-1 rounded
+                                 bg-red-500/90 text-white border border-red-300/50
+                                 shadow-[0_0_10px_rgba(239,68,68,0.45)]"
+                      aria-label="Unreliable: season pack; the played episode can't be verified"
+                    >
+                      Unreliable
+                    </span>
+                  </Tooltip>
+                ) : parsed.stars > 0 ? (
+                  <Stars value={parsed.stars} />
+                ) : null}
+              </div>
+            )}
+          </div>
           )}
 
-          {/* CHIPS — vertical stack, one row per AIOStreams category. The
-              category icon sits as a left rail at the start of each row.
-              pb-7 reserves vertical clearance so the absolute VPS / score
-              cluster never rides over the last row. mt-1.5 gives the
-              title a little breathing room above the chip stack so the
-              two visual blocks read separately. */}
+          {/* CHIPS - one line per AIOStreams category, its icon as a rail.
+              A line NEVER wraps (user's call): what does not fit hides behind
+              a "+N" chip that lists it on hover (ChipRow), and a chip longer
+              than its line truncates. Every chip's hover gives its full value. */}
           {hasAnyChip(parsed) && (
-            <div className="flex flex-col gap-1 text-[11.5px] font-mono pb-7 mt-1.5">
-
-              {/* ▣ Codec / bit-depth / HDR / visual tags */}
-              {(parsed.encode || parsed.codec || parsed.bitDepth ||
-                parsed.visualTagsPrimary.length > 0 || parsed.hdr ||
-                parsed.visualTagsSecondary.length > 0) && (
-                <div className="flex flex-wrap items-center gap-1.5">
-                  <span className="text-white/35 text-[11px] font-mono w-4 shrink-0" aria-hidden>▣</span>
-                  {parsed.encode
-                    ? <Tooltip text="Codec" pos="top"><ChipPill kind="encode" label={parsed.encode} /></Tooltip>
-                    : parsed.codec
-                      ? <Tooltip text="Codec" pos="top"><ChipPill kind="codec" label={parsed.codec} /></Tooltip>
-                      : null
-                  }
-                  {parsed.bitDepth && (
-                    <Tooltip text="Bit depth" pos="top">
-                      <ChipPill kind="encode" label={`✦ ${parsed.bitDepth}`} />
-                    </Tooltip>
-                  )}
-                  {parsed.visualTagsPrimary.map((t, i) => (
-                    <Tooltip key={`vp-${i}`} text="HDR / Dolby Vision tag" pos="top">
-                      <ChipPill kind="visual-pri" label={`✦ ${t}`} />
-                    </Tooltip>
-                  ))}
-                  {parsed.visualTagsPrimary.length === 0 && parsed.hdr && (
-                    <Tooltip text="HDR / Dolby Vision tag" pos="top">
-                      <ChipPill kind="hdr" label={parsed.hdr} />
-                    </Tooltip>
-                  )}
-                  {parsed.visualTagsSecondary.map((t, i) => (
-                    <Tooltip key={`vs-${i}`} text="Visual tag" pos="top">
-                      <ChipPill kind="visual-sec" label={`✧ ${t}`} />
-                    </Tooltip>
-                  ))}
-                </div>
+            <div className="flex flex-col gap-1 text-[11.5px] font-mono mt-1.5">
+              {videoChips.length > 0 && <ChipRow rail="▣" chips={videoChips} />}
+              {audioChips.length > 0 && (
+                <ChipRow rail={parsed.audioTags.length > 0 || parsed.audio ? "♬" : "♯"} chips={audioChips} />
               )}
-
-              {/* ♬ Audio codec + ♯ channels - ONE row. A channel layout is a
-                  single short chip and never justified a line of its own; the
-                  distinct orange fill already separates it from the codecs.
-                  Rail shows ♯ when there are channels but no codec to label. */}
-              {(parsed.audioTags.length > 0 || parsed.audio || parsed.audioChannels.length > 0) && (
-                <div className="flex flex-wrap items-center gap-1.5">
-                  <span className="text-white/35 text-[11px] font-mono w-4 shrink-0" aria-hidden>
-                    {parsed.audioTags.length > 0 || parsed.audio ? "♬" : "♯"}
-                  </span>
-                  {parsed.audioTags.length > 0
-                    ? parsed.audioTags.map((t, i) => (
-                        <Tooltip key={`a-${i}`} text="Audio codec" pos="top">
-                          <ChipPill kind="audio" label={t} />
-                        </Tooltip>
-                      ))
-                    : parsed.audio && (
-                        <Tooltip text="Audio codec" pos="top">
-                          <ChipPill kind="audio" label={parsed.audio} />
-                        </Tooltip>
-                      )
-                  }
-                  {parsed.audioChannels.map((c, i) => (
-                    <Tooltip key={`ch-${i}`} text="Audio channels" pos="top">
-                      <ChipPill kind="channels" label={c} />
-                    </Tooltip>
-                  ))}
-                </div>
-              )}
-
-              {/* ◈ Size / folder size / bitrate */}
-              {(parsed.size || parsed.folderSize || parsed.bitrate) && (
-                <div className="flex flex-wrap items-center gap-1.5">
-                  <span className="text-white/35 text-[11px] font-mono w-4 shrink-0" aria-hidden>◈</span>
-                  {parsed.size && (
-                    <Tooltip text={parsed.seasonPack ? "Season pack size" : "File size"} pos="top">
-                      <ChipPill kind="size" label={parsed.seasonPack ? `❖ ${parsed.size}` : parsed.size} />
-                    </Tooltip>
-                  )}
-                  {parsed.folderSize && (
-                    <Tooltip text="Folder / total size" pos="top">
-                      <ChipPill kind="folder" label={`/ ${parsed.folderSize}`} />
-                    </Tooltip>
-                  )}
-                  {parsed.bitrate && (
-                    <Tooltip text="Bit rate" pos="top">
-                      <ChipPill kind="bitrate" label={parsed.bitrate} />
-                    </Tooltip>
-                  )}
-                </div>
-              )}
-
-              {/* ⇄ Seeders / age */}
-              {(parsed.seeders != null || parsed.age) && (
-                <div className="flex flex-wrap items-center gap-1.5">
-                  <span className="text-white/35 text-[11px] font-mono w-4 shrink-0" aria-hidden>⇄</span>
-                  {parsed.seeders != null && (
-                    <Tooltip text="Seeders" pos="top">
-                      <ChipPill kind="seeders" label={formatSeeders(parsed.seeders)} />
-                    </Tooltip>
-                  )}
-                  {parsed.age && (
-                    <Tooltip text="Stream age" pos="top">
-                      <ChipPill kind="age" label={parsed.age} />
-                    </Tooltip>
-                  )}
-                </div>
-              )}
-
-              {/* ⛿ Languages / sub / subtitle codes */}
-              {(parsed.languages.length > 0 || parsed.language ||
-                parsed.subbed || parsed.subtitles.length > 0) && (
-                <div className="flex flex-wrap items-center gap-1.5">
-                  <span className="text-white/35 text-[11px] font-mono w-4 shrink-0" aria-hidden>⛿</span>
-                  {parsed.languages.length > 0
-                    ? parsed.languages.map((l, i) => (
-                        <Tooltip key={`l-${i}`} text="Audio language" pos="top">
-                          <ChipPill kind="lang" label={l} />
-                        </Tooltip>
-                      ))
-                    : parsed.language && (
-                        <Tooltip text="Audio language" pos="top">
-                          <ChipPill kind="lang" label={parsed.language} />
-                        </Tooltip>
-                      )
-                  }
-                  {parsed.subbed && (
-                    <Tooltip text="Subtitled" pos="top">
-                      <ChipPill kind="sub" label="SUB" />
-                    </Tooltip>
-                  )}
-                  {parsed.subtitles.map((sub, i) => (
-                    <Tooltip key={`sub-${i}`} text="Subtitle languages" pos="top">
-                      <ChipPill kind="sub" label={sub} />
-                    </Tooltip>
-                  ))}
-                </div>
-              )}
-
-              {/* Provenance: NZB health (its own row, no rail icon).
-                  Indexer used to live here too but moved to the absolute
-                  bottom-right cluster alongside seScore / VPS, so we don't
-                  render it twice. */}
-              {parsed.nzbHealth && (
-                <div className="flex flex-wrap items-center gap-1.5">
-                  <span className="w-4 shrink-0" aria-hidden />
-                  {parsed.nzbHealth === "verified" && (
-                    <Tooltip text="NZB health: verified" pos="top">
-                      <ChipPill kind="nzb-verified" label="☑ NZB" />
-                    </Tooltip>
-                  )}
-                  {parsed.nzbHealth === "elf" && (
-                    <Tooltip text="NZB health: elf" pos="top">
-                      <ChipPill kind="nzb-elf" label="ELF NZB" />
-                    </Tooltip>
-                  )}
-                  {parsed.nzbHealth === "unverified" && (
-                    <Tooltip text="NZB health: unverified" pos="top">
-                      <ChipPill kind="nzb-unverified" label="Unverified NZB" />
-                    </Tooltip>
-                  )}
-                  {parsed.nzbHealth === "broken" && (
-                    <Tooltip text="NZB health: broken" pos="top">
-                      <ChipPill kind="nzb-broken" label="✘ NZB" />
-                    </Tooltip>
-                  )}
-                </div>
-              )}
-
-              {/* Release tags the addon sends after its ` » ` separator that
-                  aren't seadex / NZB / score: release-scoring matches, and the
-                  newer network + edition fields. Shown verbatim rather than
-                  dropped, so an upstream addition surfaces instead of vanishing. */}
-              {parsed.releaseFlags.length > 0 && (
-                <div className="flex flex-wrap items-center gap-1.5">
-                  {/* » is the separator AIOStreams itself puts in front of
-                      these, so it reads as the same rail vocabulary as ▣ / ♬. */}
-                  <span className="text-white/35 text-[11px] font-mono w-4 shrink-0" aria-hidden>»</span>
-                  {parsed.releaseFlags.map((f, i) => (
-                    <Tooltip key={`rf-${i}`} text="Release tags from the addon" pos="top">
-                      <ChipPill kind="default" label={f} />
-                    </Tooltip>
-                  ))}
-                </div>
-              )}
-
+              {sizeChips.length > 0 && <ChipRow rail="◈" chips={sizeChips} />}
+              {swarmChips.length > 0 && <ChipRow rail="⇄" chips={swarmChips} />}
+              {langChips.length > 0 && <ChipRow rail="⛿" chips={langChips} />}
+              {nzbChips.length > 0 && <ChipRow rail="" chips={nzbChips} />}
+              {/* » is the separator AIOStreams itself puts in front of these. */}
+              {flagChips.length > 0 && <ChipRow rail="»" chips={flagChips} />}
             </div>
           )}
 
@@ -6455,111 +6588,77 @@ function StreamRow({
           {parsed.extra.length > 0 && (
             <div className="flex flex-col gap-0.5">
               {parsed.extra.map((line, i) => (
-                <p key={i} className="text-white/55 text-[12.5px] leading-snug break-words selectable">
+                <p key={i} className="text-white/55 text-[12.5px] leading-snug [overflow-wrap:anywhere] selectable">
                   {line}
                 </p>
               ))}
             </div>
           )}
+
+          {/* FOOTER - release group, indexer(s), private flag, the expression
+              score, then the VPS chip (rightmost). ONE line, in the flow at
+              the bottom of the right column (mt-auto): group and indexer
+              truncate before anything wraps, the rest never shrinks. */}
+          {hasFooter && (
+            <div className="mt-auto flex flex-nowrap items-center justify-end gap-1.5 min-w-0 text-[11.5px] font-mono">
+              {parsed.releaseGroup && (
+                <Tooltip text={`Release group: ${parsed.releaseGroup}`} pos="top" className="min-w-0 max-w-[50%]">
+                  <ChipPill kind="group" label={parsed.releaseGroup} />
+                </Tooltip>
+              )}
+              {indexers.length > 0 && (
+                <Tooltip
+                  text={indexers.length > 1 ? `Found on ${indexers.length} indexers: ${indexers.join(", ")}` : `Indexer: ${indexers[0]}`}
+                  pos="top"
+                  className="min-w-0 max-w-[50%]"
+                >
+                  <ChipPill kind="indexer" label={indexers[0]} sub={indexers.length > 1 ? `+${indexers.length - 1}` : undefined} />
+                </Tooltip>
+              )}
+              {parsed.private && (
+                <Tooltip text="From a private tracker" pos="top" className="flex-shrink-0">
+                  <ChipPill kind="private" label="⚿ Private" />
+                </Tooltip>
+              )}
+              {parsed.seScore != null && (
+                <Tooltip
+                  text={`Stream expression score: ${parsed.seScore}. The sum of the AIOStreams ranked expressions this stream matched; it is what AIOStreams sorts by.`}
+                  pos="top"
+                  className="flex-shrink-0"
+                >
+                  <ChipPill
+                    kind="score"
+                    label={parsed.seScore >= 0 ? `S+${parsed.seScore}` : `S${parsed.seScore}`}
+                  />
+                </Tooltip>
+              )}
+              {parsed.proxyState === "on" && (
+                <Tooltip text="Routed through the addon's proxy" pos="top" className="flex-shrink-0">
+                  <ChipPill kind="proxy" label="⛊" />
+                </Tooltip>
+              )}
+              {parsed.proxyState === "self" && (
+                <Tooltip text="Served by the addon host itself (AIOStreams' built-in usenet engine), so the connection stays on its IP. Not proxied." pos="top" className="flex-shrink-0">
+                  <ChipPill kind="proxy-self" label="⛊" />
+                </Tooltip>
+              )}
+              {parsed.proxyState === "off" && (
+                <Tooltip text="Direct delivery; the addon's proxy is off for this stream" pos="top" className="flex-shrink-0">
+                  <ChipPill kind="proxy-off" label="⛉" />
+                </Tooltip>
+              )}
+            </div>
+          )}
         </div>
       </div>
 
-      {/* BEST / ALT BEST badge — absolute top-right of the outer button.
-          Only one of these renders at a time; seadexBest takes priority. */}
-      {parsed.seadexBest && (
-        <span
-          className="absolute top-2 right-2
-                     text-[11px] font-semibold uppercase tracking-wider px-2 py-1 rounded
-                     bg-amber-400/20 text-amber-200 border border-amber-300/40
-                     shadow-[0_0_12px_rgba(251,191,36,0.3)]"
-          aria-label="Best Release"
-        >
-          ★ Best Release
-        </span>
-      )}
-      {!parsed.seadexBest && parsed.seadexAlt && (
-        <span
-          className="absolute top-2 right-2
-                     text-[11px] font-semibold uppercase tracking-wider px-2 py-1 rounded
-                     bg-amber-500/15 text-amber-300/90 border border-amber-400/30"
-          aria-label="Alt Best Release"
-        >
-          ★ ALT BEST
-        </span>
-      )}
-
-      {/* Top-right rating slot. Normally the 5-star quality bar; for a
-          stream AIOStreams flagged as an unverifiable season pack the stars
-          are replaced by a red "Unreliable" badge occupying the same slot.
-          When a Best / Alt Best badge owns the top-2 corner, this sits
-          directly below it (top-10 ≈ 40 px clears the badge); otherwise it
-          takes the corner slot (top-2). */}
-      {unreliable ? (
-        <div className={`absolute right-2 ${hasBadge ? "top-10" : "top-2"}`}>
-          <Tooltip
-            text="Season pack — the played episode can't be verified and may not be the one you requested."
-            pos="left"
-          >
-            <span
-              className="text-[11px] font-semibold uppercase tracking-wider px-2 py-1 rounded
-                         bg-red-500/90 text-white border border-red-300/50
-                         shadow-[0_0_10px_rgba(239,68,68,0.45)]"
-              aria-label="Unreliable — season pack; the played episode can't be verified"
-            >
-              Unreliable
-            </span>
-          </Tooltip>
-        </div>
-      ) : parsed.stars > 0 ? (
-        <div className={`absolute right-2 ${hasBadge ? "top-10" : "top-2"}`}>
-          <Stars value={parsed.stars} />
-        </div>
-      ) : null}
-
-      {/* Bottom-right cluster — release-group / indexer / private flag,
-          then the seScore chip, then the VPS chip. Order left-to-right is:
-          provenance tags, score, VPS (rightmost). Anchored absolute so the
-          chip strip in the right column never bumps into them; pb-7 on the
-          chip strip reserves the vertical clearance. */}
-      {(topMeta.length > 0 || parsed.private || parsed.proxyState != null || parsed.seScore != null) && (
-        <div className="absolute bottom-2 right-2 flex items-center gap-1.5 text-[11.5px] font-mono">
-          {topMeta.map((m, i) => (
-            <ChipPill key={i} kind={m.kind} label={m.label} />
-          ))}
-          {parsed.private && <ChipPill kind="private" label="⚿ Private" />}
-          {parsed.seScore != null && (
-            <Tooltip text="Stremio Enhanced score" pos="top">
-              <ChipPill
-                kind="score"
-                label={parsed.seScore >= 0 ? `S+${parsed.seScore}` : `S${parsed.seScore}`}
-              />
-            </Tooltip>
-          )}
-          {parsed.proxyState === "on" && (
-            <Tooltip text="Routed through addon's proxy" pos="top">
-              <ChipPill kind="proxy" label="⛊" />
-            </Tooltip>
-          )}
-          {parsed.proxyState === "self" && (
-            <Tooltip text="Served by the addon host itself (AIOStreams' built-in usenet engine), so the connection stays on its IP. Not proxied." pos="top">
-              <ChipPill kind="proxy-self" label="⛊" />
-            </Tooltip>
-          )}
-          {parsed.proxyState === "off" && (
-            <Tooltip text="Direct delivery; addon's proxy is off for this stream" pos="top">
-              <ChipPill kind="proxy-off" label="⛉" />
-            </Tooltip>
-          )}
-        </div>
-      )}
     </button>
   );
 }
 
-/** True when the parsed result has at least one chip to show in the
- *  vertical chip stack. seadexBest/seadexAlt are excluded (absolute badge).
- *  proxied/seScore/indexer/releaseGroup/private are excluded — they all
- *  render in the absolute bottom-right cluster. */
+/** True when the parsed result has at least one chip to show in the chip
+ *  stack. Best / Alt Best, the score, indexer, release group, private flag
+ *  and proxy render in the header and footer instead. */
 function hasAnyChip(p: ReturnType<typeof parseStream>): boolean {
   return !!(
     p.encode || p.codec || p.hdr || p.bitDepth ||
@@ -6568,37 +6667,260 @@ function hasAnyChip(p: ReturnType<typeof parseStream>): boolean {
     p.size || p.folderSize || p.bitrate ||
     p.seeders != null || p.age ||
     p.language || p.languages.length > 0 || p.subbed || p.subtitles.length > 0 ||
-    p.nzbHealth || p.releaseFlags.length > 0
+    p.nzbHealth || p.releaseFlags.length > 0 || p.expressions.length > 0
   );
 }
 
-/** Single rectangular tag pill — minimal type, coloured per kind via
- *  `chipStyleFor`.
- *  - inline-block keeps the chip's border around ALL of its content as
- *    a single rounded rectangle when the label wraps (the auto-shrunk
- *    scraper-name chip in the quality box). Without inline-block, the
- *    default `display: inline` splits the border across lines.
- *  - text-center keeps wrapped lines centred inside the chip box;
- *    single-line chips are unaffected because they fill their span.
- *  - tight ⇒ width:min-content. The chip shrinks to the widest
- *    unbreakable word (rather than the full available width), so a
- *    wrapped two-line scraper chip is only as wide as it needs to be.
- *    Default chips use max-w-full so they never blow past their parent. */
-function ChipPill({ kind, label, tight }: { kind: ChipKind; label: string; tight?: boolean }) {
+/** One chip of a ChipRow: `tip` is its hover (and its line in a "+N"
+ *  chip's list), so it always carries the full value. */
+interface RowChip { key: string; tip: string; kind: ChipKind; label: string; sub?: string }
+
+function rowChip(key: string, kind: ChipKind, label: string, tip: string, sub?: string): RowChip {
+  return { key, kind, label, tip, sub };
+}
+
+/** The stream row's chip lines, built once per parse. */
+function streamRowChips(p: ReturnType<typeof parseStream>) {
+  const video: RowChip[] = [];
+  if (p.encode) video.push(rowChip("enc", "encode", p.encode, `Video codec: ${p.encode}`));
+  else if (p.codec) video.push(rowChip("enc", "codec", p.codec, `Video codec: ${p.codec}`));
+  if (p.bitDepth) video.push(rowChip("bd", "encode", p.bitDepth, `Bit depth: ${p.bitDepth}`));
+  p.visualTagsPrimary.forEach((t, i) => video.push(rowChip(`vp${i}`, "visual-pri", t, `HDR / Dolby Vision: ${t}`)));
+  if (p.visualTagsPrimary.length === 0 && p.hdr) video.push(rowChip("hdr", "hdr", p.hdr, `HDR / Dolby Vision: ${p.hdr}`));
+  p.visualTagsSecondary.forEach((t, i) => video.push(rowChip(`vs${i}`, "visual-sec", t, `Visual tag: ${t}`)));
+
+  const audio: RowChip[] = [];
+  if (p.audioTags.length > 0) p.audioTags.forEach((t, i) => audio.push(rowChip(`a${i}`, "audio", t, `Audio codec: ${t}`)));
+  else if (p.audio) audio.push(rowChip("a", "audio", p.audio, `Audio codec: ${p.audio}`));
+  p.audioChannels.forEach((c, i) => audio.push(rowChip(`ch${i}`, "channels", c, `Audio channels: ${c}`)));
+
+  // Size: the file, then (dimmer, in the same chip) the pack or folder it
+  // comes from. Two chips ("6.45 GB", "/ 159 GB") read as two sizes.
+  const size: RowChip[] = [];
+  if (p.size) {
+    const tip = p.folderSize
+      ? p.seasonPack
+        ? `This episode's file is ${p.size}, from a ${p.folderSize} season pack.`
+        : `This file is ${p.size}, from a ${p.folderSize} torrent.`
+      : p.seasonPack ? `Season pack size: ${p.size}` : `File size: ${p.size}`;
+    size.push(rowChip("size", "size", p.size, tip, p.folderSize ? `of ${p.folderSize}` : undefined));
+  } else if (p.folderSize) {
+    size.push(rowChip("folder", "folder", p.folderSize, `Torrent size: ${p.folderSize}`));
+  }
+  if (p.bitrate) size.push(rowChip("br", "bitrate", p.bitrate, `Average bit rate: ${p.bitrate}`));
+
+  const swarm: RowChip[] = [];
+  if (p.seeders != null) {
+    swarm.push(rowChip("seed", "seeders", formatSeeders(p.seeders), `Seeders: ${p.seeders.toLocaleString()}`));
+  }
+  if (p.age) swarm.push(rowChip("age", "age", p.age, `Uploaded ${p.age} ago`));
+
+  // Languages, then the subtitles as ONE chip ("SUB EN · EN forced"): a
+  // chip per subtitle track crowded the audio languages off the line.
+  const lang: RowChip[] = [];
+  if (p.languages.length > 0) p.languages.forEach((l, i) => lang.push(rowChip(`l${i}`, "lang", l, `Audio language: ${l}`)));
+  else if (p.language) lang.push(rowChip("l", "lang", p.language, `Audio language: ${p.language}`));
+  if (p.subtitles.length > 0) {
+    lang.push(rowChip("sub", "sub", `SUB ${p.subtitles.join(" · ")}`, `Subtitles: ${p.subtitles.join(", ")}`));
+  } else if (p.subbed) {
+    lang.push(rowChip("sub", "sub", "SUB", "Has subtitles"));
+  }
+
+  const nzb: RowChip[] = [];
+  if (p.nzbHealth === "verified") nzb.push(rowChip("nzb", "nzb-verified", "☑ NZB", "NZB health: verified"));
+  if (p.nzbHealth === "elf") nzb.push(rowChip("nzb", "nzb-elf", "ELF NZB", "NZB health: elf"));
+  if (p.nzbHealth === "unverified") nzb.push(rowChip("nzb", "nzb-unverified", "Unverified NZB", "NZB health: unverified"));
+  if (p.nzbHealth === "broken") nzb.push(rowChip("nzb", "nzb-broken", "✘ NZB", "NZB health: broken"));
+
+  const flags: RowChip[] = [];
+  p.expressions.forEach((e, i) => flags.push(rowChip(`x${i}`, "default", e, `Ranked expression this stream matched in AIOStreams: ${e}`)));
+  p.releaseFlags.forEach((f, i) => flags.push(rowChip(`f${i}`, "default", f, `Release tag from the addon: ${f}`)));
+
+  return {
+    videoChips: video, audioChips: audio, sizeChips: size, swarmChips: swarm,
+    langChips: lang, nzbChips: nzb, flagChips: flags,
+  };
+}
+
+/** Width kept free for the "+N" chip, and the row's gap (gap-1.5). */
+const MORE_CHIP_W = 40;
+const CHIP_GAP = 6;
+/** A chip that would be left narrower than this is hidden, not truncated. */
+const MIN_TRUNCATED_CHIP_W = 56;
+
+/** What one ChipRow fit decided: the chip to truncate (and to what width),
+ *  the first chip to hide, and where the "+N" chip goes. */
+interface ChipFit { truncate: number; truncW: number; more: { from: number; left: number } | null }
+
+interface ChipRowHandle {
+  items: () => HTMLElement[];
+  apply: (fit: ChipFit) => void;
+}
+
+/** Read one row's layout (no writes): which chips fit. */
+function measureChipRow(box: HTMLElement, items: HTMLElement[]): ChipFit {
+  const width = box.clientWidth;
+  const right = (i: number) => items[i].offsetLeft + items[i].offsetWidth;
+  const over = items.findIndex((_, i) => right(i) > width + 0.5);
+  if (over < 0) return { truncate: -1, truncW: 0, more: null };
+  const last = over === items.length - 1;
+  const room = width - items[over].offsetLeft - (last ? 0 : CHIP_GAP + MORE_CHIP_W);
+  if (room >= MIN_TRUNCATED_CHIP_W || over === 0) {
+    // Truncate the chip that reached the edge; hide what follows it.
+    const w = Math.max(24, room);
+    return {
+      truncate: over, truncW: w,
+      more: last ? null : { from: over + 1, left: items[over].offsetLeft + w + CHIP_GAP },
+    };
+  }
+  // Hide from the first chip that leaves no room for the "+N".
+  let k = over;
+  while (k > 1 && right(k - 1) + CHIP_GAP + MORE_CHIP_W > width) k--;
+  if (k === 1 && right(0) + CHIP_GAP + MORE_CHIP_W > width) {
+    // The first chip alone leaves no room: it truncates to make some, so the
+    // "+N" is always inside the row (a chip as wide as the row hid the rest
+    // with the "+N" painted past the edge).
+    const w = Math.max(24, width - CHIP_GAP - MORE_CHIP_W);
+    return { truncate: 0, truncW: w, more: { from: 1, left: w + CHIP_GAP } };
+  }
+  return { truncate: -1, truncW: 0, more: { from: k, left: right(k - 1) + CHIP_GAP } };
+}
+
+/** A chip the row has no room for: invisible and out of the pointer's way,
+ *  but still in the accessibility tree, so the stream button's name keeps
+ *  every chip (visibility: hidden would drop them). */
+function setChipHidden(el: HTMLElement, hidden: boolean): void {
+  el.style.opacity = hidden ? "0" : "";
+  el.style.pointerEvents = hidden ? "none" : "";
+}
+
+// One ResizeObserver for every ChipRow on the page. It fits every row it is
+// handed in three passes (reset all, read all, write all), so a list of
+// streams costs one layout, not one per row: a row fitting itself in turn
+// would interleave a read after every other row's write. An element's first
+// observation is reported too, so observing (again, when the chips change)
+// is what fits a row; it runs after layout and before paint.
+const chipRows = new Map<Element, ChipRowHandle>();
+let chipRowObserver: ResizeObserver | null = null;
+function fitChipRows(boxes: Element[]): void {
+  const rows = boxes.flatMap((b) => {
+    const h = chipRows.get(b);
+    return h ? [{ box: b as HTMLElement, h, items: h.items() }] : [];
+  });
+  for (const r of rows) for (const it of r.items) { setChipHidden(it, false); it.style.maxWidth = ""; }
+  const fits = rows.map((r) => measureChipRow(r.box, r.items));
+  // Synchronously, so the "+N" chips paint in the same frame as the chips
+  // they stand for (a ResizeObserver update is otherwise flushed later).
+  flushSync(() => rows.forEach((r, i) => r.h.apply(fits[i])));
+}
+function observeChipRow(el: Element, h: ChipRowHandle): () => void {
+  if (typeof ResizeObserver === "undefined") return () => {};
+  chipRowObserver ??= new ResizeObserver((entries) => fitChipRows(entries.map((e) => e.target)));
+  chipRows.set(el, h);
+  chipRowObserver.observe(el);
+  return () => {
+    chipRows.delete(el);
+    chipRowObserver?.unobserve(el);
+  };
+}
+
+/**
+ * One line of chips that never wraps. Chips that do not fit are hidden
+ * behind a "+N" chip whose hover lists them; the first chip that does not
+ * fit truncates instead when a useful width of it is left. Laid out once,
+ * then measured: hidden chips keep their place (opacity only), so a
+ * measurement never moves anything, and the only React state is the "+N"
+ * chip (count and position), set when it changes. Re-fit when the row is
+ * resized or its chips change.
+ */
+function ChipRow({ rail, chips }: { rail: string; chips: RowChip[] }) {
+  const boxRef = useRef<HTMLDivElement>(null);
+  const [more, setMore] = useState<{ from: number; left: number } | null>(null);
+  const sig = chips.map((c) => `${c.key}=${c.label}${c.sub ?? ""}`).join("|");
+  useLayoutEffect(() => {
+    const box = boxRef.current;
+    if (!box) return;
+    const items = () => Array.from(box.querySelectorAll<HTMLElement>(":scope > [data-chip]"));
+    return observeChipRow(box, {
+      items,
+      apply: (fit) => {
+        const its = items();
+        if (fit.truncate >= 0 && its[fit.truncate]) its[fit.truncate].style.maxWidth = `${fit.truncW}px`;
+        if (fit.more) for (let i = fit.more.from; i < its.length; i++) setChipHidden(its[i], true);
+        const next = fit.more;
+        setMore((prev) => (prev?.from === next?.from && prev?.left === next?.left ? prev : next));
+      },
+    });
+  }, [sig]);
+  const hidden = more ? chips.slice(more.from) : [];
+  return (
+    <div className="flex items-center gap-1.5 min-w-0">
+      <span className="text-white/35 text-[11px] font-mono w-4 shrink-0" aria-hidden>{rail}</span>
+      <div ref={boxRef} className="relative flex-1 min-w-0 flex flex-nowrap items-center gap-1.5 overflow-hidden">
+        {chips.map((c) => (
+          <span key={c.key} data-chip="" className="flex-shrink-0 inline-flex min-w-0 max-w-full">
+            <Tooltip text={c.tip} pos="top" className={CHIP_TIP}>
+              <ChipPill kind={c.kind} label={c.label} sub={c.sub} subShrinks={c.kind === "size"} />
+            </Tooltip>
+          </span>
+        ))}
+        {more && hidden.length > 0 && (
+          <span className="absolute top-1/2 -translate-y-1/2 inline-flex" style={{ left: more.left }}>
+            <Tooltip
+              pos="top"
+              text={hidden.map((c) => c.tip).join(" / ")}
+              content={
+                <span className="flex flex-col gap-0.5 text-left">
+                  {hidden.map((c) => <span key={c.key}>{c.tip}</span>)}
+                </span>
+              }
+            >
+              <ChipPill kind="default" label={`+${hidden.length}`} />
+            </Tooltip>
+          </span>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/** Single rectangular tag pill, coloured per kind via `chipStyleFor`.
+ *  - tight (the scraper chip in the fixed-width quality box) is
+ *    width:min-content and wraps onto a second line, as designed.
+ *  - every other chip is ONE line that truncates with an ellipsis (its
+ *    Tooltip carries the full value). `sub` is a dimmer tail that never
+ *    truncates ("of 159 GB", "+7"). */
+function ChipPill({ kind, label, tight, sub, subShrinks }: {
+  kind: ChipKind; label: string; tight?: boolean; sub?: string;
+  /** The tail truncates first and the label keeps its width (the size chip:
+   *  the file size matters more than the pack's). Otherwise the label
+   *  truncates and the tail stays ("stremthru-corpus +7"). */
+  subShrinks?: boolean;
+}) {
   // Never render a blank chip: a label that's empty or only whitespace /
   // zero-width / bidi characters would otherwise paint an empty box next to
   // its category icon (the "blank spot" symptom).
-  if (!label || label.replace(/[\s ​-‏‪-‮⁠﻿]+/gu, "").length === 0) {
+  if (!label || label.replace(/[\s\u00A0\u200B-\u200F\u202A-\u202E\u2060\uFEFF]+/gu, "").length === 0) {
     return null;
   }
   const s = chipStyleFor(kind);
-  const widthClass = tight ? "w-min max-w-full" : "max-w-full";
+  if (tight) {
+    return (
+      <span className={`inline-block w-min max-w-full px-2 py-0.5 rounded border ${s.bg} ${s.fg} ${s.border} font-medium tracking-wide text-center`}>
+        {label}
+      </span>
+    );
+  }
   return (
-    <span className={`inline-block ${widthClass} px-2 py-0.5 rounded border ${s.bg} ${s.fg} ${s.border} font-medium tracking-wide text-center`}>
-      {label}
+    <span className={`inline-flex items-baseline gap-1 min-w-0 max-w-full px-2 py-0.5 rounded border ${s.bg} ${s.fg} ${s.border} font-medium tracking-wide whitespace-nowrap`}>
+      <span className={subShrinks ? "flex-shrink-0" : "min-w-0 truncate"}>{label}</span>
+      {sub && <span className={`opacity-60 ${subShrinks ? "min-w-0 truncate" : "flex-shrink-0"}`}>{sub}</span>}
     </span>
   );
 }
+
+/** A chip's Tooltip wrapper may shrink, so the chip inside can truncate. */
+const CHIP_TIP = "min-w-0 max-w-full";
 
 /** 5-star rating bar with half-star granularity. */
 function Stars({ value }: { value: number }) {

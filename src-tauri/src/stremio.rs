@@ -902,7 +902,137 @@ pub struct StreamEntry {
     /// a number), so this is the only real byte count available before the
     /// first response, and it is what the free-space preflight uses.
     pub video_size: Option<u64>,
+    /// `streamData.earlyRelease` from AIOStreams: this stream got through its
+    /// Digital Release Filter because the film is out before its official
+    /// digital date (a leak). `None` for every other stream, and for any addon
+    /// that does not send it (AIOStreams sends `streamData` only with
+    /// PROVIDE_STREAM_DATA on, or to an "AIO" User-Agent).
+    pub early_release: Option<EarlyReleaseFlag>,
+    /// AIOStreams' structured facts about this stream (`streamData`, see
+    /// `StreamFacts`). The row prefers them over what it parses out of the
+    /// formatter's text, which a formatter can truncate ("The Pirate Ba...")
+    /// or join ("GROUP · INDEXER"). `None` without streamData.
+    pub facts: Option<StreamFacts>,
 }
+
+/// The few `streamData` fields the stream row shows, read field by field so
+/// a missing or malformed one costs that field alone. Field names follow
+/// AIOStreams' ParsedStreamSchema (`packages/core/src/db/schemas.ts`):
+/// `parsedFile.releaseGroup`, `indexer`, `torrent.seeders` /
+/// `torrent.private`, `size` / `folderSize` (bytes), `age` (hours since
+/// upload), `duration` (ms), `service.cached`, `parsedFile.title`,
+/// `rankedStreamExpressionsMatched` and `streamExpressionScore`.
+#[derive(Clone, Serialize, Default, PartialEq)]
+pub struct StreamFacts {
+    pub release_group: Option<String>,
+    /// One indexer, or several joined by the scraper ("a,b,c" / "A|B").
+    pub indexer: Option<String>,
+    /// The title parsed from the file name: untruncates the formatter's
+    /// title line ("The Apothecary Diari...").
+    pub title: Option<String>,
+    /// The names of the user's ranked stream expressions this stream
+    /// matched, one name each (the formatter runs them together).
+    pub expressions: Vec<String>,
+    /// The ranked expressions' summed score (the formatter's trailing number).
+    pub expression_score: Option<i64>,
+    pub seeders: Option<u32>,
+    pub private: Option<bool>,
+    pub size: Option<u64>,
+    pub folder_size: Option<u64>,
+    pub age_hours: Option<f64>,
+    pub duration_ms: Option<u64>,
+    pub cached: Option<bool>,
+}
+
+/// `streamData`'s facts, or `None` when it carries none of them.
+fn stream_facts(sd: Option<&serde_json::Value>) -> Option<StreamFacts> {
+    let sd = sd.filter(|v| v.is_object())?;
+    // A byte count: a non-negative integer below a petabyte.
+    let bytes = |v: Option<&serde_json::Value>| {
+        v.and_then(|v| v.as_u64().or_else(|| v.as_f64().filter(|f| f.fract() == 0.0 && *f >= 0.0).map(|f| f as u64)))
+            .filter(|n| *n > 0 && *n < 1024u64.pow(5))
+    };
+    let torrent = sd.get("torrent").filter(|v| v.is_object());
+    let f = StreamFacts {
+        release_group: short_wire_str(sd.get("parsedFile").and_then(|p| p.get("releaseGroup")), 64),
+        // A scraper joins every indexer that had the file (StremThru sent
+        // eight, 78 chars): a cap that cut the list would cut a name.
+        indexer: short_wire_str(sd.get("indexer"), 256),
+        title: short_wire_str(sd.get("parsedFile").and_then(|p| p.get("title")), 200),
+        expressions: sd
+            .get("rankedStreamExpressionsMatched")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                let mut out: Vec<String> = Vec::new();
+                for v in a.iter().take(16) {
+                    if let Some(n) = short_wire_str(Some(v), 48) {
+                        if !out.contains(&n) {
+                            out.push(n);
+                        }
+                    }
+                    if out.len() == 8 {
+                        break;
+                    }
+                }
+                out
+            })
+            .unwrap_or_default(),
+        expression_score: sd
+            .get("streamExpressionScore")
+            .and_then(|v| v.as_f64())
+            .filter(|n| n.is_finite() && n.abs() < 1e9)
+            .map(|n| n.round() as i64),
+        seeders: torrent
+            .and_then(|t| t.get("seeders"))
+            .and_then(|v| v.as_u64())
+            .map(|n| n.min(u32::MAX as u64) as u32),
+        private: torrent.and_then(|t| t.get("private")).and_then(|v| v.as_bool()),
+        size: bytes(sd.get("size")),
+        folder_size: bytes(sd.get("folderSize")),
+        // Ten years in hours bounds a plausible age.
+        age_hours: sd
+            .get("age")
+            .and_then(|v| v.as_f64())
+            .filter(|h| h.is_finite() && *h >= 0.0 && *h < 87_600.0),
+        // At most 24 hours; anything longer is not a running time.
+        duration_ms: sd
+            .get("duration")
+            .and_then(|v| v.as_f64())
+            .filter(|d| d.is_finite() && *d >= 1_000.0 && *d <= 86_400_000.0)
+            .map(|d| d.round() as u64),
+        cached: sd.get("service").and_then(|v| v.get("cached")).and_then(|v| v.as_bool()),
+    };
+    (f != StreamFacts::default()).then_some(f)
+}
+
+/// One stream's `streamData.earlyRelease`. `evidence` marks a file that is
+/// itself the proof (its length matches the film's runtime).
+#[derive(Clone, Serialize)]
+pub struct EarlyReleaseFlag {
+    /// "bypass" | "leakRecord" | "leakDetected" (other values pass through,
+    /// capped, so a newer AIOStreams is not dropped).
+    pub source: String,
+    pub evidence: bool,
+}
+
+/// The data AIOStreams' "Early Release" notice carries
+/// (`streamData.code == "earlyRelease"`, `streamData.data`). Every field is
+/// optional and capped: an addon is untrusted input.
+#[derive(Clone, Serialize, Default)]
+pub struct EarlyReleaseInfo {
+    pub source: Option<String>,
+    /// When AIOStreams detected the release (an ISO timestamp, as sent).
+    pub detected_at: Option<String>,
+    /// The release groups with matching files (first RELEASE_GROUPS_CAP).
+    pub release_groups: Vec<String>,
+    /// How many groups AIOStreams named in all, before the cap.
+    pub release_group_count: u32,
+    pub runtime_minutes: Option<u32>,
+    /// The official digital date AIOStreams compared against (as sent).
+    pub digital_release_date: Option<String>,
+}
+
+const RELEASE_GROUPS_CAP: usize = 24;
 
 // ---------------------------------------------------------------------------
 // AIOStreams metadata payloads
@@ -942,6 +1072,13 @@ pub struct StreamMessage {
     /// since that path doesn't carry per-entry forced flags.
     #[serde(default)]
     pub forced: bool,
+    /// `streamData.code` (or a top-level `code` on the named-array shape):
+    /// a stable machine name for the notice, e.g. "digitalReleaseFilter" or
+    /// "earlyRelease", so the frontend never matches the wording. `None`
+    /// from an AIOStreams that does not send one.
+    pub code: Option<String>,
+    /// The notice's data when `code` is "earlyRelease".
+    pub early_release: Option<EarlyReleaseInfo>,
 }
 
 #[derive(Clone, Serialize, Default)]
@@ -950,6 +1087,12 @@ pub struct StreamMetadata {
     pub warnings: Vec<StreamMessage>,
     pub info: Vec<StreamMessage>,
     pub stats: Vec<StreamMessage>,
+    /// Addons that were ASKED and did not answer usably (send error or
+    /// timeout, a non-2xx status, unparseable JSON, a panicked task). An addon
+    /// the manifest gate skipped was never asked and is not counted. These
+    /// failures leave no StreamMessage, so without this an answer missing its
+    /// most important addon reads exactly like a complete one.
+    pub failed_addons: u32,
 }
 
 #[derive(Clone, Serialize)]
@@ -5481,6 +5624,8 @@ struct AddonFetchOutput {
     warnings: Vec<StreamMessage>,
     info: Vec<StreamMessage>,
     stats: Vec<StreamMessage>,
+    /// Asked, and no usable answer (see `StreamMetadata::failed_addons`).
+    failed: bool,
 }
 
 impl AddonFetchOutput {
@@ -5491,7 +5636,12 @@ impl AddonFetchOutput {
             warnings: Vec::new(),
             info: Vec::new(),
             stats: Vec::new(),
+            failed: false,
         }
+    }
+
+    fn failed() -> Self {
+        Self { failed: true, ..Self::empty() }
     }
 }
 
@@ -5640,7 +5790,7 @@ pub async fn fetch_streams(
                         "[{}] {}/{} {}",
                         label, media_type, id, reqwest_err_for_log(&e)
                     );
-                    return (addon_idx, AddonFetchOutput::empty());
+                    return (addon_idx, AddonFetchOutput::failed());
                 }
             };
             let status = resp.status();
@@ -5651,7 +5801,7 @@ pub async fn fetch_streams(
                     "[{}] HTTP {} for {}/{}",
                     label, status.as_u16(), media_type, id
                 );
-                return (addon_idx, AddonFetchOutput::empty());
+                return (addon_idx, AddonFetchOutput::failed());
             }
 
             let json = match resp.json::<serde_json::Value>().await {
@@ -5663,7 +5813,7 @@ pub async fn fetch_streams(
                         "[{}] {}/{} JSON parse failed ({})",
                         label, media_type, id, reqwest_err_for_log(&e)
                     );
-                    return (addon_idx, AddonFetchOutput::empty());
+                    return (addon_idx, AddonFetchOutput::failed());
                 }
             };
 
@@ -5676,7 +5826,7 @@ pub async fn fetch_streams(
             // regardless of which endpoint the addon is configured to expose.
             let mut errors   = collect_messages(&json, "errors",     "error",   &addon_name);
             let mut warnings = collect_messages(&json, "warnings",   "warning", &addon_name);
-            let info         = collect_messages(&json, "info",       "info",    &addon_name);
+            let mut info     = collect_messages(&json, "info",       "info",    &addon_name);
             let mut stats    = {
                 // Both `statistics` and `stats` have appeared in the wild —
                 // accept either, preferring the more specific name.
@@ -5700,6 +5850,7 @@ pub async fn fetch_streams(
                 match n.kind.as_str() {
                     "error"   => errors.push(n),
                     "warning" => warnings.push(n),
+                    "info"    => info.push(n),
                     _         => stats.push(n), // "stats" is the info-blue bucket
                 }
             }
@@ -5726,27 +5877,49 @@ pub async fn fetch_streams(
                 );
             }
 
-            (addon_idx, AddonFetchOutput { streams: kept, errors, warnings, info, stats })
+            (addon_idx, AddonFetchOutput { streams: kept, errors, warnings, info, stats, failed: false })
         });
     }
 
     let mut all: Vec<StreamEntry> = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new();
+    // Dedup key -> index in `all`, so a dropped duplicate can hand over what
+    // only it knows (see the early_release carry below).
+    let mut seen: HashMap<String, usize> = HashMap::new();
     let mut metadata = StreamMetadata::default();
     // Drain, then restore addon order before merging. Sorting here rather than
     // awaiting the tasks in sequence keeps the fan-out fully parallel.
     let mut outputs: Vec<(usize, AddonFetchOutput)> = Vec::new();
     while let Some(task_result) = set.join_next().await {
-        if let Ok(tagged) = task_result {
-            outputs.push(tagged);
+        match task_result {
+            Ok(tagged) => outputs.push(tagged),
+            // A panicked addon task was asked and gave no answer.
+            Err(_) => metadata.failed_addons += 1,
         }
     }
     outputs.sort_by_key(|(idx, _)| *idx);
 
     for (_, out) in outputs {
+        if out.failed {
+            metadata.failed_addons += 1;
+        }
         for s in out.streams {
-            if seen.insert(stream_dedup_key(&s)) {
-                all.push(s);
+            match seen.get(&stream_dedup_key(&s)) {
+                None => {
+                    seen.insert(stream_dedup_key(&s), all.len());
+                    all.push(s);
+                }
+                // The first addon's copy is kept (addon order), but AIOStreams'
+                // early-release flag rides only on ITS copy: an earlier addon
+                // returning the same url or hash would otherwise drop the
+                // flag, the row's chip and a proof file from the count.
+                Some(&i) => {
+                    if let Some(flag) = s.early_release {
+                        let kept = &mut all[i].early_release;
+                        if kept.as_ref().map_or(true, |k| flag.evidence && !k.evidence) {
+                            *kept = Some(flag);
+                        }
+                    }
+                }
             }
         }
         metadata.errors.extend(out.errors);
@@ -5809,12 +5982,22 @@ fn collect_messages(
             if title.is_none() && description.is_empty() {
                 return None;
             }
+            // The code and its data sit on the entry itself or under its
+            // streamData, depending on the AIOStreams build.
+            let holder = entry
+                .get("streamData")
+                .filter(|v| v.is_object())
+                .unwrap_or(entry);
+            let code = notice_code(holder.get("code")).or_else(|| notice_code(entry.get("code")));
+            let early_release = early_release_info(code.as_deref(), holder.get("data").or_else(|| entry.get("data")));
             Some(StreamMessage {
                 kind: kind.to_string(),
                 title,
                 description: cap(description, 1024),
                 addon_name: cap(addon_name.to_string(), 64),
                 forced: false,
+                code,
+                early_release,
             })
         })
         .collect()
@@ -5854,6 +6037,19 @@ fn partition_aio_pseudo_streams(
         let pseudo_type = stream_data
             .and_then(|o| o.get("type"))
             .and_then(|v| v.as_str());
+        let code = notice_code(stream_data.and_then(|o| o.get("code")));
+        // A notice with a code but a type this parser does not know yet (an
+        // "info" pseudo-stream) is still a notice, as long as it has nothing
+        // to play: a stream that carries a code AND an address stays a stream.
+        let addressless = entry.get("url").and_then(|v| v.as_str()).is_none()
+            && entry.get("infoHash").and_then(|v| v.as_str()).is_none();
+        let pseudo_type = match pseudo_type {
+            Some("error") | Some("statistic") => pseudo_type,
+            Some("info") if addressless => Some("info"),
+            _ if code.is_some() && addressless => Some("info"),
+            _ => None,
+        };
+        let early_release = early_release_info(code.as_deref(), stream_data.and_then(|o| o.get("data")));
         match pseudo_type {
             Some("error") => {
                 let (title, desc) = stream_data
@@ -5880,6 +6076,31 @@ fn partition_aio_pseudo_streams(
                     description: cap(desc, 1024),
                     addon_name: cap(addon_name.to_string(), 64),
                     forced,
+                    code,
+                    early_release,
+                });
+            }
+            Some("info") => {
+                let title_raw = entry.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let description = entry.get("description").and_then(|v| v.as_str()).unwrap_or("");
+                let forced = stream_data
+                    .and_then(|o| o.get("forced"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let title = cap(title_raw.trim().to_string(), 200);
+                // Same rule as collect_messages: a notice that says nothing is
+                // dropped, unless it carries early-release data the page uses.
+                if title.is_empty() && description.trim().is_empty() && early_release.is_none() {
+                    continue;
+                }
+                notices.push(StreamMessage {
+                    kind: "info".to_string(),
+                    title: (!title.is_empty()).then_some(title),
+                    description: cap(description.trim().to_string(), 4096),
+                    addon_name: cap(addon_name.to_string(), 64),
+                    forced,
+                    code,
+                    early_release,
                 });
             }
             Some("statistic") => {
@@ -5895,7 +6116,8 @@ fn partition_aio_pseudo_streams(
                 let category = category_wire
                     .and_then(parse_aio_category)
                     .unwrap_or_else(|| infer_aio_stat_category(title_raw));
-                let kind = match category {
+                // Early Release is good news, whatever category it rides in.
+                let kind = if code.as_deref() == Some("earlyRelease") { "info" } else { match category {
                     AioCategory::Filter => "warning",
                     AioCategory::Timing => "stats",
                     AioCategory::Addon  => {
@@ -5908,13 +6130,15 @@ fn partition_aio_pseudo_streams(
                             "stats"
                         }
                     }
-                };
+                } };
                 notices.push(StreamMessage {
                     kind: kind.to_string(),
                     title: Some(cap(title_raw.trim().to_string(), 200)),
                     description: cap(description.trim().to_string(), 4096),
                     addon_name: cap(addon_name.to_string(), 64),
                     forced,
+                    code,
+                    early_release,
                 });
             }
             _ => {
@@ -5978,6 +6202,61 @@ fn strip_leading_emoji(s: &str) -> &str {
         end = i + c.len_utf8();
     }
     &s[end..]
+}
+
+/// A notice's `code`: a short identifier only (letters, digits, `_`, `-`),
+/// so it can be compared and never needs escaping.
+fn notice_code(v: Option<&serde_json::Value>) -> Option<String> {
+    let s = v?.as_str()?.trim();
+    (!s.is_empty() && s.len() <= 64 && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+        .then(|| s.to_string())
+}
+
+/// A short wire string (an id, a date, a group name), trimmed and capped, with
+/// control characters refused.
+fn short_wire_str(v: Option<&serde_json::Value>, max: usize) -> Option<String> {
+    let s = v?.as_str()?.trim();
+    (!s.is_empty() && !s.chars().any(|c| c.is_control())).then(|| cap(s.to_string(), max))
+}
+
+/// The Early Release notice's data, only for `code == "earlyRelease"`. Read
+/// field by field, so a missing or malformed one costs that field alone.
+fn early_release_info(code: Option<&str>, data: Option<&serde_json::Value>) -> Option<EarlyReleaseInfo> {
+    if code != Some("earlyRelease") {
+        return None;
+    }
+    let Some(d) = data.filter(|v| v.is_object()) else {
+        return Some(EarlyReleaseInfo::default());
+    };
+    // Only real, distinct names count: a count that includes a number, an
+    // empty string or a repeat would claim a group that does not exist.
+    let mut seen = HashSet::new();
+    let valid: Vec<String> = d
+        .get("releaseGroups")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .take(10_000)
+                .filter_map(|g| short_wire_str(Some(g), 64))
+                .filter(|s| seen.insert(s.to_ascii_lowercase()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let release_group_count = valid.len() as u32;
+    let release_groups: Vec<String> = valid.into_iter().take(RELEASE_GROUPS_CAP).collect();
+    let runtime_minutes = d
+        .get("runtimeMinutes")
+        .and_then(|v| v.as_f64())
+        .filter(|m| m.is_finite() && *m > 0.0 && *m < 2000.0)
+        .map(|m| m.round() as u32);
+    Some(EarlyReleaseInfo {
+        source: short_wire_str(d.get("source"), 32),
+        detected_at: short_wire_str(d.get("detectedAt"), 40),
+        release_group_count,
+        release_groups,
+        runtime_minutes,
+        digital_release_date: short_wire_str(d.get("digitalReleaseDate"), 40),
+    })
 }
 
 /// The identity two streams are deduplicated on, in `fetch_streams`' merge and
@@ -6061,6 +6340,18 @@ fn sanitize_stream(s: &serde_json::Value, addon_name: &str) -> Option<StreamEntr
         .and_then(|v| v.get("episodePack"))
         .and_then(|v| v.as_bool());
 
+    // streamData.earlyRelease = { source, evidence }: set by AIOStreams on a
+    // stream that got through its Digital Release Filter as a verified early
+    // release. Same gating as episodePack.
+    let early_release = s
+        .get("streamData")
+        .and_then(|v| v.get("earlyRelease"))
+        .filter(|v| v.is_object())
+        .map(|e| EarlyReleaseFlag {
+            source: short_wire_str(e.get("source"), 32).unwrap_or_default(),
+            evidence: e.get("evidence").and_then(|v| v.as_bool()).unwrap_or(false),
+        });
+
     // behaviorHints.proxyHeaders.request — see the struct field for why this
     // matters only on the download path. Bounded hard on every axis: an addon
     // is untrusted input and these end up on a real outbound request.
@@ -6114,6 +6405,8 @@ fn sanitize_stream(s: &serde_json::Value, addon_name: &str) -> Option<StreamEntr
         episode_pack,
         proxy_headers,
         video_size,
+        early_release,
+        facts: stream_facts(s.get("streamData")),
     })
 }
 
@@ -8343,5 +8636,138 @@ mod tests {
         assert_eq!(err(serde_json::json!({ "error": "" })), None);
         assert_eq!(err(serde_json::json!({ "error": null, "result": { "addons": [] } })), None);
         assert_eq!(err(serde_json::json!({ "result": { "success": true } })), None);
+    }
+    // ---- AIOStreams early release (streamData.code / streamData.earlyRelease)
+
+    #[test]
+    fn early_release_notice_is_info_with_its_data() {
+        let raw = vec![
+            serde_json::json!({
+                "name": "📅 Early Release",
+                "description": "Verified: 12 release groups have files matching the 173 min runtime",
+                "streamData": {
+                    "type": "statistic",
+                    "category": "filter",
+                    "code": "earlyRelease",
+                    "data": {
+                        "source": "leakDetected",
+                        "detectedAt": "2026-11-08T10:00:00.000Z",
+                        "releaseGroups": ["CiNEPHiLES", "AdL", "PSA"],
+                        "runtimeMinutes": 173,
+                        "digitalReleaseDate": "2026-11-17"
+                    }
+                }
+            }),
+            serde_json::json!({
+                "url": "https://example.com/a.mkv",
+                "name": "x",
+                "streamData": { "earlyRelease": { "source": "leakDetected", "evidence": true } }
+            }),
+        ];
+        let (playable, notices) = partition_aio_pseudo_streams(&raw, "AIOStreams");
+        assert_eq!(playable.len(), 1);
+        assert_eq!(notices.len(), 1);
+        let n = &notices[0];
+        assert_eq!(n.kind, "info");
+        assert_eq!(n.code.as_deref(), Some("earlyRelease"));
+        let d = n.early_release.as_ref().expect("data");
+        assert_eq!(d.source.as_deref(), Some("leakDetected"));
+        assert_eq!(d.release_groups, vec!["CiNEPHiLES", "AdL", "PSA"]);
+        assert_eq!(d.release_group_count, 3);
+        assert_eq!(d.runtime_minutes, Some(173));
+        assert_eq!(d.digital_release_date.as_deref(), Some("2026-11-17"));
+
+        let s = sanitize_stream(&playable[0], "AIOStreams").expect("playable");
+        let f = s.early_release.expect("flag");
+        assert_eq!(f.source, "leakDetected");
+        assert!(f.evidence);
+    }
+
+    #[test]
+    fn coded_info_pseudo_stream_and_drf_code() {
+        let raw = vec![
+            // An "info" pseudo-stream type this parser did not know before.
+            serde_json::json!({
+                "name": "📅 Early Release",
+                "description": "d",
+                "streamData": { "type": "info", "code": "earlyRelease", "data": { "source": "bypass" } }
+            }),
+            serde_json::json!({
+                "name": "📅 Digital Release Filter",
+                "description": "Not out digitally yet",
+                "streamData": { "type": "statistic", "category": "filter", "code": "digitalReleaseFilter", "forced": true }
+            }),
+            // A real stream carrying a code stays a stream.
+            serde_json::json!({
+                "url": "https://example.com/b.mkv",
+                "streamData": { "code": "earlyRelease" }
+            }),
+        ];
+        let (playable, notices) = partition_aio_pseudo_streams(&raw, "AIOStreams");
+        assert_eq!(playable.len(), 1);
+        assert_eq!(notices.len(), 2);
+        assert_eq!(notices[0].kind, "info");
+        assert_eq!(notices[0].early_release.as_ref().and_then(|d| d.source.as_deref()), Some("bypass"));
+        assert_eq!(notices[1].kind, "warning");
+        assert_eq!(notices[1].code.as_deref(), Some("digitalReleaseFilter"));
+        assert!(notices[1].early_release.is_none());
+        assert!(sanitize_stream(&playable[0], "AIOStreams").unwrap().early_release.is_none());
+    }
+
+    #[test]
+    fn notice_code_and_named_array_shape() {
+        assert_eq!(notice_code(Some(&serde_json::json!("earlyRelease"))).as_deref(), Some("earlyRelease"));
+        assert_eq!(notice_code(Some(&serde_json::json!("bad code"))), None);
+        assert_eq!(notice_code(Some(&serde_json::json!(""))), None);
+        assert_eq!(notice_code(Some(&serde_json::json!(7))), None);
+        let root = serde_json::json!({ "info": [
+            { "title": "📅 Early Release", "description": "d", "code": "earlyRelease",
+              "data": { "releaseGroups": ["A", 5, "B", "", "a", null], "runtimeMinutes": "x" } }
+        ]});
+        let m = collect_messages(&root, "info", "info", "AIOStreams");
+        assert_eq!(m.len(), 1);
+        let d = m[0].early_release.as_ref().unwrap();
+        assert_eq!(d.release_groups, vec!["A", "B"]);
+        assert_eq!(d.release_group_count, 2, "invalid and repeated names are not groups");
+        assert_eq!(d.runtime_minutes, None);
+        // An info pseudo-stream with no text and no data is dropped.
+        let (_, n) = partition_aio_pseudo_streams(
+            &[serde_json::json!({ "streamData": { "type": "info" } })],
+            "AIOStreams",
+        );
+        assert!(n.is_empty());
+    }
+
+    #[test]
+    fn stream_facts_read_field_by_field() {
+        let s = serde_json::json!({
+            "url": "https://x/y", "title": "t",
+            "streamData": {
+                "indexer": "The Pirate Bay", "size": 94_700_000_000u64, "folderSize": -5,
+                "age": 30.5, "duration": 10_380_000.0,
+                "torrent": { "seeders": 5050, "private": false },
+                "service": { "id": "torbox", "cached": true },
+                "parsedFile": { "releaseGroup": "CiNEPHiLES", "title": "The Odyssey" },
+                "rankedStreamExpressionsMatched": ["Web T2", "", "Web T6", "Web T2", 4],
+                "streamExpressionScore": 600
+            }
+        });
+        let f = sanitize_stream(&s, "AIOStreams").unwrap().facts.unwrap();
+        assert_eq!(f.release_group.as_deref(), Some("CiNEPHiLES"));
+        assert_eq!(f.indexer.as_deref(), Some("The Pirate Bay"));
+        assert_eq!(f.seeders, Some(5050));
+        assert_eq!(f.private, Some(false));
+        assert_eq!(f.size, Some(94_700_000_000));
+        assert_eq!(f.folder_size, None, "a negative size is not a size");
+        assert_eq!(f.age_hours, Some(30.5));
+        assert_eq!(f.duration_ms, Some(10_380_000));
+        assert_eq!(f.cached, Some(true));
+        assert_eq!(f.title.as_deref(), Some("The Odyssey"));
+        assert_eq!(f.expressions, vec!["Web T2".to_string(), "Web T6".to_string()], "names only, once each");
+        assert_eq!(f.expression_score, Some(600));
+        // No facts: no struct.
+        let bare = serde_json::json!({ "url": "https://x/y", "streamData": { "type": "debrid", "parsedFile": {} } });
+        assert!(sanitize_stream(&bare, "AIOStreams").unwrap().facts.is_none());
+        assert!(sanitize_stream(&serde_json::json!({ "url": "https://x/y" }), "A").unwrap().facts.is_none());
     }
 }

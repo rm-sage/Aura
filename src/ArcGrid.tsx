@@ -21,12 +21,15 @@
 // on the episode rows underneath it.
 // ---------------------------------------------------------------------------
 
-import { useMemo } from "react";
+import { useLayoutEffect, useMemo, useRef } from "react";
 
 import ImageLoader from "./ImageLoader";
 import Tooltip from "./Tooltip";
-import { episodeIsBeforeResume, useResumeVideoId } from "./LibraryContext";
+import { episodeIsBeforeResume, useLibraryMap, useResumeVideoId } from "./LibraryContext";
 import { getManualWatchedState, useManualWatchedVersion } from "./manualWatched";
+import { isEpisodeWatched } from "./episodeSpoilers";
+import { arcScrollAnchor } from "./seasonScroll";
+import { isSkipped } from "./skipMarks";
 import { shrinkPoster } from "./posterSize";
 import {
   arcEpisodeRange, arcYearRange, orderGroupings, absoluteEpisodeMap,
@@ -62,6 +65,9 @@ interface ArcGridProps {
   /** The manga chapters an arc adapts, already formatted ("Ch. 1,058-1,125"),
    *  or null. From mangaChapters.ts; absent for shows with no chapter data. */
   chapterLabelFor?: (arc: StoryArc) => string | null;
+  /** The player drawer's playing episode: the grid lands on its arc, ahead of
+   *  the latest watched one. */
+  pinnedEpisodeId?: string | null;
 }
 
 /** Episodes in this arc the user has finished. Mirrors LibraryContext's
@@ -129,6 +135,7 @@ function ArcCard({
   return (
     <button
       type="button"
+      data-arc-id={arc.id}
       onClick={() => onSelect(arc)}
       onContextMenu={onArcContextMenu ? (e) => {
         e.preventDefault();
@@ -390,7 +397,7 @@ export function ArcGridSkeleton({ count }: { count?: number }) {
 
 export default function ArcGrid({
   result, seriesId, videos, cloudKinds, loading, activeGroupingId, onSelect, onGroupingChange,
-  onArcContextMenu, chapterLabelFor,
+  onArcContextMenu, chapterLabelFor, pinnedEpisodeId,
 }: ArcGridProps) {
   const resumeId = useResumeVideoId(seriesId);
   // Re-render when a manual mark lands anywhere, so the progress bars stay
@@ -425,8 +432,38 @@ export default function ArcGrid({
   // when we actually used it.
   const usesFandomArt = arcs.some((a) => a.image_source === "fandom");
 
+  // Land on the arc holding the latest watched episode, once each time tiles appear: the
+  // grid opening (a new scroller on the Detail page, the drawer's shared one with
+  // whatever offset its rows left) or tiles replacing the skeleton, which has already
+  // clamped the offset away, whichever grouping they are. The scroller is always the
+  // parent, in both panels. scrollTop rather than scrollIntoView, which would also
+  // scroll the page's clipped ancestors.
+  const rootRef = useRef<HTMLDivElement>(null);
+  const libraryById = useLibraryMap();
+  const landedGroupingRef = useRef<string | null>(null);
+  useLayoutEffect(() => {
+    if (loading) { landedGroupingRef.current = null; return; }
+    if (landedGroupingRef.current === result.grouping_id) return;
+    landedGroupingRef.current = result.grouping_id;
+    const root = rootRef.current;
+    const scroller = root?.parentElement;
+    if (!root || !scroller) return;
+    const broadcast = videos
+      .filter((v) => absoluteById.has(v.id))
+      .sort((a, b) => absoluteById.get(a.id)! - absoluteById.get(b.id)!);
+    // A skipped episode is stored as a watched mark, but it is not where the
+    // user got to: "Skip the filler" at E110 marks every filler through E220.
+    const pinnedArc = pinnedEpisodeId ? arcs.find((a) => a.episode_ids.includes(pinnedEpisodeId))?.id : undefined;
+    const arcId = pinnedArc
+      ?? arcScrollAnchor(arcs, broadcast, (id) => isEpisodeWatched(libraryById, id) && !isSkipped(id));
+    const tile = arcId
+      ? root.querySelector<HTMLElement>(`[data-arc-id="${CSS.escape(arcId)}"]`)
+      : null;
+    scroller.scrollTop = tile ? tile.offsetTop - scroller.offsetTop : 0;
+  }, [loading, result.grouping_id, arcs, videos, absoluteById, libraryById]);
+
   return (
-    <div className="flex flex-col gap-3">
+    <div ref={rootRef} className="flex flex-col gap-3">
       <div className="flex items-center justify-between gap-3 flex-wrap">
         <GroupingSelect
           groupings={result.groupings}

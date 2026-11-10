@@ -1,8 +1,8 @@
-// Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
+// Aura - © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 // ---------------------------------------------------------------------------
-// releaseCountdown — shared "time until release" logic for the detail page
+// releaseCountdown: shared "time until release" logic for the detail page
 // meta strip and the catalog hover panel. Both surfaces call
 // `computeReleaseCountdowns(detail)` and render the result with
 // `formatCountdown`, so the rules live in exactly one place.
@@ -11,20 +11,17 @@
 //   • Series / anime → ONE countdown to the earliest episode whose air
 //     date is still in the future (across every season). This single rule
 //     covers both cases the product spec calls out:
-//       – currently airing  → counts down to the next unaired episode
-//       – announced/first season not yet started → counts down to the
+//       * currently airing: counts down to the next unaired episode
+//       * announced, first season not yet started: counts down to the
 //         premiere (the first episode's date)
 //     The label distinguishes them ("Next Episode" vs "Premieres") based
 //     on whether ANY episode has already aired.
-//   • Movies → up to TWO countdowns:
-//       – cinematic: counts down to `detail.released` while that date is
-//         still in the future ("In Theaters").
-//       – digital:   counts down to `released + DIGITAL_WINDOW_DAYS`
-//         ("Digital"). Stremio meta carries no authoritative digital /
-//         streaming date, so we estimate with the modern PVOD window
-//         (~45 days post-theatrical — the Universal/WB-era industry norm).
-//         Shown whenever that estimated date is still in the future, so a
-//         film already in theaters still shows a digital countdown.
+//   • Movies → up to TWO countdowns, cinematic and digital, from the dates
+//     `fetch_movie_release_dates` resolves for the user's Windows region
+//     (TMDB per-country rows, then MDBList), each with a basis the UI shows:
+//     Confirmed, Reported or Estimate. That logic, the "In Theaters" test and
+//     the wording live in the import-free movieRelease.ts (re-exported here)
+//     so a node check can load them.
 //
 // Everything is pure + timestamp-driven so it's trivially unit-testable and
 // the UI can pass a ticking `now` for a live display.
@@ -32,50 +29,39 @@
 
 import type { MetaDetail, VideoEntry } from "./types";
 import { releasedMs } from "./availableEarly";
+import { getMovieEarlyVersion, movieEarlyRecord, subscribeMovieEarly, type MovieEarlyRecord } from "./movieEarly";
 
-export type CountdownKind = "premiere" | "next-episode" | "cinematic" | "digital";
+import {
+  computeMovieCountdowns,
+  type AccurateReleaseDates,
+  type ReleaseCountdown,
+} from "./movieRelease";
 
-export interface ReleaseCountdown {
-  kind: CountdownKind;
-  /** Short UI label, e.g. "Next Episode", "Premieres", "In Theaters", "Digital". */
-  label: string;
-  /** Target release timestamp (ms since epoch). */
-  targetMs: number;
-  /** True when this target is the PVOD-window ESTIMATE (no authoritative
-   *  date was available) rather than a real date. Only ever set on the
-   *  `digital` kind; the UI marks estimated values (e.g. a "~" prefix). */
-  estimated?: boolean;
-}
-
-/** Authoritative release dates resolved from MDBList (see releaseDates.ts).
- *  Both `YYYY-MM-DD`; either may be absent. Passed into
- *  `computeReleaseCountdowns` / `isInTheaters` to replace the estimate. */
-export interface AccurateReleaseDates {
-  theatrical?: string | null;
-  digital?: string | null;
-}
-
-/** Days after theatrical release a film is assumed to hit digital when no
- *  authoritative digital date exists. The post-2021 PVOD / 45-day window is
- *  the industry norm; this is only an estimate (see module comment). */
-export const DIGITAL_WINDOW_DAYS = 45;
-
-/** Days after theatrical release a film is still treated as "in theaters"
- *  when no digital date has landed. Guards old catalog titles (which often
- *  carry a theatrical date but no recorded digital date) from reading as
- *  "In Theaters" indefinitely. ~120 days covers a typical wide + limited
- *  theatrical run. Only used by `isInTheaters`. */
-export const IN_THEATERS_WINDOW_DAYS = 120;
+export {
+  computeMovieCountdowns,
+  describeReleaseBasis,
+  formatReleaseDay,
+  inTheatersHover,
+  isInTheaters,
+  regionName,
+  releaseDayWhere,
+  DIGITAL_WINDOW_DAYS,
+  IN_THEATERS_WINDOW_DAYS,
+  IN_THEATERS_MAX_DAYS,
+  RELEASE_BASIS_TAG,
+} from "./movieRelease";
+export type {
+  AccurateReleaseDates,
+  CountdownKind,
+  ReleaseBasis,
+  ReleaseBasisWording,
+  ReleaseCountdown,
+  ReleaseSource,
+} from "./movieRelease";
 
 const DAY_MS = 86_400_000;
 const HOUR_MS = 3_600_000;
 const MIN_MS = 60_000;
-
-function parseMs(iso: string | null | undefined): number | null {
-  if (!iso) return null;
-  const t = Date.parse(iso);
-  return Number.isFinite(t) ? t : null;
-}
 
 /** Earliest future episode air date + whether anything has aired yet. */
 function nextEpisodeRelease(
@@ -121,64 +107,16 @@ export function computeReleaseCountdowns(
     ];
   }
 
-  // Movies (and any other non-episodic single-release content). Prefer
-  // MDBList's authoritative theatrical date when resolved, else the addon's
-  // `released` (usually the same value).
-  const cinematicMs = parseMs(dates?.theatrical) ?? parseMs(detail.released);
-  if (cinematicMs == null) return [];
-
-  const out: ReleaseCountdown[] = [];
-  if (cinematicMs > nowMs) {
-    out.push({ kind: "cinematic", label: "In Theaters", targetMs: cinematicMs });
-  }
-  // Accurate digital date from MDBList when known; otherwise fall back to
-  // the PVOD-window estimate and flag it so the UI can mark it. The old
-  // fixed estimate routinely drifted 20–40+ days off the real date.
-  const accurateDigitalMs = parseMs(dates?.digital);
-  const digitalMs = accurateDigitalMs ?? cinematicMs + DIGITAL_WINDOW_DAYS * DAY_MS;
-  if (digitalMs > nowMs) {
-    out.push({
-      kind: "digital",
-      label: "Digital",
-      targetMs: digitalMs,
-      estimated: accurateDigitalMs == null,
-    });
-  }
-  return out;
-}
-
-/**
- * Whether a movie is currently in theaters, from accurate MDBList dates.
- * True when its theatrical date has passed, it hasn't reached digital yet
- * (or digital is still unknown), AND the theatrical date is within the
- * freshness window. Returns false for series/anime and whenever accurate
- * dates aren't available — so the persistent "In Theaters" tag only shows
- * on real data, never on the +45-day guess.
- *
- * The digital cutoff is the key discriminator: once the digital date
- * passes, the film has entered the home window and drops out of "In
- * Theaters" even if technically still on some screens.
- */
-export function isInTheaters(
-  mediaType: string | null | undefined,
-  dates: AccurateReleaseDates | null | undefined,
-  nowMs: number = Date.now(),
-): boolean {
-  const mt = (mediaType ?? "").toLowerCase();
-  if (mt === "series" || mt === "anime") return false;
-  if (!dates) return false;
-  const theatrical = parseMs(dates.theatrical);
-  if (theatrical == null || theatrical > nowMs) return false;
-  if (nowMs - theatrical > IN_THEATERS_WINDOW_DAYS * DAY_MS) return false;
-  const digital = parseMs(dates.digital);
-  if (digital != null && digital <= nowMs) return false;
-  return true;
+  // Movies (and any other non-episodic single-release content): the
+  // resolved regional dates, the addon's `released` as the theatrical
+  // fallback, the +45-day estimate as the digital one. See movieRelease.ts.
+  return computeMovieCountdowns(detail.released, nowMs, dates);
 }
 
 /**
  * The earliest future-dated episode across every season (the one airing
  * next) and its target timestamp, or null when nothing is upcoming. Single
- * source of truth for "which episode is next to air" — shared by the
+ * source of truth for "which episode is next to air", shared by the
  * episode-list "next airing" highlight (DetailView + the in-player drawer)
  * and the EOS caught-up countdown, so all three agree. Mirrors the future-
  * date scan `computeReleaseCountdowns` uses for series, but returns the id
@@ -306,11 +244,11 @@ export function formatTargetDate(targetMs: number): string {
 }
 
 // ---------------------------------------------------------------------------
-// React tick hook — re-renders the caller so countdowns advance live.
+// React tick hook: re-renders the caller so countdowns advance live.
 //
 // IMPORTANT: call this in the SMALLEST component that actually shows the
 // countdown text (a leaf display component), never in a heavy parent like
-// DetailViewBody or a Continue-Watching row — otherwise the whole subtree
+// DetailViewBody or a Continue-Watching row; otherwise the whole subtree
 // re-renders every second. The set of countdowns (computeReleaseCountdowns)
 // rarely changes, so compute that in the parent and let each leaf tick its
 // own value.
@@ -347,6 +285,12 @@ import { getAvailableEarlyVersion, subscribeAvailableEarly } from "./availableEa
  *  listed air date (availableEarly.ts), so an aired / unaired read updates. */
 export function useAvailableEarlyVersion(): number {
   return useSyncExternalStore(subscribeAvailableEarly, getAvailableEarlyVersion);
+}
+
+/** A film's early-release record (movieEarly.ts), re-read when one is noted. */
+export function useMovieEarly(id: string | null | undefined): MovieEarlyRecord | null {
+  useSyncExternalStore(subscribeMovieEarly, getMovieEarlyVersion);
+  return movieEarlyRecord(id);
 }
 
 /** Tick used only when the smallest VISIBLE unit is minutes. 30 s is a 2x

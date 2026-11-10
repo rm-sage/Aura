@@ -19,10 +19,11 @@
 // next card's is ready, then cross-fades. It never collapses to a loading
 // box between cards. See the Motion block below.
 //
-// Placement: see hoverPlacement.ts for the side. A panel with no clear side
-// covers other cards, so it lets the pointer through to them unless Alt is
-// held or the cursor is already on it (`covers`, below). A panel over free
-// space takes the pointer as it always did.
+// Placement: see hoverPlacement.ts for the side. In hover mode the panel
+// ALWAYS lets the pointer through unless Alt is held or the cursor is already
+// on it (`covers`, below), wherever it sits. It used to take the pointer when
+// it sat over free space, so the first and last cards of a short row (a
+// search result) behaved differently from the rest: one rule, every card.
 // ---------------------------------------------------------------------------
 
 import { useEffect, useLayoutEffect, useReducer, useRef, useState } from "react";
@@ -48,7 +49,9 @@ import {
 import { coverOf, pickPanelSide, type Box } from "./hoverPlacement";
 import { loadAuraSettings } from "./auraSettings";
 import { electMetaAddons } from "./addonElection";
-import { computeReleaseCountdowns, formatCountdown, formatTargetDate, isInTheaters, useCountdownNow } from "./releaseCountdown";
+import { computeReleaseCountdowns, describeReleaseBasis, formatCountdown, formatTargetDate, inTheatersHover, isInTheaters, releaseDayWhere, useCountdownNow, useMovieEarly, type ReleaseCountdown } from "./releaseCountdown";
+import { describeMovieEarly, earlyRecordFor, earlyTag, earlyUncheckedHover, earlyUncheckedLabel, isOutEarly, type MovieEarlyRecord } from "./movieEarly";
+import ReleaseBasisTag, { EarlyReleaseTag } from "./ReleaseBasisTag";
 import { useMovieReleaseDates } from "./releaseDates";
 
 const PANEL_W = 360;
@@ -189,21 +192,60 @@ function Heading({ children }: { children: React.ReactNode }) {
 
 /** Live, self-ticking release-countdown chip. Owns its own 1 s tick so only
  *  this node re-renders each second, not the whole hover panel (cast grid,
- *  ratings, etc.). */
-function HoverCountdownChip({ label, targetMs, estimated }: { label: string; targetMs: number; estimated?: boolean }) {
+ *  ratings, etc.). A movie date carries its basis tag (Confirmed / Reported /
+ *  Estimate) and the matching hover text, same as the detail page's
+ *  CountdownStat; an episode countdown has neither. */
+function HoverCountdownChip({ countdown, userRegion, early }: {
+  countdown: ReleaseCountdown;
+  userRegion?: string | null;
+  /** A film's Digital date: its early-release record as the detail page's
+   *  stream fetch left it (movieEarly.ts), null when it can be checked and
+   *  has not been; absent when it is not checked at all. The panel never
+   *  checks itself. */
+  early?: MovieEarlyRecord | null;
+}) {
   const now = useCountdownNow();
+  const wording = describeReleaseBasis(countdown, userRegion);
+  const estimate = countdown.basis === "estimated";
+  const earlyWording = early ? describeMovieEarly(early, releaseDayWhere(countdown)) : null;
+  const tag = early ? earlyTag(early, false, estimate) : null;
+  const out = isOutEarly(early?.kind);
+  const hover = [
+    wording?.hover ?? formatTargetDate(countdown.targetMs),
+    early === null ? earlyUncheckedHover(estimate) : earlyWording?.hover,
+  ].filter(Boolean).join(" ");
+  // One line per countdown: the value never wraps and carries at most ONE
+  // chip (the basis, or Verified / Unverified once out). Anything else the
+  // check has to say sits on a quiet line under it, aligned with the text,
+  // so three chips never pile up beside a wrapping timer.
+  const subline = early === null
+    ? earlyUncheckedLabel(estimate)
+    : tag && !out ? tag.label : null;
   return (
-    <span
-      title={estimated ? `${formatTargetDate(targetMs)} (estimated)` : formatTargetDate(targetMs)}
-      className="inline-flex items-center gap-1 text-[11.5px] font-semibold text-ln-accent"
-    >
-      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden>
-        <circle cx="12" cy="12" r="9" />
-        <path d="M12 7v5l3 2" strokeLinecap="round" strokeLinejoin="round" />
-      </svg>
-      {/* "~" marks the PVOD-window estimate vs an authoritative MDBList date. */}
-      {label} in {estimated ? "~" : ""}{formatCountdown(targetMs, now)}
-    </span>
+    <div title={hover} className="flex flex-col min-w-0">
+      <span className={`inline-flex items-center gap-1 text-[11.5px] font-semibold whitespace-nowrap ${out ? "text-emerald-300" : "text-ln-accent"}`}>
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="flex-shrink-0" aria-hidden>
+          <circle cx="12" cy="12" r="9" />
+          <path d="M12 7v5l3 2" strokeLinecap="round" strokeLinejoin="round" />
+        </svg>
+        {out && earlyWording?.value
+          ? `${countdown.label}: ${earlyWording.value}`
+          : `${countdown.label} in ${formatCountdown(countdown.targetMs, now)}`}
+        {countdown.basis && !out && <span className="ml-0.5"><ReleaseBasisTag basis={countdown.basis} /></span>}
+        {tag && out && <span className="ml-0.5"><EarlyReleaseTag tone={tag.tone} label={tag.label} /></span>}
+      </span>
+      {subline && (
+        <span className="inline-flex items-center gap-1 pl-4 mt-0.5 text-[10.5px] text-white/45 whitespace-nowrap">
+          {early === null && (
+            <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                 strokeWidth="3" strokeDasharray="4 3.5" className="flex-shrink-0" aria-hidden>
+              <circle cx="12" cy="12" r="8" />
+            </svg>
+          )}
+          {subline}
+        </span>
+      )}
+    </div>
   );
 }
 
@@ -362,11 +404,11 @@ function measurePlacement(
   const side = pickPanelSide({
     fitsLeft, fitsRight, coverLeft, coverRight, card: rect, entry: target.entry ?? null, prevSide,
   });
-  // Fitting neither way centres the panel, over the hovered card itself.
-  const covers = !fitsLeft && !fitsRight ? true : (side === "left" ? coverLeft : coverRight) > 0;
   // Only a hover has a pointer to let through: the other modes open on an
-  // explicit press and close on an explicit dismiss.
-  return { side, covers: covers && loadAuraSettings().metaPanelActivation === "hover" };
+  // explicit press and close on an explicit dismiss. In hover mode it is let
+  // through everywhere, over free space too (user's call: one rule for every
+  // card, so Alt is always what lets you onto the panel).
+  return { side, covers: loadAuraSettings().metaPanelActivation === "hover" };
 }
 
 function HoverPanel({
@@ -926,8 +968,8 @@ function HoverPanel({
             )}
           </div>
         </div>
-        {/* Only where the panel lets the pointer through: over free space it
-            can simply be moved onto, and this would be noise. A footer, because
+        {/* Wherever the panel lets the pointer through (every hover-mode
+            panel; the click modes take the pointer). A footer, because
             a panel in pass-through cannot be scrolled to anything below the
             scroller's fold. Always mounted, out of flow and unseen until
             needed, so the placement can count its height before it shows. */}
@@ -1008,9 +1050,13 @@ function PanelContent({
   // airing or fully caught up.
   const episodesBehind = useEpisodesBehind(detail?.videos, meta.id);
 
-  // Accurate Digital + Theatrical dates (MDBList) for the Digital countdown
-  // and the "In Theaters" tag. null for non-movies / before it lands.
+  // Theatrical + Digital dates for the user's region (TMDB, then MDBList)
+  // for the countdowns and the "In Theaters" tag. null for non-movies /
+  // before it lands.
   const releaseDates = useMovieReleaseDates(meta.id, meta.media_type);
+  // The early-release record the detail page's stream fetch left for this
+  // film (movieEarly.ts); read only, never fetched from here.
+  const movieEarly = useMovieEarly(meta.media_type === "movie" ? meta.id : null);
 
   // Release countdown(s) — next-episode / premiere for series, cinematic +
   // digital for movies. Computed once per render; the hover panel is too
@@ -1078,7 +1124,8 @@ function PanelContent({
         <div className="mt-1.5">
           <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded
                            bg-amber-500/20 border border-amber-400/40 text-amber-100
-                           text-[11px] font-semibold">
+                           text-[11px] font-semibold cursor-help"
+                title={inTheatersHover(releaseDates)}>
             <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
               <path d="M22 10V6c0-1.1-.9-2-2-2H4c-1.1 0-1.99.9-1.99 2v4c1.1 0 1.99.9 1.99 2s-.89 2-2 2v4c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2v-4c-1.1 0-2-.9-2-2s.9-2 2-2z" />
             </svg>
@@ -1088,9 +1135,20 @@ function PanelContent({
       )}
 
       {countdowns.length > 0 && (
-        <div className="flex flex-wrap items-center gap-x-3 gap-y-1 mt-1.5">
+        <div className="flex flex-col gap-1 mt-1.5">
           {countdowns.map((c) => (
-            <HoverCountdownChip key={c.kind} label={c.label} targetMs={c.targetMs} estimated={c.estimated} />
+            <HoverCountdownChip
+              key={c.kind}
+              countdown={c}
+              userRegion={releaseDates?.region}
+              // Only the record checked against this day and basis (on the
+              // +45-day Estimate it reads "Streams available"). Only a film's
+              // Digital date is checked, and only once the dates have landed
+              // (the detail page checks under the same rule).
+              early={c.kind === "digital" && meta.media_type === "movie" && releaseDates
+                ? earlyRecordFor(movieEarly, c.targetMs, c.basis === "estimated")
+                : undefined}
+            />
           ))}
         </div>
       )}

@@ -1,7 +1,7 @@
 // Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import type { StreamEntry } from "./types";
+import type { StreamEntry, StreamFacts } from "./types";
 
 // ---------------------------------------------------------------------------
 // streamMeta — extract structured chip data from an addon's stream output.
@@ -92,6 +92,9 @@ export interface ParsedStream {
   seeders: number | null;
   /** Age string after seeders (`· 2 days`). */
   age: string | null;
+  /** The file's running time ("2h 53m"), from AIOStreams' streamData only:
+   *  no formatter prints it. */
+  duration: string | null;
 
   // ── PROXY / SERVICE / ADDON. ───────────────────────────────────────
   /** VPS-proxy state encoded by AIOStreams' shield glyphs.
@@ -150,13 +153,19 @@ export interface ParsedStream {
   seadexAlt: boolean;
   /** NZB health classification. */
   nzbHealth: "verified" | "elf" | "unverified" | "broken" | null;
-  /** Trailing subscript score (e.g. ₂₅ → 25, ₋₅ → -5). */
+  /** AIOStreams' stream expression score: the summed score of the user's
+   *  ranked stream expressions this stream matched (the trailing subscript,
+   *  ₂₅ → 25, ₋₅ → -5, or `streamData.streamExpressionScore`). */
   seScore: number | null;
   /** Whatever remains after the ` » ` separator once seadex / NZB / score are
    *  taken out: AIOStreams' release-scoring matches, plus the newer
    *  `stream.network` and `stream.editions` fields. Kept as free text so new
    *  upstream additions surface as chips instead of being silently swallowed. */
   releaseFlags: string[];
+  /** The ranked stream expressions this stream matched, one name each, from
+   *  AIOStreams' streamData (empty without it; the formatter's text runs
+   *  them together, and then they stay in \`releaseFlags\`). */
+  expressions: string[];
 
   // ── LEGACY fallback fields (kept for compatibility). ───────────────
   /** Codec — kept for back-compat with non-AIOStreams parsing. Mirrors
@@ -352,21 +361,48 @@ const SMALLCAPS_RX = (() => {
   return new RegExp(`(?:${escaped.join("|")})`, "gu");
 })();
 
+/** A run of small capitals and plain lowercase ASCII: one word as the
+ *  formatter writes it. Three letters have no small capital it uses (s, x,
+ *  q), so it writes them plain: `sᴇᴀᴅᴇx`, `sᴜʙ`, `ʙᴇsᴛ`. */
+const SMALLCAPS_WORD_RX = new RegExp(`[a-z${Object.keys(SMALLCAPS_MAP).join("")}]+`, "gu");
+/** Look-alikes from real alphabets (Cyrillic, Greek, a Latin letter with an
+ *  ogonek). They are mapped only inside a word that also has a TRUE small
+ *  capital, so "Тихий" or "Hǫnir" is left as written. */
+const SMALLCAPS_HOMOGLYPHS = new Set(["ғ", "х", "ϙ", "ǫ"]);
+const HAS_SMALLCAP_RX = new RegExp(
+  `[${Object.keys(SMALLCAPS_MAP).filter((k) => !SMALLCAPS_HOMOGLYPHS.has(k)).join("")}]`,
+  "u",
+);
+
+/** Map small capitals to capitals a WORD at a time, BEFORE NFKC: a word with
+ *  any small capital is all capitals, so its plain s / x / q go up with it
+ *  ("sᴇᴀᴅᴇx" read "sEADEx"). Superscripts sit outside the run, so
+ *  `ᴇɴᶠᵒʳᶜᵉᵈ` stays "EN" + "forced" once NFKC lowers them. */
+function mapSmallCaps(s: string): string {
+  return s.replace(SMALLCAPS_WORD_RX, (w) =>
+    HAS_SMALLCAP_RX.test(w) ? w.replace(SMALLCAPS_RX, (c) => SMALLCAPS_MAP[c] ?? c).toUpperCase() : w,
+  );
+}
+
 /** Collapse Unicode superscripts / smallcaps / subscripts to ASCII via
  *  NFKC, then apply manual smallcaps-Latin → uppercase mapping for
  *  blocks NFKC leaves untouched. Also forces every dash variant to a
  *  plain `-` and strips VS-16 selectors. */
 function normaliseLineForRegex(s: string): string {
-  let out = s
+  let out = mapSmallCaps(s)
     .normalize("NFKC")
     // Strip BOTH variation selectors. VS-16 (U+FE0F, emoji presentation) and
     // VS-15 (U+FE0E, text presentation) - the library glyph is emitted as
     // `☁︎` = U+2601 U+FE0E, and a surviving VS-15 rode along into the parsed
     // display title as an invisible leading character.
     .replace(/[\u{FE0E}\u{FE0F}]/gu, "")
+    // Zero-width joiners and spaces: the formatter pads the Name field with
+    // them and they rode along inside values ("Web" ZWJ "-" ZWJ "dl").
+    .replace(/[\u{200B}-\u{200D}\u{2060}\u{FEFF}]/gu, "")
     .replace(/[‐‑‒–—−]/g, "-");
-  // Smallcaps → ASCII (preserves case as uppercase for visibility).
-  out = out.replace(SMALLCAPS_RX, (c) => SMALLCAPS_MAP[c] ?? c);
+  // Small capitals were mapped a word at a time above (mapSmallCaps); a
+  // second, letter-by-letter pass here turned Cyrillic "х" in real titles
+  // into "X".
   return out;
 }
 
@@ -464,24 +500,33 @@ function parseSeederValue(raw: string): { count: number | null; age: string | nu
 
 /** Parse the size line — handles size, optional `/folderSize`, optional
  *  `· bitrate`. */
+/** An age as the formatter writes it: "352d", "5h", "3mo", "2y". */
+const AGE_TOKEN_RX = /^\d+(?:\.\d+)?\s*(?:mo|[mhdwy])$/i;
+
 function parseSizeLine(raw: string): {
   size: string | null;
   folderSize: string | null;
   bitrate: string | null;
+  age: string | null;
 } {
   let size: string | null = null;
   let folderSize: string | null = null;
   let bitrate: string | null = null;
 
-  // Bitrate may sit at the tail after `·`. Pull it out first.
-  const dot = raw.lastIndexOf("·");
-  let head = raw;
-  if (dot >= 0) {
-    const tail = raw.slice(dot + 1).trim();
-    const br = BITRATE_RX.exec(tail);
-    if (br) {
+  let age: string | null = null;
+  // The parts after the size: bit rate and, in newer TamTaro, the age
+  // (`6.45 / 159 GB · 35.8 Mbps · 352d`). Each "·" part is classified on
+  // its own; the age used to be dropped here.
+  const parts = raw.split("·").map((p) => p.trim());
+  let head = parts[0] ?? raw;
+  for (const part of parts.slice(1)) {
+    const br = BITRATE_RX.exec(part);
+    if (br && !bitrate) {
       bitrate = `${br[1]} ${br[2].slice(0, 1).toUpperCase()}${br[2].slice(1).toLowerCase()}`;
-      head = raw.slice(0, dot).trim();
+    } else if (AGE_TOKEN_RX.test(part) && !age) {
+      age = part.replace(/\s+/g, "");
+    } else if (!SIZE_RX.test(head)) {
+      head = `${head} ${part}`;
     }
   }
 
@@ -517,7 +562,7 @@ function parseSizeLine(raw: string): {
     }
   }
 
-  return { size, folderSize, bitrate };
+  return { size, folderSize, bitrate, age };
 }
 
 /** Parse the proxy/service/addon line:
@@ -559,6 +604,15 @@ function parseProxyServiceAddon(raw: string): {
   return { serviceShort, addonName, releaseGroupOrIndexer, privateFlag };
 }
 
+/** One subtitle token: "EN", or a code with the formatter's superscript
+ *  qualifier, which NFKC leaves glued on in lower case ("ENforced" ->
+ *  "EN forced", "ENdub" -> "EN dub": the signs track for the dub). */
+function subtitleLabel(t: string): string {
+  const m = /^([A-Z]{2,3})([a-z]{2,})$/.exec(t);
+  if (m) return `${m[1]} ${m[2]}`;
+  return t.toUpperCase();
+}
+
 /** Parse the language line:
  *    "JP · EN"             → ["JP", "EN"], no sub
  *    "JP · EN · sub (EN)"  → ["JP", "EN"], subbed = true, subs = ["EN"]
@@ -575,7 +629,7 @@ function parseLanguageLine(raw: string): {
   // Trailing subtitle codes in parens.
   const subParen = /\(([^)]+)\)\s*$/.exec(s);
   if (subParen) {
-    subtitles.push(...splitOnDot(subParen[1]).map((c) => c.toUpperCase()));
+    subtitles.push(...splitOnDot(subParen[1]).map(subtitleLabel));
     s = s.slice(0, subParen.index).trim();
   }
 
@@ -658,7 +712,7 @@ function parseMetadataFlags(raw: string): {
   const leftover = cleanupResidue(s);
   const flags = leftover.length === 0
     ? []
-    : [leftover.length > 60 ? `${leftover.slice(0, 59)}…` : leftover];
+    : [leftover];
 
   return { seadexBest, seadexAlt, nzbHealth, seScore, flags };
 }
@@ -666,6 +720,117 @@ function parseMetadataFlags(raw: string): {
 // ---------------------------------------------------------------------------
 // Main entry point.
 // ---------------------------------------------------------------------------
+
+/** Bytes as AIOStreams prints them: DECIMAL units, three significant
+ *  digits, no trailing zeros (6_447_549_338 -> "6.45 GB", 159_142_692_487 ->
+ *  "159 GB", 2_000_000_000 -> "2 GB"), so a filled size reads like the
+ *  formatter's own in the same list. */
+export function formatStreamBytes(n: number): string {
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let v = n;
+  let i = 0;
+  while (v >= 999.5 && i < units.length - 1) { v /= 1000; i++; }
+  return `${i === 0 ? Math.round(v) : parseFloat(v.toPrecision(3))} ${units[i]}`;
+}
+
+/** A running time: 10_380_000 ms -> "2h 53m", 2_700_000 -> "45m". */
+export function formatStreamDuration(ms: number): string {
+  const totalMin = Math.round(ms / 60_000);
+  const h = Math.floor(totalMin / 60);
+  const m = totalMin % 60;
+  return h > 0 ? `${h}h ${m}m` : `${Math.max(1, m)}m`;
+}
+
+/** Whole units, rounded down, as AIOStreams writes them (8467 h -> "352d"),
+ *  so a fact never reads a day apart from the formatter's own text. */
+function formatAgeHours(h: number): string {
+  if (h < 1) return "<1h";
+  if (h < 24) return `${Math.floor(h)}h`;
+  return `${Math.floor(h / 24)}d`;
+}
+
+/** The indexers in an indexer field: a scraper joins every indexer that had
+ *  the file ("stremthru-corpus,zilean,nyaa" / "StremThru|Knaben"). */
+export function indexerNames(indexer: string | null | undefined): string[] {
+  if (!indexer) return [];
+  const out: string[] = [];
+  for (const raw of indexer.split(/[,|]/)) {
+    const n = raw.trim();
+    if (n && !out.some((o) => o.toLowerCase() === n.toLowerCase())) out.push(n);
+  }
+  return out;
+}
+
+/** A title line the formatter cut short ("The Apothecary Diari…"), made
+ *  whole from the title parsed off the file name when that one starts the
+ *  same way. Anything else keeps the formatter's text. */
+function untruncateTitle(shown: string, full: string | null): string {
+  const m = /^(.*?)\s*(?:…|\.\.\.)$/u.exec(shown);
+  if (!m || !full) return shown;
+  // Letters and digits only: the shown line has lost punctuation ("Re Zero"
+  // for "Re:Zero").
+  const key = (t: string) => t.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "");
+  const head = key(m[1]);
+  const whole = key(full);
+  return head.length >= 3 && whole.startsWith(head) && whole.length > head.length ? full : shown;
+}
+
+/** The text flags with the expression names taken out (the formatter runs
+ *  them together: "WEB T2 WEB T6"); what is left is something else
+ *  (network, editions) and stays. */
+function flagsBesides(flags: string[], names: string[]): string[] {
+  const out: string[] = [];
+  for (const f of flags) {
+    let rest = f;
+    for (const n of names) {
+      const rx = new RegExp(
+        `(?<![\\p{L}\\p{N}])${n.trim().split(/\s+/).map(escapeRx).join("\\s*")}(?![\\p{L}\\p{N}])`,
+        "iu",
+      );
+      rest = rest.replace(rx, " ");
+    }
+    const left = cleanupResidue(rest);
+    if (left) out.push(left);
+  }
+  return out;
+}
+
+/** AIOStreams' structured facts beat the formatter's text where the text is
+ *  lossy: a formatter can TRUNCATE a field ("The Pirate Ba...") or JOIN two
+ *  ("CiNEPHiLES · The Pirate Bay" read as one release group), and a custom
+ *  formatter can leave a field out. Release group, indexer and seeders are
+ *  replaced outright (exact on the wire); size, folder size, age and cache
+ *  state only fill a field the text did not give, so a formatter's own
+ *  wording of them stays. */
+function applyStreamFacts(out: ParsedStream, f: StreamFacts | null): void {
+  if (!f) return;
+  if (f.release_group || f.indexer) {
+    out.releaseGroup = f.release_group ?? null;
+    out.indexer = f.indexer ?? null;
+    // Never the same name twice (an NZB's "group" field is its indexer).
+    if (out.releaseGroup && out.indexer
+        && out.releaseGroup.toLowerCase() === out.indexer.toLowerCase()) out.releaseGroup = null;
+  }
+  if (f.seeders != null) out.seeders = f.seeders;
+  if (f.private === true) out.private = true;
+  if (!out.size && f.size) out.size = formatStreamBytes(f.size);
+  if (!out.folderSize && f.folder_size && f.folder_size !== f.size) {
+    out.folderSize = formatStreamBytes(f.folder_size);
+  }
+  if (!out.age && f.age_hours != null) out.age = formatAgeHours(f.age_hours);
+  if (out.cachedStatus == null && f.cached != null) out.cachedStatus = f.cached ? "cached" : "uncached";
+  if (f.duration_ms) out.duration = formatStreamDuration(f.duration_ms);
+  if (out.displayTitle) out.displayTitle = untruncateTitle(out.displayTitle, f.title ?? null);
+  // The expression names, one chip each, in their own spelling, instead of
+  // the formatter's run of small capitals ("sEADEx BEsT").
+  const names = f.expressions ?? [];
+  if (names.length > 0) {
+    out.expressions = [...names];
+    out.releaseFlags = flagsBesides(out.releaseFlags, names);
+  }
+  // A score of 0 is no match at all; the text shows none either.
+  if (out.seScore == null && f.expression_score) out.seScore = f.expression_score;
+}
 
 export function parseStream(s: StreamEntry): ParsedStream {
   // Split title and description into normalised lines. We keep them
@@ -690,6 +855,7 @@ export function parseStream(s: StreamEntry): ParsedStream {
     ripType: null,
     stars: 0,
     cachedStatus: null,
+    duration: null,
     streamType: null,
     displayTitle: null,
     library: false,
@@ -722,6 +888,7 @@ export function parseStream(s: StreamEntry): ParsedStream {
     nzbHealth: null,
     seScore: null,
     releaseFlags: [],
+    expressions: [],
     codec: null,
     hdr: null,
     audio: null,
@@ -804,7 +971,9 @@ export function parseStream(s: StreamEntry): ParsedStream {
     const am = AUDIO_RX.exec(fullBody);
     if (am) out.audio = am[1].toUpperCase().replace(/\s+/g, "");
   }
-  if (!out.size) {
+  // A size-shaped token anywhere in the body is a guess (it can be the pack
+  // size); AIOStreams' own size, when it sent one, fills the field instead.
+  if (!out.size && !s.facts?.size) {
     const szm = SIZE_RX.exec(fullBody);
     if (szm) out.size = `${szm[1]} ${szm[2].toUpperCase()}`;
   }
@@ -857,6 +1026,8 @@ export function parseStream(s: StreamEntry): ParsedStream {
   // party" for traffic that never left the addon's IP. An explicit proxy flag
   // still wins: if the addon says it IS proxying, that's the stronger claim.
   if (out.proxyState !== "on" && out.serviceShort === "AIO") out.proxyState = "self";
+
+  applyStreamFacts(out, s.facts ?? null);
 
   // ── 4) Build the displayed `primary` and `extra`. ───────────────────
   // For AIOStreams entries (recognised when displayTitle was set), we
@@ -1012,7 +1183,8 @@ function handleSegment(glyph: string, value: string, out: ParsedStream): boolean
       if (info.size)       out.size = info.size;
       if (info.folderSize) out.folderSize = info.folderSize;
       if (info.bitrate)    out.bitrate = info.bitrate;
-      return Boolean(info.size || info.folderSize || info.bitrate);
+      if (info.age && !out.age) out.age = info.age;
+      return Boolean(info.size || info.folderSize || info.bitrate || info.age);
     }
 
     // ⇄ - seeder count and stream age.

@@ -99,7 +99,8 @@ fn client() -> &'static reqwest::Client {
 /// Resolve the TMDB key: a user-supplied key in the OS keyring wins, else the
 /// build-time baked one. `None` when neither is set, which makes every public
 /// entry point here return `Ok(None)` without touching the network.
-fn tmdb_key() -> Option<String> {
+/// Shared with `release_dates.rs` (movie release dates by region).
+pub(crate) fn tmdb_key() -> Option<String> {
     if let Some(k) = crate::api_keyring::read("tmdb") {
         let t = k.trim().to_string();
         if !t.is_empty() {
@@ -122,7 +123,11 @@ pub async fn story_arcs_available() -> bool {
 
 /// GET a TMDB path, with the api_key appended. Retries 429 / 5xx a few times
 /// with a bounded backoff, because TMDB rate-limits a shared key.
-async fn tmdb_get(path: &str, key: &str) -> Result<String, String> {
+/// Shared with `release_dates.rs`. reqwest's Display appends the request URL,
+/// which carries the key, so every transport error is stripped of it here
+/// (`without_url`): callers log these errors (`[arcs]`) and the frontend
+/// warns with them, which reaches the DevConsole and exported logs.
+pub(crate) async fn tmdb_get(path: &str, key: &str) -> Result<String, String> {
     let sep = if path.contains('?') { '&' } else { '?' };
     let url = format!("{TMDB_API}{path}{sep}api_key={key}&language=en-US");
     let mut delay_ms = 250u64;
@@ -133,7 +138,7 @@ async fn tmdb_get(path: &str, key: &str) -> Result<String, String> {
             Ok(resp) => {
                 let status = resp.status();
                 if status.is_success() {
-                    return resp.text().await.map_err(|e| e.to_string());
+                    return resp.text().await.map_err(|e| e.without_url().to_string());
                 }
                 if status.as_u16() == 401 {
                     // A bad key is not retryable and is worth surfacing loudly:
@@ -145,7 +150,7 @@ async fn tmdb_get(path: &str, key: &str) -> Result<String, String> {
                     return Err(last);
                 }
             }
-            Err(e) => last = e.to_string(),
+            Err(e) => last = e.without_url().to_string(),
         }
         if attempt < 3 {
             tokio::time::sleep(Duration::from_millis(delay_ms)).await;

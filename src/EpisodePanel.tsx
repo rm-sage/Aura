@@ -23,7 +23,7 @@
 // than the dropdown for legibility over a bright paused frame.
 // ---------------------------------------------------------------------------
 
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import ImageLoader from "./ImageLoader";
 import { shrinkPoster } from "./posterSize";
 import SeasonSelect from "./SeasonSelect";
@@ -32,6 +32,7 @@ import { getMetaDetailFallback, peekCachedDetailById } from "./metaCache";
 import { getSortedEpisodes } from "./episodeSort";
 import { loadAuraSettings } from "./auraSettings";
 import { shouldBlurThumbnail, isEpisodeWatched } from "./episodeSpoilers";
+import { seasonScrollAnchor } from "./seasonScroll";
 import { episodeKindFlags, formatEpisodeTag } from "./nextUp";
 import FillerRecapTags from "./FillerRecapTags";
 import { isSkipped, useSkipMarksVersion } from "./skipMarks";
@@ -43,7 +44,7 @@ import { PlayerMenuChip } from "./playerMenu";
 import ArcGrid, { ArcGridSkeleton } from "./ArcGrid";
 import GroupingToggle from "./EpisodeGroupingToggle";
 import {
-  useStoryArcs, loadArcMode, saveArcMode, preferredGroupingId,
+  useStoryArcs, loadArcMode, saveArcMode, preferredGroupingId, arcResultIsInterim,
   arcPositionOf, absoluteEpisodeMap, arcsLikelyAvailable, absoluteEpisodeHint,
   type EpisodeGrouping, type StoryArc,
 } from "./storyArcs";
@@ -216,7 +217,12 @@ function EpisodePanel({
   // Whichever list is actually on screen: a season, or an open arc.
   const visibleEpisodes = arcMode ? (openArc ? inArc : []) : inSeason;
 
+  // Armed by a season pick, or by leaving Arcs for the season list, which reuses the
+  // scroller the grid or open arc left an offset in. Consumed by the landing effect.
+  const seasonPickedRef = useRef(false);
+
   const switchGrouping = useCallback((next: EpisodeGrouping) => {
+    if (next === "seasons" && grouping === "arcs") seasonPickedRef.current = true;
     setGrouping(next);
     saveArcMode(seriesId, next, groupingId);
     // Entering Arcs: open the arc that holds the episode currently playing, so
@@ -225,7 +231,7 @@ function EpisodePanel({
       const anchor = currentEpisodeId;
       setOpenArcId(anchor ? arcPositionOf(arcResult, anchor)?.arc.id ?? null : null);
     }
-  }, [seriesId, groupingId, arcResult, currentEpisodeId]);
+  }, [seriesId, grouping, groupingId, arcResult, currentEpisodeId]);
 
   const switchGroupingId = useCallback((id: string) => {
     setGroupingId(id);
@@ -239,13 +245,15 @@ function EpisodePanel({
   useEffect(() => { arcAnchoredRef.current = false; }, [open, seriesId]);
   useEffect(() => {
     if (!arcMode || !arcResult || arcAnchoredRef.current) return;
-    if (openArcId) { arcAnchoredRef.current = true; return; }
+    if (arcResultIsInterim(arcResult, groupingId)) return;
+    // The resolved arc, not the id: an id left over from the interim grouping opens nothing.
+    if (openArc) { arcAnchoredRef.current = true; return; }
     if (!currentEpisodeId) return;
     const pos = arcPositionOf(arcResult, currentEpisodeId);
     if (!pos) return;
     arcAnchoredRef.current = true;
     setOpenArcId(pos.arc.id);
-  }, [arcMode, arcResult, openArcId, currentEpisodeId]);
+  }, [arcMode, arcResult, groupingId, openArc, currentEpisodeId]);
 
   // Next-to-air episode across ALL seasons — its row shows the live
   // countdown chip. No per-second tick here; the chip owns its own.
@@ -280,7 +288,52 @@ function EpisodePanel({
       el?.scrollIntoView({ block: "center" });
     }, 60);
     return () => window.clearTimeout(id);
-  }, [open, currentEpisodeId, season, openArcId, arcMode]);
+    // The pending flags: season rows mounting after the arc skeleton move nothing else.
+  }, [open, currentEpisodeId, season, openArcId, arcMode, arcPending, arcsLikelyPending]);
+
+  // Seasons, an open arc and the arc grid all swap their contents inside this one
+  // scroller, which would otherwise keep its scrollTop. Layout effects, so the old
+  // offset never paints. A list holding the playing episode lands on that row, as the
+  // effect above does on open; otherwise on the latest watched.
+  const landList = (episodes: VideoEntry[]) => {
+    const list = listRef.current;
+    if (!list) return;
+    const target = episodes.some((v) => v.id === currentEpisodeId)
+      ? currentEpisodeId
+      // A skipped episode is stored as a watched mark, but it is not where the
+    // user got to: "Skip the filler" at E110 marks every filler through E220.
+      : seasonScrollAnchor(episodes, (id) => isEpisodeWatched(libraryById, id) && !isSkipped(id));
+    const row = target ? list.querySelector(`[data-ep-id="${CSS.escape(target)}"]`) : null;
+    if (row) row.scrollIntoView({ block: "center" });
+    else list.scrollTop = 0;
+  };
+
+  const pickSeason = (next: number) => {
+    if (next !== season) seasonPickedRef.current = true;
+    setSeason(next);
+  };
+  useLayoutEffect(() => {
+    if (!seasonPickedRef.current) return;
+    // The header's picker stays live over the arc skeleton: hold the pick until the
+    // rows it is about have mounted.
+    if (arcPending || arcsLikelyPending) return;
+    seasonPickedRef.current = false;
+    // Arcs resolved over the pick, so the season list never appeared.
+    if (arcMode) return;
+    landList(inSeason);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [season, inSeason, currentEpisodeId, libraryById, arcPending, arcsLikelyPending, arcMode]);
+
+  // Once per opening of an arc, so a refreshed library or arc result does not move a
+  // list the user is reading.
+  const landedArcRef = useRef<string | null>(null);
+  useLayoutEffect(() => {
+    if (!open || !openArc) { landedArcRef.current = null; return; }
+    if (inArc.length === 0 || landedArcRef.current === openArc.id) return;
+    landedArcRef.current = openArc.id;
+    landList(inArc);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, openArc, inArc, currentEpisodeId, libraryById]);
 
   // Escape closes (matches the other player submenus).
   useEffect(() => {
@@ -371,7 +424,7 @@ function EpisodePanel({
             ) : arcMode ? (
               <span className="text-[16px] font-semibold tracking-tight text-white">Arcs</span>
             ) : seasons.length > 1 ? (
-              <SeasonSelect seasons={seasons} value={season} onChange={setSeason} />
+              <SeasonSelect seasons={seasons} value={season} onChange={pickSeason} />
             ) : (
               <span className="text-[16px] font-semibold tracking-tight text-white">Episodes</span>
             )}
@@ -421,6 +474,7 @@ function EpisodePanel({
                 onSelect={(arc) => setOpenArcId(arc.id)}
                 onGroupingChange={switchGroupingId}
                 chapterLabelFor={arcChapterLabel}
+                pinnedEpisodeId={currentEpisodeId}
               />
             )
           ) : arcPending || arcsLikelyPending ? (

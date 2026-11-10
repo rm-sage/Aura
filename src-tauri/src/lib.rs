@@ -61,6 +61,7 @@ mod popup_nav;
 mod player;
 mod publicmetadb;
 mod ratings;
+mod release_dates;
 mod runtime_deps;
 mod scrobble;
 mod scrobble_anilist;
@@ -2631,8 +2632,8 @@ pub fn run() {
             stremio::fetch_streams,
             // ── Multi-source ratings (MDBList + MAL via Tenrai) ──────────────
             ratings::fetch_aggregate_ratings,
-            // ── Accurate movie Digital/Theatrical dates (MDBList) ────────────
-            ratings::fetch_movie_release_dates,
+            // ── Movie Digital/Theatrical dates (TMDB by region, MDBList) ─────
+            release_dates::fetch_movie_release_dates,
             // ── Landscape (16:9) art resolution via AIOMeta ──────────────────
             stremio::fetch_landscape_art,
             // ── Phase 5.5: external subtitles fan-out ────────────────────────

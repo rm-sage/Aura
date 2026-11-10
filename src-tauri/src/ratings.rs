@@ -191,7 +191,10 @@ fn norm_date(d: Option<String>) -> Option<String> {
 /// Fetch (theatrical, digital) release dates for a movie by IMDb id from
 /// MDBList. Best-effort: any failure (no key, network, parse, no record)
 /// yields `(None, None)` and the caller falls back to its estimate.
-async fn mdblist_release_dates(imdb_id: &str) -> (Option<String>, Option<String>) {
+/// The FALLBACK source now: `release_dates.rs` prefers TMDB's per-country
+/// rows, because MDBList's dates proved wrong (The Odyssey's digital date
+/// was 10 days early) and carry no region.
+pub(crate) async fn mdblist_release_dates(imdb_id: &str) -> (Option<String>, Option<String>) {
     if MDBLIST_KEY.is_empty() {
         return (None, None);
     }
@@ -209,30 +212,6 @@ async fn mdblist_release_dates(imdb_id: &str) -> (Option<String>, Option<String>
         Err(_) => return (None, None),
     };
     (norm_date(data.released), norm_date(data.released_digital))
-}
-
-/// Movie release dates returned to the frontend. Both `YYYY-MM-DD` when
-/// known; either may be absent. The fields serialise as `theatrical` /
-/// `digital` (Rust field names → Tauri's outgoing JSON), matching the
-/// `ReleaseDates` TS interface in `src/releaseDates.ts`.
-#[derive(Clone, Debug, Default, Serialize)]
-pub struct MovieReleaseDates {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub theatrical: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub digital: Option<String>,
-}
-
-/// Accurate Digital + Theatrical release dates for a movie, by IMDb id.
-/// Non-`tt` ids resolve to empty (MDBList's `i` param is IMDb-keyed).
-/// Never errors — an unavailable date is simply `None`.
-#[tauri::command]
-pub async fn fetch_movie_release_dates(imdb_id: String) -> Result<MovieReleaseDates, String> {
-    if !imdb_id.starts_with("tt") {
-        return Ok(MovieReleaseDates::default());
-    }
-    let (theatrical, digital) = mdblist_release_dates(&imdb_id).await;
-    Ok(MovieReleaseDates { theatrical, digital })
 }
 
 // ---------------------------------------------------------------------------

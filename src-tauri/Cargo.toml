@@ -187,6 +187,10 @@ windows = { version = "0.61", features = [
     "Win32_System_SystemInformation",
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
+    # GetUserGeoID + GetGeoInfoW / GetUserDefaultLocaleName - the user's "Country
+    # or region" setting, which picks the TMDB release-date row (release_dates.rs).
+    # Never GetUserDefaultGeoName: Windows 10 1709+ only, and a load-time import.
+    "Win32_Globalization",
 ] }
 
 # Dev-profile slimming. The default debug profile produced ~43 GB of

@@ -362,6 +362,49 @@ export interface StreamEntry {
    *  this is the only real byte count available before a download's first
    *  response, and it is what the free-space preflight uses. */
   video_size?: number | null;
+  /** AIOStreams `streamData.earlyRelease`: this stream got through its
+   *  Digital Release Filter as an early release (a leak) of the film.
+   *  `evidence` marks a file that is itself the proof: its length matches
+   *  the film's runtime. Absent for every other stream and addon. */
+  early_release?: { source: string; evidence: boolean } | null;
+  /** AIOStreams' structured facts (`streamData`), preferred over the
+   *  formatter's text by `parseStream`. Absent without streamData. */
+  facts?: StreamFacts | null;
+}
+
+/** Rust `StreamFacts`: the `streamData` fields the stream row shows. */
+export interface StreamFacts {
+  release_group: string | null;
+  /** One indexer, or several joined by the scraper ("a,b,c" / "A|B"). */
+  indexer: string | null;
+  /** The title parsed from the file name (untruncates the title line). */
+  title: string | null;
+  /** The ranked stream expressions this stream matched, one name each. */
+  expressions: string[];
+  /** Their summed score (the formatter's trailing number). */
+  expression_score: number | null;
+  seeders: number | null;
+  private: boolean | null;
+  /** Bytes. */
+  size: number | null;
+  /** Bytes. */
+  folder_size: number | null;
+  age_hours: number | null;
+  duration_ms: number | null;
+  cached: boolean | null;
+}
+
+/** AIOStreams' "Early Release" notice data (`code: "earlyRelease"`). */
+export interface EarlyReleaseInfo {
+  /** "bypass" | "leakRecord" | "leakDetected". */
+  source: string | null;
+  detected_at: string | null;
+  /** The first 24 groups AIOStreams named. */
+  release_groups: string[];
+  /** How many it named in all. */
+  release_group_count: number;
+  runtime_minutes: number | null;
+  digital_release_date: string | null;
 }
 
 /** AIOStreams emits structured payloads alongside the canonical `streams`
@@ -387,6 +430,12 @@ export interface StreamMessage {
    *  the warnings the addon explicitly wants surfaced. False on the
    *  named-array shape (older AIOStreams instances and pre-patch). */
   forced?: boolean;
+  /** AIOStreams `streamData.code`: a stable name for the notice
+   *  ("digitalReleaseFilter", "earlyRelease"). Compare this, never the
+   *  wording; null from an AIOStreams that does not send it. */
+  code?: string | null;
+  /** The data of an "earlyRelease" notice. */
+  early_release?: EarlyReleaseInfo | null;
 }
 
 export interface StreamMetadata {
@@ -394,6 +443,10 @@ export interface StreamMetadata {
   warnings: StreamMessage[];
   info:     StreamMessage[];
   stats:    StreamMessage[];
+  /** Addons that were asked and gave no usable answer (send error, timeout,
+   *  non-2xx, bad JSON). They leave no message, so this is the only sign an
+   *  answer is missing one. Absent from an older build. */
+  failed_addons?: number;
 }
 
 export interface StreamFetchResult {

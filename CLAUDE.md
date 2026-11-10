@@ -1141,6 +1141,45 @@ Bound every cache (see Performance & memory).
   The cloud's `next_aired` ids follow the cloud's own source's numbering, not the local meta addon's, so "is the cloud's next episode already out" goes through `cloudNextIsOut`
   (by id, else by date against a recorded local episode), never a bare `availableEarlyAt(sig.id)`.
 - **Calendar meta**: 24-hour module-level `Map` keyed by `${addonUrl}::${type}::${id}`.
+- **Movie release dates** (`src-tauri/src/release_dates.rs`, `src/releaseDates.ts`, `src/movieRelease.ts`): the
+  frontend caches per IMDb id (cap 500): 5 min for an all-null answer or one whose TMDB lookup FAILED (`tmdb:
+  "failed"`), 6 h otherwise. Rust has no cache. The source order is TMDB's per-country release_dates for the
+  Windows "Country or region" (`GetUserGeoID` + `GetGeoInfoW`, else the locale's country, else US; NEVER
+  `GetUserDefaultGeoName`, a Win10 1709+ load-time import that stops aura.exe starting on older Win10), then US, then the
+  earliest country, then MDBList, then the +45-day estimate. MDBList is the LAST source on purpose: it gave Nolan's
+  The Odyssey a digital date of 2026-11-07 against TMDB's and Universal's 2026-11-17, and Aura then showed the film
+  as already digital. Never let a failed TMDB answer be cached long: it is answered from MDBList alone. The film is
+  found by `/find` on the IMDb id only, never the addon meta's `tmdb_id` (it can be a SERIES id). Re-release rows
+  and rows over 730 days after the first of their kind are not the release; another country's digital date before
+  the user's OWN theatrical run is dropped. Dates are local calendar days (local midnight), not UTC instants. Every
+  date shows its basis: Confirmed (a TMDB row), Reported (MDBList or the addon), Estimate. "In Theaters" lasts
+  until a known digital date (365 days at most), else 120 days; no source publishes a run's end, and its hover
+  says so. Devlog label `[release-dates]`.
+- **Movies out early** (`aura:movie-early:v1`, `src/movieEarly.ts`, cap 100, device-local): a film whose copies are
+  out before its official digital date (Nolan's The Odyssey leaked 2026-11-07, ten days before its US digital day).
+  A leak never moves the official date; the Digital countdown shows "Out early" beside it. The check is the DETAIL
+  PAGE's own movie stream fetch (user's call: no background fan-out); the Digital countdown says "Checking for early
+  copies" while it runs, and the hover panel only reads what it left. Evidence, strongest first: AIOStreams' "Early
+  Release" notice (`streamData.code: "earlyRelease"` + `data`) or a stream it flagged (`streamData.earlyRelease =
+  { source, evidence }`, Rust `StreamEntry.early_release`) is Verified with source leakDetected / leakRecord or a
+  proof file (`evidence: true`, a runtime match), else (source "bypass") Unverified; without AIOStreams, home-release
+  rows (WEB-DL, BluRay, REMUX, ...) are Unverified (a same-name film's files or another country's real release look
+  the same, so the bare scene tag WEB counts), theater rows (CAM, TS, TC) and unlabelled rows are notes. Only an
+  AIOStreams-backed record (Verified, Unverified-by-bypass) holds against a weaker answer; a guessed one is replaced
+  by the next real answer. An answer missing an addon that was asked (`StreamMetadata.failed_addons`: send error,
+  non-2xx, bad JSON, a panic; such failures leave no message) records only an early release. The check runs once the
+  dates have landed, against the Digital countdown day; on the +45-day Estimate (no digital date announced) the record
+  carries `estimate` and a find reads "Streams available", never "Out early" (nothing official to be early against).
+  Readers show a record only for the same day AND basis it was checked against (`earlyRecordFor`), and a hold applies
+  only within one. The hover panel shows a quiet "Not checked for early copies yet" ("... for streams yet" on the Estimate) line under the
+  Digital countdown for a film it could show a check for and has none; each countdown has its own line there and on the
+  detail page (under the facts row), so a countdown never shares a wrapped line with another. The stream-list note describes the list shown, not the stored record. The dedup in
+  `fetch_streams` carries a dropped duplicate's `early_release` onto the kept row. An early release lasts until the
+  official day (at most 120 days); anything else 6 h. AIOStreams
+  sends `streamData` only with PROVIDE_STREAM_DATA on (or to an "AIO" User-Agent). Notices are matched by
+  `StreamMessage.code` ("digitalReleaseFilter", "earlyRelease"), never by wording, except an older AIOStreams with
+  no code (`isDigitalReleaseFilterNotice`). A pseudo-stream with a code and no address is a notice whatever its
+  `type`; one with an address stays a stream.
 - **sessionRoute.ts** (`sessionStorage`): active nav tab + open detail target so Ctrl+R/F5 restores
   the page you were on; cleared on app close (cold start opens Home).
 - **Notifications** (`aura:notifications:v1`): ring buffer capped at 200 entries.
@@ -1362,6 +1401,15 @@ creep degrades the experience. When adding ANY feature:
   meta detail resolves; a detail-less fetch sends null anime ids and falls through to the title
   search, which can elect the wrong MAL entry. The session cache is keyed on the ids the answer was
   computed from for exactly this reason. DevConsole `[aniskip]` logs the elected id and score.
+- "A movie's digital / theatrical date is wrong or shows Reported" -> DevConsole `[release-dates]` prints the
+  region asked, which source and country each date came from, and the TMDB outcome (`N rows`, `no match`, `find
+  failed`, `deadline failed`, `no key`). Reported means TMDB had no row of that kind for any country. Story Arcs and
+  this share the TMDB key (`arcs::tmdb_key`, keyring override).
+- "A leaked / early film still shows a Digital countdown" -> `src/movieEarly.ts`. The check runs only on the detail
+  page (open it once); DevConsole `[release-dates]` logs "early-release check says <kind>". No "Out early" without
+  AIOStreams' signal or a home-release label on a row: check that PROVIDE_STREAM_DATA is on and that the AIOStreams
+  build sends `code: "earlyRelease"`. The copies only count on the film's OWN id (a same-name knockoff whose date
+  has passed never shows it).
 - "Ratings missing/sparse" -> `ratings.rs`: the MDBList branch needs a `tt`-prefixed IMDb id and a
   non-empty `AURA_MDBLIST_KEY` (baked from `.env.local`); the MAL/AniList branch needs a resolvable
   anime id. Non-tt non-anime ids get only addon-supplied `detail.ratings`. OMDb is fully removed.
@@ -1481,6 +1529,29 @@ Two related rules:
   enough that other addons use it for "✓ Verified", so it is accepted as the language glyph only
   when the body actually looks like language codes (`looksLikeLanguageCodes`).
 
+AIOStreams structured facts beat the text where the text is lossy (`applyStreamFacts`, Rust `StreamFacts` from
+`streamData`: field names per AIOStreams `ParsedStreamSchema`): release group, indexer and seeders replace the text
+(a formatter truncates and joins them: "CiNEPHiLES · The Pirate Ba..." was ONE chip); size, folder size, age and cache
+state only fill a gap; the running time (`duration`) exists only there. The facts also untruncate the title line from
+`parsedFile.title` (only when it starts the same way), and give the ranked expression names one chip each
+(`expressions`; the text runs them together as "WEB T2 WEB T6") plus the expression score (the trailing number, which is
+AIOStreams' stream expression score, not a Stremio Enhanced one). An indexer field can list several (`indexerNames`:
+"stremthru-corpus,zilean,nyaa", "StremThru|Knaben"). Text rules learned from live output (2026-11-09): small capitals
+map a WORD at a time before NFKC (the formatter writes s / x / q plain, so "sᴇᴀᴅᴇx" read "sEADEx"); a subtitle code
+keeps its superscript qualifier ("ᴇɴᶠᵒʳᶜᵉᵈ" is "EN forced", not "ENFORCED"); the size line can end in the age
+("· 352d"); zero-width joiners are stripped (they sat inside "Web-dl"); a fact's age rounds DOWN like the formatter; a fact's size is DECIMAL units at three significant digits ("6.45 GB"),
+as the formatter prints it, and it beats the body-wide size guess (which can be the pack size).
+
+The stream row never wraps a chip line and never clips (user's call; a scrolling marquee was tried and dropped): the
+header (badge, stars) and the footer (group, indexer, score, VPS) are IN the flow (an absolute footer grew left over the
+quality box), the footer is one line whose group and indexer chips truncate, and each chip line is a `ChipRow`
+(DetailView.tsx): one line, a chip that reaches the edge truncates when a useful width is left, anything after it hides
+behind a "+N" chip whose hover lists it, and every chip's hover carries its full value. One shared ResizeObserver
+re-fits the rows; hidden chips keep their place (visibility only) so a fit never moves anything. The size chip carries
+the pack or folder size as a dim tail ("6.45 GB of 159 GB"), the subtitles are ONE chip ("SUB EN · EN forced"), and the
+running time sits beside the episode tag. An early release tints the whole row (emerald verified, dashed amber
+unverified) with a calendar icon in the title line.
+
 There are no tests here; the practical check is to run the real `parseStream` over hand-rendered
 old-format and new-format samples and diff the field sets. Node runs the `.ts` file directly.
 
@@ -1489,9 +1560,22 @@ old-format and new-format samples and diff the field sets. Node runs the `.ts` f
 - Ctrl+F focuses the search box on screen and the native find bar is off (`src/searchHotkey.ts`,
   popups through `POPUP_NO_FIND_SCRIPT`). A new search box only needs `data-aura-search` on its
   `<input>`. Do not use WebView2's `AreBrowserAcceleratorKeysEnabled`: it also kills F5.
+- Where an episode list lands (`src/seasonScroll.ts`, both episode panels and `ArcGrid`): on a season pick, on opening
+  an arc and on leaving Arcs for Seasons, the latest watched episode, else the top (nothing watched, or everything).
+  A SKIPPED episode does not count (a skip is stored as a watched mark: "Skip the filler" at Naruto E110 marks filler
+  through E220).
+  The grid lands on the arc holding that episode, read in BROADCAST order (Naruto's "Various Filler" is the last tile and
+  scattered, so walking the tiles lands past every arc the user has not reached). Each landing runs once per opening: a
+  library refresh must not move a list being read. A resume target, a notification's ringed row and, in the player
+  drawer, the playing episode (the arc grid too, through `pinnedEpisodeId`) outrank it. `useStoryArcs`' `loading` is derived from the request, true from the first
+  commit that has it, because one commit of the season list in a remembered Arcs mode spends the resume target. Anything
+  that opens an arc once waits out `arcResultIsInterim`: arc ids are per grouping, so one opened from the result the
+  default grouping is about to replace vanishes.
 - The hover meta panel opens on a side that covers no other card when one fits, else behind the
-  cursor's travel (`src/hoverPlacement.ts`, once per card, never flipped live). While it covers cards
-  it lets the pointer through to them; holding Alt freezes it and lets it take the pointer.
+  cursor's travel (`src/hoverPlacement.ts`, once per card, never flipped live). In hover mode it
+  ALWAYS lets the pointer through, over free space too (user's call: the first and last cards of a
+  short search row took the pointer while the rest did not); holding Alt freezes it and lets it
+  take the pointer.
 - Alt+~ (the `perf-monitor` keybinding, Shift tolerated since ~ is Shift+`) opens the Performance
   Monitor (`src/PerfMonitor.tsx`, `src/perfSeries.ts`, `src-tauri/src/perf_monitor.rs`). Closed, it
   costs nothing: the panel unmounts and Rust holds no thread, timer or PDH query; pdh.dll and dxgi.dll
@@ -1573,7 +1657,7 @@ old-format and new-format samples and diff the field sets. Node runs the `.ts` f
 - Rust log labels to grep in the DevConsole or `aura-mpv.log`: `[bridge]`, `[player]`, `[streams]`,
   `[meta]`, `[catalog]`, `[search]`, `[subtitles]`, `[ratings]`, `[rpc]`, `[win32]`, `[smtc]`,
   `[scrobble]`, `[publicmetadb]`, `[mpv]` (the playback engine), `[cast]`, `[iptv]`, `[sync]`,
-  `[aniskip]`, `[introdb]`, `[skipdetect]` (the layered OP/ED detector), `[arcs]`, `[subsync]`, `[downloads]`, `[history]` (the watch-history store), `[status]` (the service status probes),
+  `[aniskip]`, `[introdb]`, `[skipdetect]` (the layered OP/ED detector), `[arcs]`, `[release-dates]` (movie digital / theatrical dates), `[subsync]`, `[downloads]`, `[history]` (the watch-history store), `[status]` (the service status probes),
   `[backup]` (the user-data snapshot ledger), `[perf]` (the Performance Monitor's GPU counters), `[tenrai]` (the MyAnimeList client), `[manga]` (manga chapters: MangaUpdates + Fandom), `[airing-check]` (frontend, the stream check for an
   airing show's next episode), `[extras]` (frontend,
   the anime metadata tabs on the detail page), `[next-up]` (frontend, the Next-Up card's timing
