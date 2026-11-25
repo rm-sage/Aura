@@ -1209,6 +1209,13 @@ Both materials (it is layout, not material). Every large soft gradient here is a
 (`heroAmbient.ts`, the same full-range-plus-noise-in-one-composite technique as the cursor light), held
 as a blob url and revoked when dropped.
 
+- HOME'S TOP EDGE IS THE TITLE BAR (2026-11-25; the user: "a thin bar under the window title bar
+  that's persistently there"). Home's page scrolls UNDER the floating search bar, so App's
+  `PageColumn` pulls Home's column up through the body's 12 px `p-3` (`marginTop: -12`) and HomeView
+  adds the 12 px back inside (bar container `pt-7`, rows and results `pt-[78px]`): nothing moves at
+  rest (harness: bar 64 to 106, hero top 122, as before), and the scroller's clip edge is the title
+  bar's bottom (36) instead of 12 px below it, where the hero and the rows used to vanish and leave a
+  band of bare background. A change to the body padding moves this margin with it.
 - SOURCE AND SLIDES (`src/heroSource.ts`, HomeView, 2026-11-22; the user: on loading or returning to
   Home "the hero banner rapidly cycles/flickers through multiple slides in quick succession before
   settling", art and bleed jumping). The carousel never stepped its index on load: it was REMOUNTED,
@@ -1314,6 +1321,37 @@ as a blob url and revoked when dropped.
   its first build (`handOver`: the old teardown runs then, never later), and the copy keeps fading only
   its own two layers under the new bleed. Never let an old instance's teardown run after a new one
   painted: it clears the rail's face, every patch, the tint and the sweep dim (review 2026-11-24).
+  OVER THE HERO ART (2026-11-24; the user: the search bar "looks off now when on top of the hero
+  item"): the bleed lies under the hero, so a marked element the page scrolls the hero up under has
+  no bleed around it to continue, and its face crop and corner patch drew a flat slab of the bleed's
+  colour over the art. Scaling them by the share over the art failed across the hero's top and
+  bottom edges (part of the bar over the bleed, part over the art: one background layer cannot
+  follow that line; the user's video showed a flat dark bar half over the bleed). So an element that
+  overlaps the hero takes NO hole, face crop or patch at all (`measureOverHero`): its glass reads the
+  real page, as any glass does. The area (since 2026-11-25; the user still saw "very faintly the
+  sharp corners next to the search bar when scrolling slowly near the hero item") is the hero, its
+  underglow's reach (`UNDERGLOW_PAD` past each side, up to the top of the page content where that
+  is nearer) and EVERYTHING BELOW, down to the scroller's bottom. The corner patch is exact only
+  where nothing but the bleed lies under the element: it paints the bleed OVER what the page draws
+  there, where the page draws it UNDER (the underglow at -1, the rows). At rest the search bar
+  already sits in the underglow, so its box corners showed the underglow's shadow painted over: a
+  sharp-edged corner off by about 1 level, up to 4, growing as the hero came up (scratchpad
+  `sbv/r3`). With the area running on below, there is no switch back over the rows either (an area
+  ending with the underglow switched back over the first row's posters, an 8 level one-frame step,
+  `sbv/r2`). In practice the Home search bar is now ALWAYS real glass (every scroll, 1100 x 700 to
+  2400 x 1300); only the rail, outside the scroller, keeps its hole. The price, measured at rest:
+  the bar's face shows 1-level contours where the face crop showed dither (row-averaged residual
+  rms 0.05 against 0.2), against the corners' 4. With the hero GONE (the leave fade) a marked element
+  is over content too: a search swaps Home's rows for its results and the bar STAYS, so the fade had cut
+  it a hole at its focused width and painted its patch, and as the bar narrowed to its rest width the
+  hole showed as a dark box either side for 900 ms (2026-11-25, the user: "the search bar leaves behind
+  rectangles when something is actually searched"). Each switch re-cuts the holes
+  and repaints the face in the same call, and finishes the element's box-shadow transition
+  (`snapShadow`: the drop shadow moves between the element and its patch child in one frame, and the
+  200 ms transition showed it missing, then doubled, for about 100 ms). Measured (scratchpad `sbv`,
+  Liquid, mica / ember, 100 / 125%, 2 px scroll steps): the straddle follows the real backdrop (a
+  smooth vertical blur, no slab); the switch is a 2 to 4 level tint step in one frame, the size of the
+  ordinary scroll steps there; no seam outside the ends.
 - Banding under fixed glass: a glass surface over the bleed blurs its dither away and rounds the smooth
   result again (measured with no cut: runs of identical pixels 180 px inside the rail, 120 to 250 px in
   the search bar). So, as the mockup: the bleed is CUT OUT (holes in the bleed layer's mask, one per
@@ -1576,7 +1614,11 @@ page). Cards are CONTENT (the user's round 2 call): no backdrop pass on a card, 
   9 swapped the SOLID disc (white glyph on an 85% accent fill) for a dark frost disc with only the glyph
   coloured, so the coloured mass shrank from a 22 px disc to an 8 x 10 px bookmark, and the in-progress
   mark was a bare 8 px dot. Now every state is ONE size: a 26 px disc, a 15 px glyph (`MarkGlyph`, shared
-  with the solid badge, a 1-unit stroke in the fill colour thickens the check), 8 px in (`top-2 left-2`)
+  with the solid badge, a 1-unit stroke in the fill colour thickens the check), drawn in a 14 px svg box
+  whose viewBox centres each glyph's ink box (2026-11-25, the user: "off center by a few pixels"; a
+  15 px box left a 4.5 px inset, 3.5 in the 22 px solid disc, rounded to a whole pixel: every glyph a
+  pixel right and down at 100%. Keep the inset a multiple of 4 CSS px; measured at real scale within
+  0.4 device px at 100 / 150 / 200%, 0.62 at 125 / 175%, scratchpad wf/marks), 8 px in (`top-2 left-2`)
   on CatalogCard, Library, Queue, Discover and the catalog page. In progress is a half-filled ring (same
   size as the check, reads "partly done" by shape). The disc carries a 0.14 wash of the state's colour
   (`--wm-rgb`: emerald, purple, amber, the accent for planned) and a 0.42 tinted hairline over a 0.72 dark
@@ -1637,6 +1679,23 @@ page). Cards are CONTENT (the user's round 2 call): no backdrop pass on a card, 
 - Library, Queue, Discover, Catalog and Airing have their own poster components; since round 11 they
   carry the bezel and FAUX frost badges (no backdrop pass, no card underglow): see "In-page sheets and
   pages" R4.
+- CATALOG FADE (2026-11-25; the user: catalog images should "slowly fade in as they load, so switching
+  to and from the home page isn't as jarring", everywhere catalogs load). Every catalog `ImageLoader`
+  passes `catalog`: Home rows and Continue Watching (`CinemaRows`), Library, Search, Discover, catalog
+  pages, Queue, History, Calendar, Live TV channels. It fades in over 1000 ms (500 at first; the user,
+  2026-11-25: "might still be a little fast") as a Web Animation from
+  opacity 0, started in a layout effect, so a CACHED image fades too (a CSS transition never ran for
+  one: it was loaded before its first paint, so every poster on a page you came back to popped in);
+  the skeleton crossfades out on the same clock and is removed when it ends. Measured (harness, Home
+  and Library switched twice, at 500 ms): every visible poster 0 to 1 over the fade on each switch, the
+  second visit too. Reduced motion skips it; a caller that sets the image's `opacity` in `imgStyle`
+  keeps its own fade. Everything else (player, Next-Up card, hero, detail backdrop, episode
+  thumbnails) keeps the plain 300 ms transition. A new catalog surface passes `catalog`. The loading
+  tile's colours (`--ln-skeleton-base` / `-highlight`, App.css `:root`) are ONE formula, white tinted
+  30% / 40% with the accent (a custom accent carries), at two strengths per theme
+  (`--ln-skeleton-a` / `-h`: Haze 0.02 / 0.10, Midnight 0.02 / 0.08, the coloured themes 0.035 /
+  0.11, Mica 0.05 / 0.13; High Contrast keeps its explicit 0.12 / 0.40). The old pale 0.22 to 0.32
+  bands made a grey slab of every tile on a dark theme (Haze luma 60 on an 18 page, now 41).
 
 ## Home performance (round 11)
 
@@ -1891,6 +1950,34 @@ Notifications fixed bottom-left) and the under-800px `.aura-nav-rail` padding ha
   divider, Addons, Settings). Rows (`RailRow` for the section rows,
   `NavRow` for the nav) are LIST ROWS on the one surface, never glass pills: transparent, `.aura-nav-row
   .nav-tap` (press squash, Liquid's droplet rule), label colours in glass-rail.css.
+- TREE CONNECTOR and its click light (2026-11-25; the user: "redesign the click animation to be more
+  cohesive with the physics based light theme of the app"). Library's trunk, the ticks and the last
+  row's rounded L are ONE svg over the list (`NavTree`, `.aura-rail-tree`, z 1: over the pill, under
+  the rows), NOT the sub-rows' ::before / ::after: as pseudo-elements they took every transform the
+  row got, and the 280 ms `scale(0.92)` click pulse (`SUB_PULSE`, a Material curve, the one
+  off-vocabulary motion in the rail) threw the trunk about 6 px right and back. The pulse is gone; the
+  lines never move. A click into Queue / Airing runs LIGHT along them: a cool-white glint (core
+  232,241,255, a 22 px tail at 0.34, a 3 px halo at 0.12, the blue 70,150,255 fringe 1 px behind: the
+  cursor light's colours) from Library's bottom edge down the trunk into the clicked row, the head on
+  `--aura-spring-snappy` (k600/c38, close to the pill's leading spring) as WAAPI on
+  `stroke-dashoffset`, faded in and out on the cursor light's curves (260 ms ease-out cubic in, 600 ms
+  in-out sine out from the landing). It leaves the branch to the active child LIT (white 0.38 in Clear,
+  the accent mark at 60% in Matte; the lines never showed which child was active). Sibling to sibling,
+  only the new stretch runs and only the old stretch fades; leaving Library's family fades the branch
+  (220 ms). Reduced motion: no run, a crossfade. High Contrast: no glint, branch white 0.6. GPU off: no
+  blue fringe. Dashes are written so a spring's overshoot cannot unlight anything (a dash ENDING at the
+  head and longer than 2L; a dash starting at 0 lost the trunk's root at the 1.02 peak). PIXELS: the
+  svg is painted at its origin ROUNDED to the device grid and a border edge lands on round(v), so
+  every line is centred on the device pixel the old border painted, counted from the rounded origin.
+  Measured at REAL display scale (`--force-device-scale-factor`, not Playwright's deviceScaleFactor):
+  the trunk lands on the old column at the old strength at 100 / 125 / 150 / 175% with the rail on
+  whole and half pixels; only the elbow's antialiasing and the old double-drawn tick junction differ
+  (scratchpad tree/abr). Flooring, or counting from the unrounded origin, moved the trunk a column and
+  split the ticks over two rows.
+- NO lit row while Home shows SEARCH RESULTS (2026-11-25, the user: "disable the menu bar highlight so
+  Home doesn't appear to be selected"): App passes `active={null}` while `homeSearchActive` (Home's
+  `aura:home-search-changed`); the pill fades out, no `aria-current`, no lit tree branch. Clicking Home
+  clears the search (`homeResetKey`) and lights it again.
 - Lit state: nav row `aria-current="page"`, Library `data-parent-lit` while Queue / Airing is the page,
   a section row `.is-active` (its panel open, in a party). Frosted: the accent. Liquid:
   `color-mix(accent 34%, white)`. A section row also takes a faint wash (it has no pill).

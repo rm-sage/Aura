@@ -11198,7 +11198,11 @@ export default function App() {
           and nothing scrolls under it; it hides with the body during
           playback. Its popups portal into a host beside it (RailRow). ── */}
       <NavSidebar
-        active={activeView}
+        // Search results show inside Home, but they are not Home: no row
+        // lit while they do (2026-11-25, the user: "disable the menu bar
+        // highlight so Home doesn't appear to be selected"). Clicking Home
+        // clears the search (homeResetKey below) and lights it again.
+        active={activeView === "home" && homeSearchActive ? null : activeView}
         onNavigate={(view) => {
           setActiveCatalog(null);
           // Always clear search when navigating to Home — even from another
@@ -11892,6 +11896,7 @@ export default function App() {
           a newer release and it hasn't been dismissed to the bell yet). */}
       {pendingUpdate && !isPlayerActive && (
         <UpdatePopup
+          key={pendingUpdate.version}
           release={pendingUpdate}
           currentVersion={APP_VERSION}
           onUpdate={async () => {
@@ -12305,6 +12310,13 @@ const PageColumn = memo(function PageColumn({
     <div
       key={activeView}
       className="aura-view-enter flex-1 flex flex-col min-w-0 overflow-hidden"
+      // Home reaches up through the body's 12 px top padding to the title
+      // bar (HomeView adds the 12 px back inside): its page scrolls UNDER the
+      // floating search bar, and clipped 12 px short of the title bar it left
+      // a band of bare background there whenever the hero or a row scrolled
+      // up (2026-11-25, the user: "a thin bar under the window title bar
+      // that's persistently there").
+      style={activeView === "home" ? { marginTop: -12 } : undefined}
       data-glass-covered={covered ? "" : undefined}
     >
       {activeView === "home" && (

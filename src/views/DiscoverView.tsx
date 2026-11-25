@@ -568,7 +568,7 @@ const DiscoverPosterCard = memo(function DiscoverPosterCard({
       <div className="relative rounded-xl overflow-hidden bg-white/4"
            style={{ aspectRatio: "2 / 3" }}>
         {meta.poster ? (
-          <ImageLoader
+          <ImageLoader catalog
             src={shrinkPoster(meta.poster)}
             alt={meta.name}
             className="w-full h-full object-cover"

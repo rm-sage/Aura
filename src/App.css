@@ -67,11 +67,21 @@
   --text-primary:  rgba(235, 236, 240, 0.92);
   --text-muted:    rgba(235, 236, 240, 0.55);
 
-  /* Skeleton shimmer — Mica surface can be light or dark depending on the
-     desktop wallpaper, so we use a mid-grey base with a stronger highlight
-     to ensure the sweep is always visible regardless of what shows through. */
-  --ln-skeleton-base:      rgba(128, 128, 128, 0.10);
-  --ln-skeleton-highlight: rgba(200, 200, 200, 0.32);
+  /* Skeleton shimmer (ImageLoader's loading tile): a near-ground base and a
+     soft sweep, both white tinted with the theme's accent (so a custom accent
+     carries into it), at two strengths each theme sets: --ln-skeleton-a for
+     the base, --ln-skeleton-h for the sweep (2026-11-25; the user: the
+     shimmer should "better compliment the selected theme", darker on a dark
+     theme such as Haze). Up to then every dark theme drew a white or pale
+     0.07-0.08 base with a 0.22-0.24 band: on Haze a tile came out at 60
+     against the page's 18 (a grey slab), Midnight 36 against 0, Ember 49
+     against 11 (luma, harness). Now about 40 / 20 / 36, and the band still
+     sweeps. Mica can sit over a light wallpaper, so it keeps a stronger
+     pair; High Contrast keeps its own explicit stops. */
+  --ln-skeleton-a: 0.05;
+  --ln-skeleton-h: 0.13;
+  --ln-skeleton-base:      color-mix(in srgb, rgb(var(--ln-accent-rgb) / var(--ln-skeleton-a)) 30%, rgb(255 255 255 / var(--ln-skeleton-a)));
+  --ln-skeleton-highlight: color-mix(in srgb, rgb(var(--ln-accent-rgb) / var(--ln-skeleton-h)) 40%, rgb(255 255 255 / var(--ln-skeleton-h)));
 }
 /* Small accent MARKS on dark glass (unread dots, the rail's count badges, the
    notification sweep and washes): the accent with its OKLCH lightness floored
@@ -120,8 +130,8 @@
 
   /* Glass background is always dark-tinted so white-alpha stops read fine;
      slightly higher than Mica because the backdrop is more consistently dark. */
-  --ln-skeleton-base:      rgba(255, 255, 255, 0.07);
-  --ln-skeleton-highlight: rgba(255, 255, 255, 0.24);
+  --ln-skeleton-a: 0.02;
+  --ln-skeleton-h: 0.1;
 }
 
 :root[data-theme="midnight"] {
@@ -153,8 +163,8 @@
   /* Midnight is always pure black — the original white-alpha recipe works
      fine here; keep stops consistent in feel with glass/mica but expressed
      as white-alpha because there's no colour bleed from a wallpaper. */
-  --ln-skeleton-base:      rgba(255, 255, 255, 0.05);
-  --ln-skeleton-highlight: rgba(255, 255, 255, 0.18);
+  --ln-skeleton-a: 0.02;
+  --ln-skeleton-h: 0.08;
 }
 
 /* ----------------------------------------------------------------------
@@ -183,8 +193,8 @@
   --glass-bg-soft: rgba(44, 36, 28, 0.94);
   --text-primary:  rgba(248, 240, 230, 0.94);
   --text-muted:    rgba(248, 240, 230, 0.58);
-  --ln-skeleton-base:      rgba(255, 200, 140, 0.08);
-  --ln-skeleton-highlight: rgba(255, 220, 170, 0.22);
+  --ln-skeleton-a: 0.035;
+  --ln-skeleton-h: 0.11;
 }
 
 :root[data-theme="forest"] {
@@ -205,8 +215,8 @@
   --glass-bg-soft: rgba(32, 50, 42, 0.94);
   --text-primary:  rgba(238, 248, 240, 0.94);
   --text-muted:    rgba(238, 248, 240, 0.58);
-  --ln-skeleton-base:      rgba(140, 220, 180, 0.08);
-  --ln-skeleton-highlight: rgba(170, 240, 200, 0.22);
+  --ln-skeleton-a: 0.035;
+  --ln-skeleton-h: 0.11;
 }
 
 :root[data-theme="rose"] {
@@ -227,8 +237,8 @@
   --glass-bg-soft: rgba(48, 36, 44, 0.94);
   --text-primary:  rgba(248, 238, 244, 0.94);
   --text-muted:    rgba(248, 238, 244, 0.58);
-  --ln-skeleton-base:      rgba(230, 170, 200, 0.08);
-  --ln-skeleton-highlight: rgba(245, 195, 220, 0.22);
+  --ln-skeleton-a: 0.035;
+  --ln-skeleton-h: 0.11;
 }
 
 :root[data-theme="amethyst"] {
@@ -249,8 +259,8 @@
   --glass-bg-soft: rgba(40, 34, 56, 0.94);
   --text-primary:  rgba(244, 240, 252, 0.94);
   --text-muted:    rgba(244, 240, 252, 0.58);
-  --ln-skeleton-base:      rgba(190, 160, 240, 0.08);
-  --ln-skeleton-highlight: rgba(215, 190, 250, 0.22);
+  --ln-skeleton-a: 0.035;
+  --ln-skeleton-h: 0.11;
 }
 
 :root[data-theme="ocean"] {
@@ -271,8 +281,8 @@
   --glass-bg-soft: rgba(30, 44, 60, 0.94);
   --text-primary:  rgba(238, 246, 252, 0.94);
   --text-muted:    rgba(238, 246, 252, 0.58);
-  --ln-skeleton-base:      rgba(130, 220, 240, 0.08);
-  --ln-skeleton-highlight: rgba(160, 240, 255, 0.22);
+  --ln-skeleton-a: 0.035;
+  --ln-skeleton-h: 0.11;
 }
 
 :root[data-theme="solar"] {
@@ -293,8 +303,8 @@
   --glass-bg-soft: rgba(50, 40, 24, 0.94);
   --text-primary:  rgba(252, 244, 226, 0.94);
   --text-muted:    rgba(252, 244, 226, 0.58);
-  --ln-skeleton-base:      rgba(255, 220, 140, 0.08);
-  --ln-skeleton-highlight: rgba(255, 240, 175, 0.22);
+  --ln-skeleton-a: 0.035;
+  --ln-skeleton-h: 0.11;
 }
 
 :root[data-theme="crimson"] {
@@ -315,8 +325,8 @@
   --glass-bg-soft: rgba(54, 32, 34, 0.94);
   --text-primary:  rgba(252, 236, 238, 0.94);
   --text-muted:    rgba(252, 236, 238, 0.58);
-  --ln-skeleton-base:      rgba(255, 150, 160, 0.08);
-  --ln-skeleton-highlight: rgba(255, 180, 188, 0.22);
+  --ln-skeleton-a: 0.035;
+  --ln-skeleton-h: 0.11;
 }
 
 /* ----------------------------------------------------------------------
@@ -3963,7 +3973,7 @@ html[data-reduced-motion="true"] :is(.aura-glass-knob, .aura-glass-seg-ind, .aur
 }
 html[data-reduced-motion="true"] .aura-glass-press,
 html[data-reduced-motion="true"] .aura-glass-press:is(:hover, :active),
-html[data-reduced-motion="true"][data-glass="liquid"] .aura-nav-row.nav-tap:is(:hover, :active) {
+html[data-reduced-motion="true"] .aura-nav-row.nav-tap:is(:hover, :active) {
   scale: none !important;
   translate: none !important;
   transform: none !important;

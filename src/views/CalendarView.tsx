@@ -256,7 +256,7 @@ function HiddenPostersPopout({ anchor, entries }: { anchor: DOMRect; entries: Ca
               style={{ width: posterW, height: posterH }}
             >
               {src ? (
-                <ImageLoader
+                <ImageLoader catalog
                   src={src}
                   alt=""
                   draggable={false}
@@ -835,7 +835,7 @@ const CalendarDayCell = memo(function CalendarDayCell({
                 title={detail?.name ?? item.name}
               >
                 {src ? (
-                  <ImageLoader
+                  <ImageLoader catalog
                     src={src}
                     alt=""
                     draggable={false}
@@ -1060,7 +1060,7 @@ function CalendarCard({
         style={{ aspectRatio: "2 / 3" }}
       >
         {poster ? (
-          <ImageLoader
+          <ImageLoader catalog
             src={shrinkPoster(poster)}
             alt=""
             draggable={false}

@@ -1132,7 +1132,7 @@ const LibraryCard = memo(function LibraryCard({
           style={{ aspectRatio: "2 / 3" }}
         >
           {item.poster ? (
-            <ImageLoader
+            <ImageLoader catalog
               // Downsize oversized masters (TMDB original / metahub large) to
               // card width: a 2000x3000 poster decoded into a ~180px tile is
               // brutal for the compositor to re-raster on every scroll frame.

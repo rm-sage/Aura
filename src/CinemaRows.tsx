@@ -983,7 +983,7 @@ export const ContinueWatchingCard = memo(function ContinueWatchingCard(
           data-card-art
         >
           {src ? (
-            <ImageLoader
+            <ImageLoader catalog
               src={src}
               alt={item.name}
               draggable={false}
@@ -1219,7 +1219,7 @@ export const CatalogCard = memo(function CatalogCard({ meta, onSelect, fixedTitl
         data-card-art
       >
         {meta.poster ? (
-          <ImageLoader
+          <ImageLoader catalog
             src={shrinkPoster(meta.poster)}
             alt={meta.name}
             draggable={false}

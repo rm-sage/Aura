@@ -60,7 +60,7 @@ export async function fetchReleasePage(page: number): Promise<ReleasePage> {
   if (!res.ok) {
     throw new Error(
       res.status === 403
-        ? "GitHub rate limit reached — try again in a little while."
+        ? "GitHub rate limit reached. Try again in a little while."
         : `GitHub releases request failed (HTTP ${res.status}).`,
     );
   }
@@ -77,6 +77,18 @@ export async function fetchReleasePage(page: number): Promise<ReleasePage> {
   const result: ReleasePage = { items, full: arr.length >= RELEASES_PAGE_SIZE };
   _pageCache.set(page, result);
   return result;
+}
+
+/** Compare two dotted versions ("2.3.10" vs "2.4.0", a leading "v" and any
+ *  "-suffix" ignored) numerically: negative, 0 or positive. */
+export function compareVersions(a: string, b: string): number {
+  const parts = (v: string) => v.replace(/^v/, "").split("-")[0].split(".").map((n) => parseInt(n, 10) || 0);
+  const pa = parts(a), pb = parts(b);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const d = (pa[i] ?? 0) - (pb[i] ?? 0);
+    if (d !== 0) return d;
+  }
+  return 0;
 }
 
 /** Format an ISO date as a short, locale-aware "Jun 17, 2026". Empty on no date. */

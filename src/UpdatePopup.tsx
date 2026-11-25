@@ -7,19 +7,22 @@
 // whenever checkForUpdate() returns a tag newer than the running app version
 // AND that tag has not already been dismissed to the notifications bell.
 //
-// The new version's notes render at top via the shared ReleaseNotesBody; a
-// "View earlier versions" control lazily loads prior releases from GitHub
-// (RELEASES_PAGE_SIZE at a time) so the popup doubles as a quick changelog.
+// The new version's notes render at top via the shared ReleaseNotesBody. When
+// the running app is more than one version behind, the notes of every version
+// it skipped follow, newest to oldest (loaded from GitHub when the popup
+// opens). A "View earlier versions" control then lazily loads the releases
+// from the installed one down (RELEASES_PAGE_SIZE at a time), so the popup
+// doubles as a quick changelog.
 //
 // Two ways to dismiss: backdrop click and Esc (suppressed while installing).
 // We do NOT close on the "Install" button — the parent handles that after the
 // plugin relaunches.
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { UpdateInfo } from "./updaterPlugin";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { ReleaseNotesBody } from "./releaseNotesRender";
-import { fetchReleasePage, formatReleaseDate, RELEASES_PAGE_SIZE, type ReleaseNote } from "./changelogApi";
+import { compareVersions, fetchReleasePage, formatReleaseDate, RELEASES_PAGE_SIZE, type ReleaseNote } from "./changelogApi";
 
 interface Props {
   release:        UpdateInfo;
@@ -37,6 +40,38 @@ interface Props {
  *  shows without a trip to GitHub. Matches the prior-versions list + the
  *  Settings changelog, both of which render at Infinity. */
 const NOTES_MAX = Infinity;
+/** How far back the skipped versions are looked for when the popup opens
+ *  (pages of RELEASES_PAGE_SIZE): 50 releases, about a year of them. One page
+ *  covers almost every case, and pages are cached for the session. */
+const MISSED_MAX_PAGES = 5;
+
+/** One release's heading and notes card (the offered version, a skipped one,
+ *  or an earlier one). */
+function ReleaseSection({ version, date, notes, badge }: {
+  version: string; date: string; notes: string; badge?: string;
+}) {
+  return (
+    <section className="space-y-2.5">
+      <div className="flex items-baseline gap-2.5">
+        <h3 className="text-white text-[15px] font-semibold tracking-tight">Aura {version}</h3>
+        {badge && (
+          <span className="px-1.5 py-px rounded text-[9px] font-bold uppercase tracking-wider
+                           bg-ln-accent/20 text-ln-accent border border-ln-accent/30">
+            {badge}
+          </span>
+        )}
+        {formatReleaseDate(date) && (
+          <span className="text-white/35 text-[11px] font-mono ml-auto">{formatReleaseDate(date)}</span>
+        )}
+      </div>
+      <div className="rounded-xl bg-white/[0.03] border border-white/[0.08] px-5 py-4">
+        {notes.trim()
+          ? <ReleaseNotesBody notes={notes} max={NOTES_MAX} />
+          : <p className="text-white/40 text-[13px] italic">No notes for this release.</p>}
+      </div>
+    </section>
+  );
+}
 
 export default function UpdatePopup({
   release,
@@ -54,16 +89,67 @@ export default function UpdatePopup({
   const [priorError, setPriorError] = useState<string | null>(null);
   const [priorDone, setPriorDone] = useState(false);
   const [showPrior, setShowPrior] = useState(false);
+  /** The versions between the installed one and the offered one, newest
+   *  first: shown under the offered version without asking. */
+  const [missed, setMissed] = useState<ReleaseNote[]>([]);
+  const [missedLoading, setMissedLoading] = useState(true);
+  const [missedError, setMissedError] = useState(false);
+
+  // On open (and on Retry after a failed one): read release pages until one
+  // reaches the installed version (or the list ends). Everything newer than it
+  // but older than the offered version was skipped; the rest seeds the
+  // earlier-versions list, which the pager then reveals without a second
+  // fetch and continues from. The popup is keyed on the offered version
+  // (App.tsx), so a newer offer starts over in a fresh instance.
+  const openRun = useRef(0);
+  const loadOpening = useCallback(async () => {
+    const run = ++openRun.current;
+    setMissedLoading(true);
+    setMissedError(false);
+    const all: ReleaseNote[] = [];
+    let page = 0, full = true;
+    try {
+      while (full && page < MISSED_MAX_PAGES) {
+        const batch = await fetchReleasePage(page + 1);
+        page++;
+        all.push(...batch.items);
+        full = batch.full;
+        if (batch.items.some((r) => compareVersions(r.version, currentVersion) <= 0)) break;
+      }
+    } catch {
+      if (run === openRun.current) { setMissedError(true); setMissedLoading(false); }
+      return;
+    }
+    if (run !== openRun.current) return;
+    const seen = new Set<string>();
+    const uniq = all.filter((r) => !seen.has(r.version) && (seen.add(r.version), true));
+    setMissed(uniq
+      .filter((r) => compareVersions(r.version, currentVersion) > 0 && compareVersions(r.version, release.version) < 0)
+      .sort((a, b) => compareVersions(b.version, a.version)));
+    setPrior(uniq.filter((r) => compareVersions(r.version, currentVersion) <= 0));
+    setPriorPage(page);
+    setPriorDone(!full);
+    setMissedLoading(false);
+  }, [currentVersion, release.version]);
+  useEffect(() => {
+    void loadOpening();
+    // An unmount drops a load still in flight.
+    return () => { openRun.current++; };
+  }, [loadOpening]);
 
   const loadMorePrior = useCallback(async () => {
+    // The first press shows what the open already loaded.
+    if (!showPrior && prior.length > 0) { setShowPrior(true); return; }
     if (priorLoading || priorDone) return;
     setPriorLoading(true);
     setPriorError(null);
     const next = priorPage + 1;
     try {
       const batch = await fetchReleasePage(next);
-      // The target version's notes already show at top — drop it from the list.
-      setPrior((p) => [...p, ...batch.items.filter((r) => r.version !== release.version)]);
+      // The offered version and the skipped ones already show above.
+      setPrior((p) => [...p, ...batch.items.filter((r) =>
+        r.version !== release.version && !missed.some((m) => m.version === r.version)
+        && !p.some((q) => q.version === r.version))]);
       setPriorPage(next);
       if (!batch.full) setPriorDone(true);
       setShowPrior(true);
@@ -72,7 +158,7 @@ export default function UpdatePopup({
     } finally {
       setPriorLoading(false);
     }
-  }, [priorLoading, priorDone, priorPage, release.version]);
+  }, [showPrior, prior.length, priorLoading, priorDone, priorPage, release.version, missed]);
 
   // Esc dismiss — suppressed while installing (the plugin holds file handles).
   useEffect(() => {
@@ -89,7 +175,6 @@ export default function UpdatePopup({
 
   const targetTag = `v${release.version}`;
   const releasePageUrl = `https://github.com/rm-sage/Aura/releases/tag/${targetTag}`;
-  const hasNotes = (release.body ?? "").trim().length > 0;
 
   const handleInstall = async () => {
     if (installing) return;
@@ -143,6 +228,9 @@ export default function UpdatePopup({
             Aura {currentVersion}
             <span className="px-1.5 text-white/35">→</span>
             <span className="text-white/85 font-medium">{targetTag}</span>
+            {missed.length > 0 && (
+              <span className="text-white/45"> · {missed.length + 1} new versions</span>
+            )}
           </p>
         </div>
 
@@ -159,52 +247,38 @@ export default function UpdatePopup({
           style={{ scrollbarWidth: "thin", scrollbarColor: "rgba(255,255,255,0.08) transparent" }}
         >
           {/* The version being offered. */}
-          <section className="space-y-2.5">
-            <div className="flex items-baseline gap-2.5">
-              <h3 className="text-white text-[15px] font-semibold tracking-tight">Aura {release.version}</h3>
-              <span className="px-1.5 py-px rounded text-[9px] font-bold uppercase tracking-wider
-                               bg-ln-accent/20 text-ln-accent border border-ln-accent/30">
-                New
-              </span>
-              {formatReleaseDate(release.date ?? "") && (
-                <span className="text-white/35 text-[11px] font-mono ml-auto">{formatReleaseDate(release.date ?? "")}</span>
-              )}
+          <ReleaseSection version={release.version} date={release.date ?? ""} notes={release.body ?? ""} badge="New" />
+
+          {/* Every version skipped since the installed one, newest first. */}
+          {missed.map((r) => (
+            <ReleaseSection key={r.tag} version={r.version} date={r.date} notes={r.notes} />
+          ))}
+          {missedError && (
+            <div className="flex flex-col items-center gap-1.5">
+              <p className="text-white/55 text-[11px] text-center">
+                Could not load the notes of the versions since yours.
+              </p>
+              <button
+                type="button"
+                onClick={() => void loadOpening()}
+                className="aura-glass-flat aura-glass-press px-3 py-1.5 rounded-lg text-[11.5px] font-medium text-white/75"
+              >
+                Retry
+              </button>
             </div>
-            <div className="rounded-xl bg-white/[0.03] border border-white/[0.08] px-5 py-4">
-              {hasNotes
-                ? <ReleaseNotesBody notes={release.body ?? ""} max={NOTES_MAX} />
-                : <p className="text-white/40 text-[13px] italic">No notes for this release.</p>}
-            </div>
-          </section>
+          )}
 
           {/* Earlier versions, revealed by the pager below. */}
           {showPrior && prior.map((r) => (
-            <section key={r.tag} className="space-y-2.5">
-              <div className="flex items-baseline gap-2.5">
-                <h3 className="text-white text-[15px] font-semibold tracking-tight">Aura {r.version}</h3>
-                {r.version === currentVersion && (
-                  <span className="px-1.5 py-px rounded text-[9px] font-bold uppercase tracking-wider
-                                   bg-ln-accent/20 text-ln-accent border border-ln-accent/30">
-                    Installed
-                  </span>
-                )}
-                {formatReleaseDate(r.date) && (
-                  <span className="text-white/35 text-[11px] font-mono ml-auto">{formatReleaseDate(r.date)}</span>
-                )}
-              </div>
-              <div className="rounded-xl bg-white/[0.03] border border-white/[0.08] px-5 py-4">
-                {r.notes.trim()
-                  ? <ReleaseNotesBody notes={r.notes} max={Infinity} />
-                  : <p className="text-white/40 text-[13px] italic">No notes for this release.</p>}
-              </div>
-            </section>
+            <ReleaseSection key={r.tag} version={r.version} date={r.date} notes={r.notes}
+              badge={r.version === currentVersion ? "Installed" : undefined} />
           ))}
 
           {/* Pager — reveals the changelog of earlier versions inline. */}
           <div className="flex flex-col items-center gap-1.5 pt-1">
-            {priorLoading ? (
+            {missedLoading || missedError ? null : priorLoading ? (
               <span className="text-white/40 text-[11px]">Loading…</span>
-            ) : priorDone ? (
+            ) : priorDone && (showPrior || prior.length === 0) ? (
               prior.length > 0 && <span className="text-white/30 text-[10.5px]">Showing all earlier versions.</span>
             ) : (
               <button

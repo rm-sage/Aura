@@ -680,7 +680,7 @@ const ChannelCard = memo(function ChannelCard({
           stretched some cards into giant tiles. */}
       <div className="relative aspect-video bg-black/40 overflow-hidden flex items-center justify-center">
         {channel.logo ? (
-          <ImageLoader
+          <ImageLoader catalog
             src={channel.logo}
             alt={channel.name}
             loading="lazy"

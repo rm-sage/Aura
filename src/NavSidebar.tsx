@@ -50,7 +50,9 @@ import type { LibraryItem } from "./types";
 export type NavView = "home" | "library" | "queue" | "airing" | "addons" | "discover" | "live" | "calendar" | "history" | "settings";
 
 interface Props {
-  active: NavView;
+  /** The page whose row is lit; null lights none (Home showing search
+   *  results: App's homeSearchActive, so Home does not read as selected). */
+  active: NavView | null;
   onNavigate: (view: NavView) => void;
   /** Email of the signed-in user; null when guest. May be an empty string
    *  when the user has a valid auth_key but the email was never persisted
@@ -270,7 +272,7 @@ const RailBody = memo(function RailBody({
 const ListLayoutContext = createContext(0);
 
 function NavList({ active, onNavigate, handoff }: {
-  active: NavView;
+  active: NavView | null;
   onNavigate: (view: NavView) => void;
   /** performance.now() of the last click on the droplet's row (useRailDroplet). */
   handoff: React.MutableRefObject<number>;
@@ -288,7 +290,7 @@ function NavList({ active, onNavigate, handoff }: {
     if (list.parentElement) ro.observe(list.parentElement);
     return () => ro.disconnect();
   }, []);
-  const parentLit = LIBRARY_SUBS.includes(active);
+  const parentLit = active !== null && LIBRARY_SUBS.includes(active);
 
   return (
     <ListLayoutContext.Provider value={layoutGen}>
@@ -296,17 +298,16 @@ function NavList({ active, onNavigate, handoff }: {
         {/* The active pill, under the rows (the rail's one hover droplet is
             NavSidebar's, under this pill). */}
         <NavPill listRef={listRef} activeId={active} handoff={handoff} />
+        {/* Library's tree connector, over the pill and under the rows. */}
+        <NavTree listRef={listRef} activeId={active} />
         {NAV_ITEMS.map((item, i) => {
           if (item === "divider") return <div key={`div-${i}`} className="aura-rail-div" aria-hidden />;
-          const next = NAV_ITEMS[i + 1];
-          const lastSub = !!item.sub && !(next && next !== "divider" && next.sub);
           return (
             <NavRow
               key={item.id}
               item={item}
               active={active === item.id}
               parentLit={item.id === "library" && parentLit}
-              lastSub={lastSub}
               onClick={() => onNavigate(item.id)}
             />
           );
@@ -337,7 +338,7 @@ const HANDOFF_MS = 400;
 
 function NavPill({ listRef, activeId, handoff }: {
   listRef: React.RefObject<HTMLDivElement | null>;
-  activeId: NavView;
+  activeId: NavView | null;
   /** performance.now() of the last hand-off click (useRailDroplet), 0 when none. */
   handoff: React.MutableRefObject<number>;
 }) {
@@ -353,7 +354,7 @@ function NavPill({ listRef, activeId, handoff }: {
     handoff.current = 0;
     const list = listRef.current;
     if (!live || !spare || !list) return;
-    const row = list.querySelector<HTMLElement>(`[data-nav-id="${activeId}"]`);
+    const row = activeId ? list.querySelector<HTMLElement>(`[data-nav-id="${activeId}"]`) : null;
     if (!row) {
       // Fade out in place; the next appearance snaps.
       cancelSpan(live);
@@ -400,6 +401,230 @@ function NavPill({ listRef, activeId, handoff }: {
     </>
   );
 }
+
+// ---------------------------------------------------------------------------
+// NavTree: Library's tree connector (2026-11-25; the user: "redesign the click
+// animation to be more cohesive with the physics based light theme of the
+// app"). One SVG over the list, under the rows: the trunk from Library's
+// bottom edge, a tick into every sub-row's icon and a rounded L into the last.
+// It used to be each sub-row's ::before / ::after, so the lines moved with the
+// row: a click played a 280 ms scale(0.92) pulse on the row (a Material curve,
+// the one off-vocabulary motion in the rail) that threw the trunk about 6 px
+// right and back. Now the lines never move, and a click on a sub-row sends
+// LIGHT along them instead: a cool-white glint with the cursor light's blue
+// fringe (glassGlint.ts / aura-glass-rim.js colours) runs from Library down
+// the trunk into the clicked row on the snappy spring (--aura-spring-snappy,
+// sampled from the k600/c38 spring, close to the pill's leading edge), fading
+// in and out on the cursor light's curves, and leaves the branch to the
+// active child lit (it never showed which child was active). From one sibling
+// to the other only the new stretch runs. Leaving Library's family fades the
+// branch out. Reduced motion: no run, the branch crossfades. High Contrast: no
+// glint, a brighter branch (glass-rail.css "Tree connector").
+//
+// Every coordinate is snapped to the device pixel grid in PAGE space (the
+// rail's top can sit on a half pixel), so the 1 px lines stay as crisp as the
+// borders they replace. Written imperatively: React renders the empty paths.
+// ---------------------------------------------------------------------------
+
+/** The connector's geometry in the sub-row (as the old pseudo-elements). */
+const TREE_X = 16.8, TREE_TICK = 9, TREE_R = 6;
+/** The glint's three strokes (dash lengths, CSS px) and the blue fringe's lag. */
+const GLINT_TAIL = 22, GLINT_HALO = 14, GLINT_CORE = 7, GLINT_DISP_LAG = 1;
+/** The lit branch's crossfade (the pill's own fade in Liquid). */
+const TREE_FADE_MS = 220;
+
+interface TreeGeom {
+  key: string;
+  base: string;
+  /** Per sub-row: its tick's y, and its branch from a point on the trunk. */
+  subs: Map<NavView, { y: number; from: (y: number) => string }>;
+  top: number;
+}
+
+function cssMs(name: string, fallback: number): number {
+  const v = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  const n = parseFloat(v);
+  return Number.isFinite(n) && n > 0 ? (v.endsWith("s") && !v.endsWith("ms") ? n * 1000 : n) : fallback;
+}
+
+function NavTree({ listRef, activeId }: {
+  listRef: React.RefObject<HTMLDivElement | null>;
+  activeId: NavView | null;
+}) {
+  const layoutGen = useContext(ListLayoutContext);
+  const svgRef = useRef<SVGSVGElement>(null);
+  const baseRef = useRef<SVGPathElement>(null);
+  const lit0 = useRef<SVGPathElement>(null);
+  const lit1 = useRef<SVGPathElement>(null);
+  const glintRef = useRef<SVGGElement>(null);
+  const halo = useRef<SVGPathElement>(null);
+  const tail = useRef<SVGPathElement>(null);
+  const disp = useRef<SVGPathElement>(null);
+  const core = useRef<SVGPathElement>(null);
+  const geom = useRef<TreeGeom | null>(null);
+  const cur = useRef(0);
+  const shown = useRef<NavView | null>(null);
+  const runs = useRef<Animation[]>([]);
+  // The rail moves with the window (it is centred) without changing size, so
+  // the pixel snap is redone on a window resize too.
+  const [winGen, setWinGen] = useState(0);
+  useEffect(() => {
+    const f = () => setWinGen((g) => g + 1);
+    window.addEventListener("resize", f);
+    return () => window.removeEventListener("resize", f);
+  }, []);
+
+  useLayoutEffect(() => {
+    const list = listRef.current, base = baseRef.current;
+    const lits = [lit0.current, lit1.current];
+    if (!list || !base || !lits[0] || !lits[1]) return;
+    // ---- geometry -------------------------------------------------------
+    const lib = list.querySelector<HTMLElement>('[data-nav-id="library"]');
+    const subEls = LIBRARY_SUBS.map((id) => list.querySelector<HTMLElement>(`[data-nav-id="${id}"]`));
+    let g: TreeGeom | null = null;
+    if (lib && subEls.every(Boolean)) {
+      const dpr = window.devicePixelRatio || 1;
+      const w = Math.max(1, Math.floor(dpr));
+      const sw = w / dpr;
+      const o = list.getBoundingClientRect();
+      // The svg is painted at its box's origin ROUNDED to the device grid
+      // (a replaced element), and a border edge at v lands on device pixel
+      // round(v): so a line drawn where the old border was is centred on
+      // that pixel, counted from the svg's rounded origin. Measured against
+      // the old pseudo-element borders (scratchpad tree/ab): flooring, or
+      // counting from the unrounded origin (the rail's top sits on a half
+      // pixel), moved the trunk a column left and split the ticks across two
+      // rows.
+      const ox = Math.round(o.left * dpr), oy = Math.round(o.top * dpr);
+      const devX = (v: number) => Math.round((o.left + v) * dpr + 1e-3);
+      const devY = (v: number) => Math.round((o.top + v) * dpr + 1e-3);
+      const x = (devX((subEls[0] as HTMLElement).offsetLeft + TREE_X) - ox + w / 2) / dpr;
+      const top = (devY(lib.offsetTop + lib.offsetHeight) - oy) / dpr;
+      const n = (v: number) => +v.toFixed(3);
+      const subs = new Map<NavView, { y: number; from: (y: number) => string }>();
+      // Each branch from a point on the trunk: down to its tick, then right
+      // (the last one round a TREE_R elbow, as the old L's border radius).
+      const parts: string[] = [];
+      for (let i = 0; i < LIBRARY_SUBS.length; i++) {
+        const el = subEls[i] as HTMLElement;
+        const last = i === LIBRARY_SUBS.length - 1;
+        // A tick was a border-top at the row's middle (its first pixel there);
+        // the L's foot a border-bottom ending there (its last pixel above).
+        const y = (devY(el.offsetTop + el.offsetHeight / 2) - (last ? w : 0) - oy + w / 2) / dpr;
+        const r = Math.max(0, Math.min(TREE_R, y - top));
+        const from = last
+          ? (y0: number) => `M${n(x)} ${n(y0)}V${n(y - r)}A${r} ${r} 0 0 0 ${n(x + r)} ${n(y)}H${n(x + TREE_TICK)}`
+          : (y0: number) => `M${n(x)} ${n(y0)}V${n(y)}H${n(x + TREE_TICK)}`;
+        subs.set(LIBRARY_SUBS[i], { y, from });
+        // The whole trunk comes with the last branch; the others add a tick.
+        parts.push(last ? from(top) : `M${n(x)} ${n(y)}H${n(x + TREE_TICK)}`);
+      }
+      const d = parts.join("");
+      g = { key: `${d}|${sw}`, base: d, subs, top };
+      svgRef.current?.style.setProperty("--tree-sw", `${n(sw)}px`);
+    }
+    const prevGeom = geom.current;
+    geom.current = g;
+    if (!g) { base.setAttribute("d", ""); for (const l of lits) l?.setAttribute("d", ""); return; }
+    if (!prevGeom || prevGeom.key !== g.key) base.setAttribute("d", g.base);
+
+    // ---- the lit branch and the glint -------------------------------------
+    const prev = shown.current;
+    const next = activeId && g.subs.has(activeId) ? activeId : null;
+    shown.current = next;
+    const finishRuns = () => { for (const a of runs.current) a.cancel(); runs.current = []; };
+    // A re-layout or the first placement: draw the state, no motion.
+    if (prev === next || !prevGeom) {
+      if (prevGeom && prevGeom.key === g.key) return;
+      finishRuns();
+      const live = lits[cur.current] as SVGPathElement, spare = lits[1 - cur.current] as SVGPathElement;
+      spare.setAttribute("d", ""); spare.style.opacity = "0";
+      live.setAttribute("d", next ? g.subs.get(next)!.from(g.top) : "");
+      live.style.opacity = next ? "1" : "0";
+      live.style.strokeDasharray = "";
+      return;
+    }
+    finishRuns();
+    const reduced = reducedMotionActive();
+    const old = lits[cur.current] as SVGPathElement;
+    // Where the old branch and the new one part: the trunk above it stays lit.
+    const shared = prev && next ? Math.min(g.subs.get(prev)!.y, g.subs.get(next)!.y) : g.top;
+    if (prev) {
+      // Only the old branch's own stretch fades (from the parting point on).
+      old.setAttribute("d", g.subs.get(prev)!.from(next ? shared : g.top));
+      old.style.opacity = "0";
+      runs.current.push(old.animate([{ opacity: 1 }, { opacity: 0 }], { duration: TREE_FADE_MS, easing: "ease-out" }));
+    }
+    if (!next) return;
+    cur.current = 1 - cur.current;
+    const lit = lits[cur.current] as SVGPathElement;
+    const d = g.subs.get(next)!.from(g.top);
+    lit.setAttribute("d", d);
+    lit.style.opacity = "1";
+    lit.style.strokeDasharray = "";
+    if (reduced) {
+      runs.current.push(lit.animate([{ opacity: 0 }, { opacity: 1 }], { duration: TREE_FADE_MS, easing: "ease-out" }));
+      return;
+    }
+    // The run: the head travels from the parting point to the tick's end.
+    const L = lit.getTotalLength();
+    const s0 = Math.max(0, shared - g.top);
+    const root = getComputedStyle(document.documentElement);
+    const easing = root.getPropertyValue("--aura-spring-snappy").trim() || "cubic-bezier(0.25, 1.1, 0.4, 1)";
+    const dur = cssMs("--aura-spring-snappy-dur", 320);
+    const timing: KeyframeAnimationOptions = { duration: dur, easing };
+    // The branch lights up behind the head: one dash ending at the head and
+    // reaching back past the path's start (D > 2L), so the spring's overshoot
+    // (the snappy curve peaks at 1.02) never pulls its start off the trunk's
+    // root, as a dash starting at 0 did.
+    const D = 2 * L + 40;
+    const dash = `${n3(D)} ${n3(D)}`;
+    runs.current.push(lit.animate(
+      [{ strokeDasharray: dash, strokeDashoffset: n3(D - s0) }, { strokeDasharray: dash, strokeDashoffset: n3(D - L) }], timing));
+    // A dash of length `len` whose head is at distance s: offset len - s.
+    const strokes: [SVGPathElement | null, number, number][] = [
+      [halo.current, GLINT_HALO, 0], [tail.current, GLINT_TAIL, 0], [disp.current, GLINT_CORE, GLINT_DISP_LAG], [core.current, GLINT_CORE, 0],
+    ];
+    for (const [p, len, lag] of strokes) {
+      if (!p) continue;
+      p.setAttribute("d", d);
+      const da = `${len} ${n3(L + len + 20)}`;
+      runs.current.push(p.animate(
+        [{ strokeDasharray: da, strokeDashoffset: n3(len - s0 + lag) }, { strokeDasharray: da, strokeDashoffset: n3(len - L + lag) }],
+        { ...timing, fill: "forwards" }));
+    }
+    // The glint's fade: the cursor light's (260 ms ease-out cubic in, 600 ms
+    // in-out sine out), out from the moment the head lands.
+    const glint = glintRef.current;
+    if (glint) {
+      const total = dur + 600;
+      runs.current.push(glint.animate([
+        { opacity: 0, easing: "cubic-bezier(0.33, 1, 0.68, 1)" },
+        { opacity: 1, offset: Math.min(260, dur) / total },
+        { opacity: 1, offset: dur / total, easing: "cubic-bezier(0.37, 0, 0.63, 1)" },
+        { opacity: 0 },
+      ], { duration: total, fill: "forwards" }));
+    }
+  }, [activeId, layoutGen, winGen, listRef]);
+
+  useEffect(() => () => { for (const a of runs.current) a.cancel(); }, []);
+
+  return (
+    <svg ref={svgRef} className="aura-rail-tree" aria-hidden focusable="false">
+      <path ref={baseRef} className="aura-rail-tree-base" />
+      <path ref={lit0} className="aura-rail-tree-lit" />
+      <path ref={lit1} className="aura-rail-tree-lit" />
+      <g ref={glintRef} className="aura-rail-tree-glint" style={{ opacity: 0 }}>
+        <path ref={halo} className="is-halo" />
+        <path ref={tail} className="is-tail" />
+        <path ref={disp} className="is-disp" />
+        <path ref={core} className="is-core" />
+      </g>
+    </svg>
+  );
+}
+
+const n3 = (v: number) => +v.toFixed(3);
 
 // ---------------------------------------------------------------------------
 // useRailDroplet: Liquid's hover droplet (.aura-glass-hl) for the WHOLE rail.
@@ -530,46 +755,29 @@ function useRailDroplet(
 // ---------------------------------------------------------------------------
 // NavRow: transparent; the pill behind supplies the active indicator and the
 // label colour comes from glass-rail.css (accent in Frosted, accent 34% over
-// white in Liquid). A sub-row is indented under Library with a tree connector
-// (`.aura-rail-sub`, the last one an L) and plays a short shrink-and-restore on
-// click, since its smaller row makes a plain pill slide read as muted.
+// white in Liquid). A sub-row is indented under Library (`.aura-rail-sub`); its
+// tree connector is NavTree's, drawn over the list, not part of the row.
 // ---------------------------------------------------------------------------
 
-/** The sub-row click pulse (was the keyed `.aura-queue-click-pulse` wrapper,
- *  which remounted the button and dropped its focus). */
-const SUB_PULSE: Keyframe[] = [
-  { transform: "scale(1)" },
-  { transform: "scale(0.92)", offset: 0.45 },
-  { transform: "scale(1)" },
-];
-
-function NavRow({ item, active, parentLit, lastSub, onClick }: {
+function NavRow({ item, active, parentLit, onClick }: {
   item: ItemMeta;
   active: boolean;
   /** Library while one of its sub-views is the page. */
   parentLit: boolean;
-  /** The last sub-row under its parent (its connector is an L). */
-  lastSub: boolean;
   onClick: () => void;
 }) {
   return (
     <button
       type="button"
       data-nav-id={item.id}
-      onClick={(e) => {
-        if (item.sub && !reducedMotionActive()) {
-          e.currentTarget.animate?.(SUB_PULSE, { duration: 280, easing: "cubic-bezier(0.4, 0, 0.2, 1)" });
-        }
-        onClick();
-      }}
+      onClick={onClick}
       aria-label={item.label}
       aria-current={active ? "page" : undefined}
       data-parent-lit={parentLit ? "" : undefined}
       className={[
         "aura-rail-row aura-nav-row nav-tap",
         item.sub ? "aura-rail-sub" : "aura-rail-navrow",
-        lastSub ? "is-last" : "",
-      ].filter(Boolean).join(" ")}
+      ].join(" ")}
     >
       <span className="aura-rail-icon">{item.icon}</span>
       <span className="aura-rail-label">{item.label}</span>

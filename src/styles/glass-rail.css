@@ -259,35 +259,43 @@ html[data-glass="liquid"] .aura-rail-urow.is-active {
   box-shadow: 0 0 10px color-mix(in srgb, var(--ln-accent-mark) 55%, transparent);
 }
 
-/* Library's sub-rows: a tree connector from the parent's icon column. Every
-   sub-row but the last draws a straight trunk (from the gap above to its own
-   bottom, so the next one continues it) and a tick into its icon; the last
-   draws one rounded L that stops at its icon. */
-.aura-rail-sub::before,
-.aura-rail-sub::after {
-  content: "";
+/* Tree connector: Library's sub-rows hang off a trunk from Library's bottom
+   edge, a tick into each icon and a rounded L into the last (NavSidebar
+   NavTree, one SVG over the list: over the pill, under the rows, never moved
+   by a row's press). The branch to the active child is lit, and a click on a
+   sub-row runs a glint along it (the cursor light's cool white with its blue
+   fringe; NavTree drives the dashes and fades). Matte lights the branch in
+   the accent mark, as its pill; Clear in neutral white, as its pill. */
+.aura-rail-tree {
   position: absolute;
-  left: 16.8px;
+  left: 0;
+  top: 0;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
   pointer-events: none;
+  z-index: 1;
 }
-.aura-rail-sub::before {
-  top: calc(-1 * var(--rail-gap));
-  bottom: 0;
-  border-left: 1px solid rgb(255 255 255 / 0.2);
+.aura-rail-tree path {
+  fill: none;
+  stroke-width: var(--tree-sw, 1px);
 }
-.aura-rail-sub::after {
-  top: 50%;
-  width: 9px;
-  border-top: 1px solid rgb(255 255 255 / 0.2);
+.aura-rail-tree-base { stroke: rgb(255 255 255 / 0.2); }
+.aura-rail-tree-lit {
+  stroke: color-mix(in srgb, var(--ln-accent-mark) 60%, transparent);
+  opacity: 0;
 }
-.aura-rail-sub.is-last::before {
-  bottom: auto;
-  width: 9px;
-  height: calc(50% + var(--rail-gap));
-  border-bottom: 1px solid rgb(255 255 255 / 0.2);
-  border-bottom-left-radius: 6px;
-}
-.aura-rail-sub.is-last::after { display: none; }
+html[data-glass="liquid"] .aura-rail-tree-lit { stroke: rgb(255 255 255 / 0.38); }
+.aura-rail-tree-glint path { stroke-linecap: round; }
+.aura-rail-tree-glint .is-halo { stroke: rgb(255 255 255 / 0.12); stroke-width: 3px; }
+.aura-rail-tree-glint .is-tail { stroke: rgb(232 241 255 / 0.34); }
+.aura-rail-tree-glint .is-disp { stroke: rgb(70 150 255 / 0.8); }
+.aura-rail-tree-glint .is-core { stroke: rgb(232 241 255 / 0.95); stroke-width: 1.5px; }
+/* No hardware acceleration: no dispersion, as the cursor light. */
+html[data-glass-gpu="off"] .aura-rail-tree-glint .is-disp { display: none; }
+/* High Contrast: no light effects; the active branch reads by contrast. */
+html:is([data-theme="contrast"], [data-theme="contrast-azure"]) .aura-rail-tree-glint { display: none; }
+html:is([data-theme="contrast"], [data-theme="contrast-azure"]) .aura-rail-tree-lit { stroke: rgb(255 255 255 / 0.6); }
 
 /* ---- Hover droplet --------------------------------------------------- */
 /* ONE for the whole rail (NavSidebar useRailDroplet, `.aura-rail-hl`, the

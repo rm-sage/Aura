@@ -230,7 +230,7 @@ function CatalogPosterCard({
         style={{ aspectRatio: "2 / 3" }}
       >
         {meta.poster ? (
-          <ImageLoader
+          <ImageLoader catalog
             src={shrinkPoster(meta.poster)}
             alt={meta.name}
             className="absolute inset-0 w-full h-full"

@@ -913,13 +913,16 @@ function HomeViewBody({
           catalog is what makes the glass mean something: the art moves under
           it as the page scrolls.
           The scroller below compensates with matching top padding, so no
-          content is permanently parked underneath. */}
+          content is permanently parked underneath. Home's column starts at
+          the title bar (App's PageColumn pulls it up through the body's
+          12 px padding), so every top inset here carries those 12 px: the
+          bar's 16 + 12, the content's 66 + 12. */}
       <div
         // 36 px each side: the scroller's px-3 plus the hero row's px-6. It was
         // px-6 alone over the full width, so the hero sat half a scrollbar left
         // of the bar's centre, and on a window narrow enough not to reach the
         // hero's maximum width the bar was also wider than the hero.
-        className="absolute inset-x-0 top-0 z-30 pt-4 pb-2 pl-9 pointer-events-none"
+        className="absolute inset-x-0 top-0 z-30 pt-7 pb-2 pl-9 pointer-events-none"
         style={{ paddingRight: 36 + scrollbarW }}
       >
         <div
@@ -934,7 +937,7 @@ function HomeViewBody({
         // Same top inset as the scroller: the floating bar overlays this
         // branch too, and results starting underneath it would be unreachable
         // at the top of the list.
-        <div className="flex-1 min-h-0 flex flex-col pt-[66px]">
+        <div className="flex-1 min-h-0 flex flex-col pt-[78px]">
           <SearchView
             addons={submitSearchAddons}
             installedAddons={addons}
@@ -954,7 +957,7 @@ function HomeViewBody({
           // rows already self-pad (px-6) so net layout shift is minor and
           // uniform, and the symmetrical right inset softens the (latent)
           // identical clip on the rightmost card.
-          className="aura-page-scroller flex-1 min-h-0 overflow-y-auto px-3 pt-[66px]"
+          className="aura-page-scroller flex-1 min-h-0 overflow-y-auto px-3 pt-[78px]"
           style={{ scrollbarWidth: "thin", scrollbarColor: "rgba(255,255,255,0.08) transparent" }}
         >
           {/* Empty state when no addons */}

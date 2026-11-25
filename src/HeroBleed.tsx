@@ -36,7 +36,7 @@
 
 import { useEffect, useLayoutEffect, useRef } from "react";
 import { createPortal } from "react-dom";
-import { bleedGlows, bleedImage, type Glow, type HeroPalette } from "./heroAmbient";
+import { bleedGlows, bleedImage, UNDERGLOW_PAD, type Glow, type HeroPalette } from "./heroAmbient";
 import { releaseSvgImage } from "./glassGlint";
 // The Home row titles take their tint from these glows (bleedTint.ts).
 import { setBleedFade, setBleedTint } from "./bleedTint";
@@ -159,6 +159,23 @@ function writePatch(q: Patch, box: string, mask: string, img: string) {
   if (mask !== q.mask) { q.mask = mask; s.mask = mask; }
   if (img !== q.img) { q.img = img; s.background = img; }
 }
+/** Marked elements that lie partly or wholly over the hero, its underglow or
+ *  the page content below them right now (see measureOverHero). */
+const overHero = new WeakMap<HTMLElement, boolean>();
+/** Elements that changed sides and still owe a shadow snap (paintFaces). */
+const flipped = new Set<HTMLElement>();
+/** Finish an element's running box-shadow transition: its drop shadow moves
+ *  between itself and its patch child in one frame when it changes sides, and
+ *  the element's own 200 ms shadow transition otherwise shows it missing, then
+ *  doubled, for about 100 ms (measured in the harness: +5 to +7 levels around
+ *  the bar, then -8 to -11 under it). The same snap as liquidGlass.ts's. */
+function snapShadow(el: HTMLElement) {
+  if (typeof CSSTransition === "undefined" || !el.isConnected) return;
+  void getComputedStyle(el).boxShadow;
+  for (const a of el.getAnimations()) {
+    if (a instanceof CSSTransition && a.transitionProperty === "box-shadow") a.finish();
+  }
+}
 /** Take the face crop and the corner patch off an element. */
 function clearFace(el: HTMLElement) {
   el.style.removeProperty("--lg-bleed");
@@ -205,8 +222,82 @@ export default function HeroBleed({ palette, heroRef }: Props) {
     }
   };
 
+  // ---- over the hero art -------------------------------------------------
+  // The bleed lies UNDER the hero, so where a marked element sits over the
+  // hero's art (the search bar once the page scrolls the hero up under it)
+  // there is no bleed to continue, and its face crop and corner patch drew a
+  // flat slab of the bleed's colour over the art (2026-11-24, the user: the
+  // search bar "looks off now when on top of the hero item"). Scaling them by
+  // the share over the art was not enough: across the hero's top or bottom
+  // edge part of the bar is over the bleed and part over the art, and one
+  // background layer cannot follow that line (the user's video: a flat dark
+  // bar half over the green bleed). So an element over the hero at all takes
+  // NO hole, face crop or patch: its glass then reads the real page, bleed
+  // and art alike, as any glass does. The banding the cut prevents is a blur
+  // of the bleed alone; here the art is in the same blur.
+  //
+  // The area is not the hero box alone but everything from the hero's
+  // underglow down (2026-11-25, the user: "I still very faintly see the sharp
+  // corners next to the search bar when scrolling slowly near the hero
+  // item"). The patch is exact only where nothing but the bleed lies under
+  // the element: it paints the bleed OVER whatever the page draws there,
+  // where the page draws it UNDER (the underglow at -1, the rows). The
+  // underglow reaches 110 px past the hero (HeroCarousel useUnderglow; up to
+  // the top of the page content where that is nearer), so at rest the search
+  // bar already sits in it, and its four box corners showed the underglow's
+  // shadow painted over by the bleed: a sharp-edged corner off by about 1
+  // level, up to 4, growing as the hero came up (harness, scratchpad sbv/r3).
+  // Below the hero everything under the bar is page content, so the area runs
+  // on to the scroller's bottom: no switch back over the rows (the one-frame
+  // 8-level step over the first row's posters that an area ending with the
+  // underglow showed, sbv/r2). The rail lies outside the scroller and never
+  // changes sides.
+  //
+  // With the hero GONE (the leave fade, after Home's rows unmounted) a marked
+  // element still on screen is over page content too: a search swaps the rows
+  // for its results inside Home and the search bar stays (2026-11-25, the
+  // user: "the search bar leaves behind rectangles when something is actually
+  // searched"). The leave fade took it for clear of everything, cut it a hole
+  // and painted its patch; the bar then morphed from its focused width to its
+  // rest width with nothing re-cutting the hole, and the wide hole showed the
+  // window as a dark box either side of it for the fade's 900 ms. The rail
+  // lies outside the page and keeps its hole. Returns whether any element
+  // changed sides.
+  const measureOverHero = (): boolean => {
+    const hero = heroRef.current;
+    const gone = !hero || !hero.isConnected;
+    let hl = 0, ht = 0, hr = 0, hb = 0;
+    if (!gone) {
+      const r = hero.getBoundingClientRect();
+      const scroller = hero.closest<HTMLElement>(".aura-page-scroller");
+      // Only the part the page scroller shows (the bar floats outside it).
+      const sc = scroller?.getBoundingClientRect();
+      // The top of the page content, where the underglow stops short of its
+      // full reach (useUnderglow's room).
+      const contentTop = sc ? sc.top - scroller!.scrollTop : -Infinity;
+      hl = Math.max(r.left - UNDERGLOW_PAD, sc?.left ?? -Infinity);
+      ht = Math.max(r.top - UNDERGLOW_PAD, contentTop, sc?.top ?? -Infinity);
+      hr = Math.min(r.right + UNDERGLOW_PAD, sc?.right ?? Infinity);
+      hb = sc?.bottom ?? Infinity;
+    }
+    let changed = false;
+    for (const el of document.querySelectorAll<HTMLElement>(BLEED_SELECTOR)) {
+      // No hero: the page under a marked element is content (see above).
+      let over = gone && el.hasAttribute("data-glass-bleed");
+      if (!over && hr > hl && hb > ht) {
+        const r = el.getBoundingClientRect();
+        over = Math.min(r.right, hr) - Math.max(r.left, hl) > 0 && Math.min(r.bottom, hb) - Math.max(r.top, ht) > 0;
+      }
+      if ((overHero.get(el) ?? false) !== over) { overHero.set(el, over); flipped.add(el); changed = true; }
+    }
+    return changed;
+  };
+
   // ---- face crops and corner patches on [data-glass-bleed] ---------------
   const paintFaces = () => {
+    // A change of sides seen here re-cuts the holes too (cutHoles' own look
+    // then finds nothing new, so this does not recurse).
+    if (measureOverHero()) cutHoles();
     const cur = urls.current[front.current];
     const prev = urls.current[1 - front.current];
     const m = mix.current;
@@ -229,7 +320,7 @@ export default function HeroBleed({ palette, heroRef }: Props) {
     // the box corners and the band showing the window (black) for 0.8 s.
     const T0 = "linear-gradient(transparent, transparent)";
     for (const el of document.querySelectorAll<HTMLElement>(BLEED_SELECTOR)) {
-      if (!pimg.length) { clearFace(el); continue; }
+      if (!pimg.length || overHero.get(el)) { clearFace(el); continue; }
       // The focus dim is ONLY for a surface that rises above the search dim
       // while it holds focus (the Home search bar, `data-glass-bleed`): the
       // page's bleed around it is under the 0.7 black dim then. The rail sits
@@ -268,6 +359,8 @@ export default function HeroBleed({ palette, heroRef }: Props) {
       writePatch(q, q.box, q.mask, patch);
       if (!el.hasAttribute(PATCH_ATTR)) el.setAttribute(PATCH_ATTR, "");
     }
+    for (const el of flipped) snapShadow(el);
+    flipped.clear();
   };
 
   // ---- holes under [data-glass-bleed] ------------------------------------
@@ -327,7 +420,12 @@ export default function HeroBleed({ palette, heroRef }: Props) {
     const F = g > 1 ? FEATHER : 0;
     const holes: [number, number, number, number][] = [];
     const tiles: string[] = [];
+    // An element that changed sides since the last look (a resize, a slide
+    // build) changes its face in step with its hole.
+    if (measureOverHero()) paintFaces();
     for (const el of document.querySelectorAll<HTMLElement>(BLEED_SELECTOR)) {
+      // Over the hero: no hole (measureOverHero).
+      if (overHero.get(el)) continue;
       const r = el.getBoundingClientRect();
       if (r.width < 1 || r.height < 1) continue;
       let L: number, T: number, R: number, B: number;
@@ -633,7 +731,11 @@ export default function HeroBleed({ palette, heroRef }: Props) {
       // The titles move with every scroll, so they re-read even when the fade
       // holds (bleedTint.ts coalesces and waits out a user-driven scroll).
       setBleedFade(q);
-      if (q === fade.current) return;
+      // The hero moves under the search bar with every scroll step: when an
+      // element changes sides, its hole and face change in this same frame.
+      const moved = measureOverHero();
+      if (moved) cutHoles();
+      if (q === fade.current && !moved) return;
       fade.current = q;
       paintLayers();
       paintFaces();

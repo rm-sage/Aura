@@ -1946,7 +1946,7 @@ const HistoryCard = memo(function HistoryCard({
           className="relative flex-shrink-0 w-[68px] h-[102px] rounded-md overflow-hidden bg-white/5"
         >
           {entry.poster ? (
-            <ImageLoader
+            <ImageLoader catalog
               // ~68 CSS px at up to 2.5x DPI. The default 360 decoded a
               // poster five times the size this thumb can show.
               src={shrinkPoster(entry.poster, 180)}

@@ -1,17 +1,19 @@
 // Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useImageEpoch, withImageBust } from "./imageCacheBust";
 
 // ---------------------------------------------------------------------------
-// ImageLoader — global graceful fade-in for every poster / backdrop / logo.
+// ImageLoader: global graceful fade-in for every poster / backdrop / logo.
 //
 // Behaviour:
 //   • Pre-load: shimmer skeleton (animated linear-gradient) reserves the box.
-//   • onLoad:   image transitions opacity 0 → 1 over 300 ms, the skeleton
-//               cross-fades out simultaneously.
-//   • onError:  silent — the parent gets the placeholder via children fallback.
+//   • onLoad:   image transitions opacity 0 → 1 over 300 ms and the skeleton
+//               goes. With `catalog` (every catalog row and grid): a 1000 ms
+//               fade that a cached image gets too, the skeleton crossfading
+//               out under it (see the fade effect).
+//   • onError:  silent; the parent gets the placeholder via children fallback.
 //
 // Key invariant: the wrapper has the SAME box geometry whether the image is
 // loaded, loading, or errored. That kills layout shifts as images stream in
@@ -49,7 +51,16 @@ export interface ImageLoaderProps {
    *  oversized poster that tanks scroll (compositor re-rasters the big texture
    *  every frame). Label is the item name so the culprit is identifiable. */
   perfLabel?: string;
+  /** Catalog art (a poster or card in a row, grid or list): a slower fade
+   *  (CATALOG_FADE_MS) that also runs when the browser already has the image,
+   *  with the skeleton crossfading out under it. See the fade effect below. */
+  catalog?: boolean;
 }
+
+/** The catalog fade (2026-11-25; the user: catalog images should "slowly fade
+ *  in as they load, so switching to and from the home page isn't as
+ *  jarring", everywhere catalogs load). */
+const CATALOG_FADE_MS = 1000;
 
 /** Map an `api.ratingposterdb.com/.../imdb/poster-default/<tt…>.jpg` URL to
  *  the equivalent metahub poster URL. Returns null for any non-RPDB or
@@ -83,8 +94,16 @@ export default function ImageLoader({
   onError,
   fallback,
   perfLabel,
+  catalog = false,
 }: ImageLoaderProps) {
   const [loaded, setLoaded] = useState(false);
+  // Catalog fade only: the skeleton stays (fading out) until the image's fade
+  // has finished.
+  const [settled, setSettled] = useState(false);
+  const skeletonRef = useRef<HTMLSpanElement>(null);
+  // A caller that drives the image's opacity itself keeps it (the detail
+  // backdrop rides its own reveal).
+  const fades = catalog && imgStyle?.opacity === undefined;
   const [errored, setErrored] = useState(false);
   // Substitute URL we've swapped in after the original failed. Used for
   // the RPDB → metahub recovery path below. Distinct from `errored` so a
@@ -121,7 +140,16 @@ export default function ImageLoader({
 
   // Reset state whenever the src changes so the new image fades in cleanly.
   useEffect(() => {
+    const img = ref.current;
+    const ready = !!img && img.complete && img.naturalWidth > 0;
     setLoaded(false);
+    // An image already complete keeps `settled`: `loaded` comes back true in
+    // this same batch, so the fade effect would not run to settle it again,
+    // and a settled catalog card whose src swapped to a cached URL (a CW
+    // card's landscape art landing, a Calendar cell's detail poster) kept
+    // its skeleton shimmering over the poster for good. The fade effect runs
+    // on the src change itself (its deps), so the swap still fades.
+    if (!ready) setSettled(false);
     setErrored(false);
     setFallbackSrc(null);
     triedFallbackRef.current = false;
@@ -133,8 +161,7 @@ export default function ImageLoader({
     }
     // If the browser already had this URL cached, `onLoad` may not fire.
     // Detect that and short-circuit so we don't show an indefinite skeleton.
-    const img = ref.current;
-    if (img && img.complete && img.naturalWidth > 0) {
+    if (ready && img) {
       setLoaded(true);
       onLoad?.(img);
     }
@@ -142,6 +169,28 @@ export default function ImageLoader({
     // function. Resetting on src change is what matters here.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [src]);
+
+  // The catalog fade. A CSS transition on `opacity` runs only when the value
+  // CHANGES after the element was first styled, so an image the browser
+  // already had (every poster on a page you come back to) was marked loaded
+  // before its first paint and popped in at full strength, while the rest
+  // faded: the jarring page switch. A Web Animation from 0 runs either way,
+  // started here before the paint. The skeleton fades out on the same clock
+  // and is taken off when it ends (it used to vanish the moment the image
+  // started to fade, so the fade ran over the bare card).
+  useLayoutEffect(() => {
+    if (!fades || !loaded) return;
+    const img = ref.current;
+    const reduced = document.documentElement.getAttribute("data-reduced-motion") === "true";
+    if (!img || reduced || typeof img.animate !== "function") { setSettled(true); return; }
+    const timing: KeyframeAnimationOptions = { duration: CATALOG_FADE_MS, easing: "ease-out" };
+    const a = img.animate([{ opacity: 0 }, { opacity: 1 }], timing);
+    const s = skeletonRef.current?.animate([{ opacity: 1 }, { opacity: 0 }], { ...timing, fill: "forwards" });
+    a.onfinish = () => setSettled(true);
+    return () => { a.onfinish = null; a.cancel(); s?.cancel(); };
+    // `src` too: a swap to an image the browser already has never takes
+    // `loaded` through false (see the reset effect), and still fades.
+  }, [fades, loaded, src]);
 
   // Clear any pending retry timer on unmount so it can't fire into a dead card.
   useEffect(() => () => {
@@ -215,6 +264,11 @@ export default function ImageLoader({
         ...(/\b(absolute|fixed|sticky|relative)\b/.test(className ?? "")
           ? null
           : { position: "relative" as const }),
+        // The catalog fade crossfades the skeleton UNDER the image: the
+        // skeleton is positioned and the image is not, so without its own
+        // stacking context here (and the skeleton at -1 in it) the shimmer
+        // painted over the poster for the whole fade.
+        ...(fades ? { isolation: "isolate" as const } : null),
       }}
     >
       {/* Skeleton: visible until the image fires onLoad. Its shimmer is
@@ -225,11 +279,13 @@ export default function ImageLoader({
           shimmered forever, repainting and re-rastering on every frame of an
           otherwise idle Home (measured round 11: about 3 ms of GPU-process
           time per frame with two rows parked below the fold). */}
-      {!loaded && !errored && (
+      {!(fades ? settled : loaded) && !errored && (
         <span
+          ref={skeletonRef}
           aria-hidden
           data-skeleton-parked={inView ? undefined : ""}
           className={`absolute inset-0 ${skeletonClassName ?? "image-loader-skeleton"}`}
+          style={fades ? { zIndex: -1 } : undefined}
         />
       )}
 
@@ -316,7 +372,8 @@ export default function ImageLoader({
           className={`block ${imgClassName ?? ""}`}
           style={{
             opacity: loaded ? 1 : 0,
-            transition: "opacity 300ms ease-out",
+            // The catalog fade is an animation (see the fade effect).
+            ...(fades ? null : { transition: "opacity 300ms ease-out" }),
             ...imgStyle,
           }}
         />

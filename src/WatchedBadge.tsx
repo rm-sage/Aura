@@ -72,16 +72,43 @@ const VARIANT_LABEL: Record<NonNullable<Variant>, string> = {
   "in-progress": "In progress",
 };
 
+/** Where each glyph's ink box (stroke included) sits off the 24-unit grid's
+ *  centre: the check 0.2 / 0.3 units low-right, the fast-forward 0.75 right.
+ *  The viewBox moves by it so every glyph's ink box is centred in its disc. */
+const GLYPH_OFFSET: Record<NonNullable<Variant>, readonly [number, number]> = {
+  watched: [0.2, 0.3], skipped: [0.75, 0], planned: [0, 0], "in-progress": [0, 0],
+};
+
+/** `box`: the svg's CSS size; `glyph`: the size the 24-unit glyph is drawn at
+ *  inside it. The box is 14 px in both discs so the inset is a whole multiple
+ *  of 4 CSS px (frost (26 - 2 - 14) / 2 + 1 = 6, solid 4) and comes out whole
+ *  in device px at every Windows scale (2026-11-25; the user: the marks are
+ *  "off center by a few pixels"). An inset of 4.5 (frost, 15 px box) or 3.5
+ *  (solid, 13 px) was rounded to a whole pixel: every glyph sat a pixel right
+ *  and down at 100% (gaps 9 / 8 / 8 / 7 on the bookmark). Measured at the real
+ *  display scale (not Playwright's deviceScaleFactor, which rounds in CSS px):
+ *  centred within 0.4 device px at 100%, 150% and 200%, 0.62 at 125% and 175%
+ *  (was up to 1.4; the rest is the 26 px disc's own half-pixel width there).
+ *  Scratchpad wf/marks. */
+function markViewBox(variant: NonNullable<Variant>, box: number, glyph: number): string {
+  const span = (24 * box) / glyph;
+  const o = (24 - span) / 2;
+  const [dx, dy] = GLYPH_OFFSET[variant];
+  const r = (n: number) => +n.toFixed(3);
+  return `${r(o + dx)} ${r(o + dy)} ${r(span)} ${r(span)}`;
+}
+
 /** The state glyph, one set for both materials so every state draws at the
  *  SAME size (round 12: the in-progress mark was a bare 8 px dot in a 22 px
  *  disc on the art and a 14 px disc beside the CW title, while the other
  *  three were glyphs in 22 px discs). In progress is a half-filled ring: a
  *  glyph of the check's size that still reads "partly done" by shape, so the
  *  four states read apart without colour. */
-function MarkGlyph({ variant, size }: { variant: NonNullable<Variant>; size: number }) {
+function MarkGlyph({ variant, box, glyph }: { variant: NonNullable<Variant>; box: number; glyph: number }) {
+  const viewBox = markViewBox(variant, box, glyph);
   if (variant === "in-progress") {
     return (
-      <svg width={size} height={size} viewBox="0 0 24 24" aria-hidden>
+      <svg width={box} height={box} viewBox={viewBox} aria-hidden>
         <circle cx="12" cy="12" r="8.2" fill="none" stroke="currentColor" strokeWidth="2.6" />
         <path d="M12 3.8A8.2 8.2 0 0 1 12 20.2Z" fill="currentColor" />
       </svg>
@@ -90,7 +117,7 @@ function MarkGlyph({ variant, size }: { variant: NonNullable<Variant>; size: num
   // A hairline stroke in the fill colour thickens the thin check and the
   // bookmark's edges by about half a pixel, so they hold up on bright art.
   return (
-    <svg width={size} height={size} viewBox="0 0 24 24" fill="currentColor"
+    <svg width={box} height={box} viewBox={viewBox} fill="currentColor"
          stroke="currentColor" strokeWidth={1} strokeLinejoin="round" aria-hidden>
       <path d={
         variant === "watched" ? "M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"
@@ -119,7 +146,7 @@ function FrostMark({ variant, className }: { variant: NonNullable<Variant>; clas
       className={`aura-frost aura-watch-mark is-${variant} inline-flex items-center justify-center
                   w-[26px] h-[26px] rounded-full ${className ?? ""}`}
     >
-      <MarkGlyph variant={variant} size={15} />
+      <MarkGlyph variant={variant} box={14} glyph={15} />
     </span>
   );
 }
@@ -153,7 +180,7 @@ export function WatchedBadgeStatic({
       className={`inline-flex items-center justify-center w-[22px] h-[22px] rounded-full
                   ${fill} shadow-[0_2px_8px_rgba(0,0,0,0.45)] ${className ?? ""}`}
     >
-      <MarkGlyph variant={variant} size={13} />
+      <MarkGlyph variant={variant} box={14} glyph={13} />
     </span>
   );
 }
