@@ -1,7 +1,7 @@
 // Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useEffect, useRef } from "react";
+import { memo, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { streamQueryAddons } from "./auraSettings";
 import { streamMatchKey } from "./watchTogether/streamMatch";
@@ -34,7 +34,7 @@ import { relinkDownload, relinkFailed, useDownloads } from "./downloadsStore";
 // fallback exists for.
 // ---------------------------------------------------------------------------
 
-export default function DownloadsRelinkBridge({ addons }: { addons: AddonEntry[] }) {
+function DownloadsRelinkBridge({ addons }: { addons: AddonEntry[] }) {
   const { jobs } = useDownloads();
   // Jobs already being worked on, so a re-render mid-flight does not fire a
   // second query for the same one.
@@ -102,3 +102,9 @@ export default function DownloadsRelinkBridge({ addons }: { addons: AddonEntry[]
 
   return null;
 }
+
+// Memoized: App renders this host with no props (or only primitives / its own
+// stable state) and re-renders on every playback-update tick. The host is
+// driven by its own state and store subscriptions, so skipping those renders
+// changes nothing on screen.
+export default memo(DownloadsRelinkBridge);

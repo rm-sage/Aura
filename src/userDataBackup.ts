@@ -20,7 +20,8 @@
 //     and new snapshots restore through one path. NOTE the different scope:
 //     history keys on the stable user_id, everything else here on the
 //     auth_key prefix, so the payload carries both.
-//   • aura:auto-bumped-series:v1 — auto-bumped flags (cross-scope).
+//   • aura:auto-bumped-series:<scope> — auto-bumped flags (per account since
+//     v2.4.0; older snapshots carry the device-wide `...:v1` set).
 //   • aura:settings:v1           — AuraSettings (cross-scope).
 //
 // What this DOESN'T protect: Stremio's cloud-synced library (datastoreGet
@@ -48,7 +49,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { reloadManualWatchedFromStorage } from "./manualWatched";
 import { reloadSkipMarksFromStorage } from "./skipMarks";
-import { reloadAutoBumpedFromStorage } from "./autoBumped";
+import { reloadAutoBumpedFromStorage, autoBumpedStorageKey } from "./autoBumped";
 import {
   getHistoryScope,
   historyReady,
@@ -68,7 +69,6 @@ const KEYS = {
   /** The pre-file localStorage home of history, cleared on restore so the
    *  one-time migration cannot union stale rows back over a restored list. */
   history:        "aura:history:",             // suffix: scope
-  autoBumped:     "aura:auto-bumped-series:v1",
   auraSettings:   "aura:settings:v1",
 } as const;
 
@@ -159,7 +159,7 @@ export function collectBackupPayload(
       manualState:  localStorage.getItem(`${KEYS.manualState}${safeScope}`),
       skipMarks:    localStorage.getItem(`${KEYS.skipMarks}${safeScope}`),
       history:      null,
-      autoBumped:   localStorage.getItem(KEYS.autoBumped),
+      autoBumped:   localStorage.getItem(autoBumpedStorageKey(safeScope)),
       auraSettings: localStorage.getItem(KEYS.auraSettings),
     },
   };
@@ -205,7 +205,9 @@ export function applyBackupPayload(payload: BackupPayload): void {
 
   writeOrRemove(`${KEYS.manualState}${safeScope}`, v.manualState);
   writeOrRemove(`${KEYS.skipMarks}${safeScope}`, v.skipMarks ?? null);
-  writeOrRemove(KEYS.autoBumped,                   v.autoBumped);
+  // Into this scope's key. A pre-v2.4.0 snapshot holds the device-wide id
+  // array, which autoBumped.ts still reads (as undated bumps).
+  writeOrRemove(autoBumpedStorageKey(safeScope),   v.autoBumped);
 
   // History goes into the store. Null meant "the key was absent" when the
   // snapshot was taken, which restored as an empty history, so it still does.

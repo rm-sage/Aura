@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { invoke } from "@tauri-apps/api/core";
-import { loadAuraSettings, saveAuraSettings, getSettingsUpdatedAt, setSettingsUpdatedAt, bumpSettingsUpdatedAt, setSettingsStampScope, clearSettingsUpdatedAt, type AuraSettings, DEFAULT_AURA_SETTINGS } from "./auraSettings";
+import { loadAuraSettings, saveAuraSettings, getSettingsUpdatedAt, setSettingsUpdatedAt, bumpSettingsUpdatedAt, setSettingsStampScope, clearSettingsUpdatedAt, type AuraSettings, DEFAULT_AURA_SETTINGS, LEGACY_GLASS, MATERIAL_NOTICE_ID } from "./auraSettings";
 import { encryptForCloud, decryptFromCloud, isEncryptedBlob, type EncryptedBlob } from "./syncCrypto";
 import {
   encodeHistoryForCloud, mergeHistoryFromCloud, historyChangeReason, getHistoryScope,
@@ -10,6 +10,9 @@ import {
 } from "./historyStore";
 import { isWindowHidden, subscribeWindowVisibility } from "./windowVisibility";
 import { safeSetItem } from "./storageQuota";
+import { AUDIO_ORDER_NOTICE_ID } from "./legacyAudioPriority";
+import { HDR_OFFER_NOTICE_ID } from "./hdrMode";
+import { mergeAutoBumpedWire } from "./autoBumpedWire";
 
 // ---------------------------------------------------------------------------
 // Aura Cloud sync orchestrator (frontend)
@@ -29,8 +32,9 @@ import { safeSetItem } from "./storageQuota";
 //         manual-state    — union with tombstone-aware deletions
 //         skip-marks      - union of episode ids (a skip made on one
 //                           device applies everywhere)
-//         auto-bumped     — union of IDs (a finished series is finished
-//                           on every device)
+//         auto-bumped     - per account since v2.4.0, newest entry per id
+//                           wins, clears included (autoBumpedWire.ts); a
+//                           pre-v2.4.0 blob is ignored, not merged
 //         notifications   — union dedup'd on (kind, id, ts), capped 100
 //         recent-searches — server-wins (cheap, not worth merging)
 //         title-state     — per-title last-writer-wins
@@ -112,7 +116,6 @@ export type SyncNamespace = (typeof SYNC_NAMESPACES)[number];
 // AND the frontend auraSettings (localStorage) into one blob. `title-
 // state` and `anilist-id-map` live entirely on the Rust side.
 const LOCAL_KEYS: Partial<Record<SyncNamespace, string>> = {
-  "auto-bumped":     "aura:auto-bumped-series:v1",
   notifications:     "aura:notifications:v1",
   "recent-searches": "aura:recent-searches",
 };
@@ -228,6 +231,7 @@ function resetSyncSession(): void {
   lastEtag.clear();
   historyCloudAbsent = false;
   settingsCloudAbsent = false;
+  settingsPulledThisSession = false;
   // A pull or push already in flight belongs to the account being left: it
   // must not merge into, or stamp etags for, the next one (see accountGen).
   accountGen++;
@@ -351,11 +355,19 @@ const mergeSettings: MergeFn<{ backend: Record<string, unknown>; frontend: AuraS
   return (local.updated_at ?? 0) > (server.updated_at ?? 0) ? local : server;
 };
 
+/** True when the last auto-bumped merge produced something the cloud does
+ *  not hold (writeLocal then re-publishes it). Set by the merger, read by
+ *  writeLocal right after it on both paths (pull, 412). */
+let autoBumpedMergeDiffers = false;
+
 const mergeAutoBumped: MergeFn<string[]> = (local, server) => {
-  // A series the user finished on EITHER device should stay finished
-  // everywhere. Union semantics: dedupe by string identity.
-  const set = new Set<string>([...(local ?? []), ...(server ?? [])]);
-  return Array.from(set);
+  // Per-id newest wins, clears included; a pre-v2.4.0 server blob (the old
+  // device-wide union) contributes nothing. See autoBumpedWire.ts.
+  const merged = mergeAutoBumpedWire(local, server, Date.now());
+  const serverSet = new Set(Array.isArray(server) ? server : []);
+  autoBumpedMergeDiffers =
+    merged.length !== serverSet.size || merged.some((s) => !serverSet.has(s));
+  return merged;
 };
 
 interface NotificationEntry {
@@ -398,7 +410,20 @@ const NOTIFICATION_ABSOLUTE_MAX = 1000;
  *  this filter only gates the cloud round-trip. */
 function stripUpdateKinds(blob: NotificationEntry[] | null | undefined): NotificationEntry[] {
   if (!Array.isArray(blob)) return [];
-  return blob.filter((n) => n.kind !== "update");
+  return blob.filter((n) => !isDeviceLocalNotification(n));
+}
+
+/** Entries that describe THIS device and never travel: update notices (see
+ *  stripUpdateKinds) and the one-time "Send HDR?" offer, which is about this
+ *  machine's display (another device may have no HDR display, and its "Turn
+ *  on" would switch that device), and the one-time "New look options" notice,
+ *  which belongs to this install's glass-defaults migration (a newer device
+ *  already chose its material in the setup wizard), and the "Audio order
+ *  updated" notice, whose data names this device's settings scope (its Undo
+ *  writes the synced list, so other devices follow anyway). */
+function isDeviceLocalNotification(n: NotificationEntry): boolean {
+  return n.kind === "update" || n.id === HDR_OFFER_NOTICE_ID || n.id === MATERIAL_NOTICE_ID
+    || n.id === AUDIO_ORDER_NOTICE_ID;
 }
 
 const mergeNotifications: MergeFn<NotificationEntry[]> = (local, server) => {
@@ -717,10 +742,20 @@ async function readSettingsBlob(): Promise<SettingsSyncBlob> {
   // `gpu_acceleration` is machine-local too: it is a per-machine GPU
   // workaround (Rust keeps it in render.json), and a laptop's "off" synced to
   // a desktop would silently drop that machine to software rendering.
+  // The HDR settings likewise describe this machine's display (Rust keeps
+  // them in render.json too): a desktop's Send HDR synced to a laptop with an
+  // SDR panel would wash out every HDR video there.
+  // `real_glass` (Real glass over video) runs an mpv shader on this machine's
+  // GPU (Rust keeps it in render.json too): a desktop's opt-in synced to a
+  // weak laptop GPU would switch an experiment on there unasked.
   const backendShared: BackendSettingsLite = { ...backend };
   delete (backendShared as Record<string, unknown>).download_dir;
   delete (backendShared as Record<string, unknown>).screenshot_dir;
   delete (backendShared as Record<string, unknown>).gpu_acceleration;
+  delete (backendShared as Record<string, unknown>).hdr_mode;
+  delete (backendShared as Record<string, unknown>).hdr_enabled;
+  delete (backendShared as Record<string, unknown>).hdr_target_peak_nits;
+  delete (backendShared as Record<string, unknown>).real_glass;
   return { backend: backendShared, frontend, updated_at: getSettingsUpdatedAt(), api_keys };
 }
 
@@ -743,6 +778,20 @@ async function writeSettingsBlob(blob: Partial<SettingsSyncBlob>): Promise<void>
       download_dir: localBackend.download_dir,
       screenshot_dir: localBackend.screenshot_dir,
       gpu_acceleration: localBackend.gpu_acceleration,
+      hdr_mode: localBackend.hdr_mode,
+      hdr_enabled: localBackend.hdr_enabled,
+      hdr_target_peak_nits: localBackend.hdr_target_peak_nits,
+      real_glass: localBackend.real_glass,
+      // The one-time audio order check (audioPriorityRepair.ts) only ever
+      // goes from not run to run: a blob from a device that has not run it,
+      // or from a build before the flag, never re-arms it here. With no
+      // settings etag held, the local flag is not this account's (a scope
+      // with no file inherits the previous scope's cache in settings.rs), so
+      // only the cloud's value counts, written explicitly so the shallow
+      // merge cannot keep the inherited one.
+      audio_priority_repaired:
+        blob.backend.audio_priority_repaired === true
+        || (lastEtag.has("settings") && localBackend.audio_priority_repaired === true),
     });
     if (gen !== accountGen) return;
     // After the write landed, and never a local edit (see installSyncTriggers).
@@ -759,12 +808,37 @@ async function writeSettingsBlob(blob: Partial<SettingsSyncBlob>): Promise<void>
     // choice on this device, which read as "the grouping never remembers".
     // These are per-device UI prefs, not account data, so the local value wins.
     const local = loadAuraSettings();
+    // Read before the setSettingsUpdatedAt at the end of this function: 0 means
+    // this account has never synced on this machine.
+    const neverSyncedHere = getSettingsUpdatedAt() === 0;
+    const incoming = (typeof blob.frontend === "object" ? blob.frontend : {}) as Partial<AuraSettings>;
     saveAuraSettings(
       {
         ...DEFAULT_AURA_SETTINGS,
         ...blob.frontend,
         airingGroupBy: local.airingGroupBy,
         airingSort: local.airingSort,
+        // A blob from a build before the material choice says nothing about it
+        // (like writeApiKeyBundle's senderKnows): keep this device's value,
+        // except on a device that has never synced this account, where the
+        // account's old look wins. readFromStorage normalizes a junk value.
+        glassStyle: "glassStyle" in incoming
+          ? (incoming.glassStyle as AuraSettings["glassStyle"])
+          : neverSyncedHere ? LEGACY_GLASS.glassStyle : local.glassStyle,
+        glassCursorGlow: "glassCursorGlow" in incoming
+          ? (incoming.glassCursorGlow as boolean)
+          : neverSyncedHere ? LEGACY_GLASS.glassCursorGlow : local.glassCursorGlow,
+        // The Cursor glow tuning, the same way: a blob from a build before it
+        // keeps this device's values. readFromStorage clamps what arrives.
+        glassGlowTune: "glassGlowTune" in incoming
+          ? (incoming.glassGlowTune as AuraSettings["glassGlowTune"])
+          : local.glassGlowTune,
+        // Same for the custom accents: a blob from a build before them says
+        // nothing, so keep this device's picks rather than wiping them.
+        // readFromStorage validates whatever arrives (hex only, capped).
+        themeAccents: "themeAccents" in incoming
+          ? (incoming.themeAccents as AuraSettings["themeAccents"])
+          : local.themeAccents,
       },
       { fromCloud: true },
     );
@@ -816,6 +890,14 @@ async function readLocal(namespace: SyncNamespace): Promise<unknown> {
   if (namespace === "manual-state") {
     return readManualStateAggregate();
   }
+  if (namespace === "auto-bumped") {
+    // Per-account store, read in its wire shape. Dynamic import as for
+    // skip-marks below.
+    try {
+      const m = await import("./autoBumped");
+      return m.getAutoBumpedWire();
+    } catch { return null; }
+  }
   if (namespace === "skip-marks") {
     // skipMarks owns the scoped localStorage entry; its in-memory set is the
     // authoritative read and is already the wire shape (a string array).
@@ -863,6 +945,19 @@ async function writeLocal(namespace: SyncNamespace, value: unknown): Promise<voi
     writeManualStateAggregate(value as ManualState);
     return;
   }
+  if (namespace === "auto-bumped") {
+    // Pushes again only when the merge holds something the cloud does not
+    // (a newer local entry, or a pre-v2.4.0 cloud blob to replace).
+    const push = autoBumpedMergeDiffers;
+    autoBumpedMergeDiffers = false;
+    try {
+      const m = await import("./autoBumped");
+      m.replaceAutoBumpedFromWire(value, { push });
+    } catch (e) {
+      console.warn("[sync] writeLocal auto-bumped failed:", e);
+    }
+    return;
+  }
   if (namespace === "skip-marks") {
     // silent: true for the same reason as history - the change event is what
     // schedules a debounced push, so notifying here would make every pull
@@ -891,7 +986,7 @@ async function writeLocal(namespace: SyncNamespace, value: unknown): Promise<voi
     // disk row, AND the rehydrate event would push the clobbered
     // value back into React state. Re-reading current disk and
     // unioning closes the race. Other namespaces don't have
-    // concurrent producers (settings/auto-bumped/recent-searches all
+    // concurrent producers (settings/recent-searches all
     // write in response to user actions, never autonomously while a
     // pull is in flight), so the extra read is targeted.
     if (namespace === "notifications") {
@@ -904,7 +999,7 @@ async function writeLocal(namespace: SyncNamespace, value: unknown): Promise<voi
         // would silently drop the user's pending update banner the
         // moment a sync pull rehydrates the buffer.
         const localUpdates = (current as NotificationEntry[])
-          .filter((n) => n.kind === "update");
+          .filter(isDeviceLocalNotification);
         const merged = mergeNotifications(
           current as NotificationEntry[],
           value as NotificationEntry[],
@@ -915,7 +1010,7 @@ async function writeLocal(namespace: SyncNamespace, value: unknown): Promise<voi
         // stripUpdateKinds, but guard anyway).
         const seen = new Set(merged.map((n) => `${n.kind}::${n.id ?? ""}`));
         for (const u of localUpdates) {
-          const key = `update::${u.id ?? ""}`;
+          const key = `${u.kind}::${u.id ?? ""}`;
           if (!seen.has(key)) merged.push(u);
         }
         merged.sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0));
@@ -926,14 +1021,9 @@ async function writeLocal(namespace: SyncNamespace, value: unknown): Promise<voi
     // Notify in-window subscribers of the underlying store AND force
     // their in-memory mirrors to rehydrate from the freshly written
     // localStorage. Without the rehydrate, consumers that cache state
-    // in module-scope variables (autoBumped's _cache, the
-    // NotificationsContext React state) keep serving the pre-pull
-    // values until reload. Dynamic imports keep this tree-shake-safe
-    // and don't pull autoBumped/NotificationsContext into the test
-    // surface for non-Tauri contexts.
-    if (namespace === "auto-bumped") {
-      import("./autoBumped").then((m) => m.reloadAutoBumpedFromStorage()).catch(() => {});
-    } else if (namespace === "notifications") {
+    // in module-scope variables (the NotificationsContext React state)
+    // keep serving the pre-pull values until reload.
+    if (namespace === "notifications") {
       window.dispatchEvent(new CustomEvent("aura:notifications-rehydrate"));
     }
   } catch (e) {
@@ -1102,6 +1192,7 @@ export function syncPullAll(): Promise<void> {
               // so it carries that edit's stamp over the values from before it.
               if (ns !== "settings" || merged !== local) await writeLocal(ns, merged);
               if (gen !== accountGen) break;
+              if (ns === "settings") settingsPulledThisSession = true;
               // The settings write is fromCloud and schedules no push. When a 200's
               // merge KEPT this device's newer blob, push it here, or it would wait
               // for the next local change. A 304 never gets here: see the
@@ -1132,7 +1223,10 @@ export function syncPullAll(): Promise<void> {
           // The cloud is the copy this device merged, so an edit still marked
           // never landed: publish it. Armed here, not at the end of the pull: a
           // pull that did not answer for settings proves nothing about the etag.
-          if (ns === "settings" && readSettingsUnpushed() !== null) debouncedPush("settings");
+          if (ns === "settings") {
+            settingsPulledThisSession = true;
+            if (readSettingsUnpushed() !== null) debouncedPush("settings");
+          }
         } else if (outcome.status === "missing") {
           // 404 — server has no blob for this namespace. Drop any
           // local etag pointing at a vanished blob so the next pull
@@ -1147,7 +1241,10 @@ export function syncPullAll(): Promise<void> {
             etagsMutated = true;
           }
           // Nothing in the cloud to overwrite, so the null If-Match is safe.
-          if (ns === "settings" && readSettingsUnpushed() !== null) debouncedPush("settings");
+          if (ns === "settings") {
+            settingsPulledThisSession = true;
+            if (readSettingsUnpushed() !== null) debouncedPush("settings");
+          }
         }
       }
       if (etagsMutated && gen === accountGen) persistEtags();
@@ -1244,7 +1341,7 @@ export async function syncPush(namespace: SyncNamespace): Promise<void> {
  *  the full list including updates. */
 function sanitizeForPush(namespace: SyncNamespace, local: unknown): unknown {
   if (namespace === "notifications" && Array.isArray(local)) {
-    return (local as NotificationEntry[]).filter((n) => n.kind !== "update");
+    return (local as NotificationEntry[]).filter((n) => !isDeviceLocalNotification(n));
   }
   return local;
 }
@@ -1367,8 +1464,25 @@ function clearSettingsUnpushed(seen: string | null): void {
  *  as historyCloudAbsent. A device holding an etag does not need it (a 412 merges). */
 let settingsCloudAbsent = false;
 
+/** This session's pull answered for settings (a 200 merged, a 304 or a 404)
+ *  for the current account, or a settings push landed. NOT the persisted etag:
+ *  that is loaded when the scope is entered, before any pull, and outlives a
+ *  failed one (an offline launch), so it says nothing about this session. */
+let settingsPulledThisSession = false;
+
+/** `scope` is still the active one and a local settings edit made now will
+ *  publish rather than be replaced: this session's pull has merged the
+ *  account's cloud settings, or found none. Always true for a guest. */
+export function settingsCloudSettled(scope: string): boolean {
+  if (activeScope() !== scope) return false;
+  // A 404 sets settingsPulledThisSession too (settingsCloudAbsent implies it).
+  return scope === "guest" || settingsPulledThisSession;
+}
+
 function noteSettingsPushLanded(seen: string | null): void {
   settingsCloudAbsent = false;
+  // The cloud now holds this device's blob.
+  settingsPulledThisSession = true;
   clearSettingsUnpushed(seen);
 }
 
@@ -1581,7 +1695,10 @@ let triggersInstalled = false;
 
 /** Machine-local backend fields, stripped from the blob both ways (see
  *  readSettingsBlob): changing only these must not make this device's blob win. */
-const MACHINE_LOCAL_BACKEND_KEYS = ["download_dir", "screenshot_dir", "gpu_acceleration"];
+const MACHINE_LOCAL_BACKEND_KEYS = [
+  "download_dir", "screenshot_dir", "gpu_acceleration",
+  "hdr_mode", "hdr_enabled", "hdr_target_peak_nits", "real_glass",
+];
 
 /** Is this settings event a local edit worth a stamp and a push? Not a cloud
  *  pull's own write, and not a save that changed nothing: SettingsView saves on

@@ -576,6 +576,19 @@ pub type MpvTerminateDestroyFn = unsafe extern "C" fn(ctx: *mut mpv_handle);
 pub type MpvCommandFn =
     unsafe extern "C" fn(ctx: *mut mpv_handle, args: *mut *const c_char) -> c_int;
 
+/// `int mpv_command_async(mpv_handle *ctx, uint64_t reply_userdata,
+/// const char **args)`. mpv copies `args` before returning, runs the command
+/// on its core thread and later queues an `MPV_EVENT_COMMAND_REPLY` carrying
+/// `reply_userdata` (its `mpv_event_command` result is owned by mpv and freed
+/// on the next `mpv_wait_event`). Used where a synchronous `mpv_command` would
+/// park the engine thread on the video-output thread (the glass shader
+/// parameters: 6 to 9 ms per call while playing).
+pub type MpvCommandAsyncFn = unsafe extern "C" fn(
+    ctx: *mut mpv_handle,
+    reply_userdata: u64,
+    args: *mut *const c_char,
+) -> c_int;
+
 /// `int mpv_command_string(mpv_handle *ctx, const char *args)`.
 pub type MpvCommandStringFn =
     unsafe extern "C" fn(ctx: *mut mpv_handle, args: *const c_char) -> c_int;
@@ -764,6 +777,7 @@ pub struct Libmpv {
     pub destroy: MpvDestroyFn,
     pub terminate_destroy: MpvTerminateDestroyFn,
     pub command: MpvCommandFn,
+    pub command_async: MpvCommandAsyncFn,
     pub command_string: MpvCommandStringFn,
     pub command_node: MpvCommandNodeFn,
     pub set_property: MpvSetPropertyFn,
@@ -907,6 +921,8 @@ impl Libmpv {
                 b"mpv_terminate_destroy\0",
             )?;
             let command = resolve::<MpvCommandFn>(&lib, b"mpv_command\0")?;
+            let command_async =
+                resolve::<MpvCommandAsyncFn>(&lib, b"mpv_command_async\0")?;
             let command_string =
                 resolve::<MpvCommandStringFn>(&lib, b"mpv_command_string\0")?;
             let command_node =
@@ -991,6 +1007,7 @@ impl Libmpv {
                 destroy,
                 terminate_destroy,
                 command,
+                command_async,
                 command_string,
                 command_node,
                 set_property,

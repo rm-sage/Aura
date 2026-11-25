@@ -1,7 +1,7 @@
 // Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useCallback, useEffect, useState } from "react";
+import { memo, useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -53,7 +53,7 @@ async function closeForReal(): Promise<void> {
   }
 }
 
-export default function DownloadsClosePrompt() {
+function DownloadsClosePrompt() {
   const [open, setOpen] = useState(false);
   const [req, setReq] = useState<CloseRequest>({ active: 0, unpausable: 0 });
   const [busy, setBusy] = useState(false);
@@ -116,16 +116,18 @@ export default function DownloadsClosePrompt() {
 
   return (
     <div
-      className="aura-modal-backdrop-in fixed inset-0 z-[10600] flex items-center justify-center
-                 bg-black/60 backdrop-blur-sm"
+      className="fixed inset-0 z-[10600] flex items-center justify-center"
       onClick={() => !busy && dismiss()}
     >
+      {/* Dim + blur on a sibling layer, never the wrapper: an ancestor's
+          backdrop-filter (or fading opacity) would blind the card's glass. */}
+      <div aria-hidden className="aura-modal-backdrop-in absolute inset-0 bg-black/60 backdrop-blur-sm" />
       <div
         role="dialog"
         aria-modal="true"
         aria-label="Downloads in progress"
-        className="aura-modal-card-in glass-panel-elevated rounded-3xl px-7 py-6 w-full
-                   max-w-[460px] mx-4 shadow-glass-edge flex flex-col gap-5"
+        className="aura-modal-card-in aura-float-glass relative rounded-3xl px-7 py-6 w-full
+                   max-w-[460px] mx-4 flex flex-col gap-5"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex flex-col gap-2">
@@ -153,10 +155,8 @@ export default function DownloadsClosePrompt() {
             type="button"
             disabled={busy}
             onClick={dismiss}
-            className="px-4 py-1.5 rounded-full text-xs font-medium
-                       bg-white/5 text-white/70 border border-white/15
-                       hover:bg-white/12 hover:text-white transition-colors
-                       disabled:opacity-50"
+            className="aura-glass-flat aura-glass-press px-4 py-1.5 rounded-full text-xs font-medium
+                       text-white/70 hover:text-white disabled:opacity-50"
           >
             Keep Aura open
           </button>
@@ -164,11 +164,9 @@ export default function DownloadsClosePrompt() {
             type="button"
             disabled={busy}
             onClick={() => void quit()}
-            className={`px-4 py-1.5 rounded-full text-xs font-semibold border
-                        transition-all disabled:opacity-60 ${
-                          lost > 0
-                            ? "bg-rose-500/85 text-white border-rose-300/50 hover:bg-rose-500"
-                            : "bg-ln-accent text-black border-ln-accent hover:brightness-110"
+            className={`aura-glass-flat aura-glass-press px-4 py-1.5 rounded-full text-xs font-semibold
+                        disabled:opacity-60 ${
+                          lost > 0 ? "is-cta-danger text-white" : "is-cta text-ln-accent-ink"
                         }`}
           >
             {busy ? "Stopping" : lost > 0 ? "Stop and quit" : "Pause and quit"}
@@ -178,3 +176,9 @@ export default function DownloadsClosePrompt() {
     </div>
   );
 }
+
+// Memoized: App renders this host with no props (or only primitives / its own
+// stable state) and re-renders on every playback-update tick. The host is
+// driven by its own state and store subscriptions, so skipping those renders
+// changes nothing on screen.
+export default memo(DownloadsClosePrompt);

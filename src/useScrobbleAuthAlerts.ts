@@ -15,7 +15,7 @@ import {
 } from "./scrobbleConn";
 
 // ---------------------------------------------------------------------------
-// useScrobbleAuthAlerts: surfaces expired Trakt / AniList / Simkl tokens in
+// useScrobbleAuthAlerts: surfaces expired AniList / Simkl tokens in
 // the notification bell so users notice without having to open Settings.
 //
 // Trigger sources:
@@ -40,14 +40,12 @@ import {
 /** The second line when the provider rejected the token outright (Rust
  *  cleared it and emitted `scrobble-signed-out`). */
 const SIGNED_OUT_SUBTITLE: Record<ScrobbleService, string> = {
-  trakt:   "Trakt no longer accepts Aura's sign-in, so scrobbling to it stopped. Reconnect to resume.",
   anilist: "AniList no longer accepts Aura's sign-in, so scrobbling to it stopped. Reconnect to resume.",
   simkl:   "Simkl no longer accepts Aura's sign-in, so scrobbling to it stopped. Reconnect to resume.",
 };
 
 /** The alert's second line, per provider. */
 const EXPIRED_SUBTITLE: Record<ScrobbleService, string> = {
-  trakt:   "Open Settings and reconnect to keep scrobbling.",
   anilist: "AniList does not support refresh. Open Settings and reconnect to keep scrobbling.",
   simkl:   "Simkl sign-in lapsed after months without a scrobble. Reconnect to keep scrobbling.",
 };

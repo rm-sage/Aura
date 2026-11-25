@@ -462,13 +462,24 @@ pub enum L1State {
 /// other sources' windows.
 pub const EARLY_SOURCE: &str = "animethemes-early";
 
+/// Source of a Layer 1 match of the OTHER kind's song in a kind's place (the
+/// opening song played as an episode's ending, or the ending song as its
+/// opening; `Decider::swapped_theme`). Always prompt-only. The kind's Layer 1
+/// state stays `Informative` (none of ITS themes is in the file), and the
+/// frontend gives it no conflict drop.
+pub const SWAP_SOURCE: &str = "animethemes-swap";
+
+/// How many of the other kind's themes a swap compares at most.
+const SWAP_MAX_THEMES: usize = 3;
+
 /// A published window. Field names are the wire names (no serde renames).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct WindowOut {
     pub start: f64,
     pub end: f64,
     /// "animethemes" (Layer 1), "animethemes-early" (the provisional opening,
-    /// EARLY_SOURCE) or "continuity" (Layer 3).
+    /// EARLY_SOURCE), "animethemes-swap" (the other kind's song in this
+    /// kind's place, SWAP_SOURCE) or "continuity" (Layer 3).
     pub source: String,
     /// False for Layer 3, for an "Over" theme (an OP, or an ED whose audio
     /// also has a clean video) and for a Transition-only ED (see `transition`).
@@ -558,6 +569,14 @@ pub struct Snapshot {
     /// (`cached_serves`): it would replay mapping A's edges for a month.
     #[serde(default)]
     pub edge_rule: u32,
+    /// The swap rule the result was computed under (`SWAP_RULE`). A kind
+    /// stored as an informative abstain with no window by a detect from
+    /// before the swap existed answers no request for that kind
+    /// (`cached_serves`): the swap might find the other kind's song there.
+    /// Every other stored kind keeps serving, so nothing else is detected
+    /// again.
+    #[serde(default)]
+    pub swap_rule: u32,
     /// The request duration a STORED result was keyed by (set on write; None
     /// on the live snapshots and on entries written before it existed). A
     /// lookup that falls through to the adjacent 0.1 s bucket accepts an
@@ -571,6 +590,10 @@ pub struct Snapshot {
 /// end (`matcher::refine_layer1_window`). 0 (absent) = mapping A.
 pub const EDGE_RULE: u32 = 1;
 
+/// The current swap rule: 1 = `Decider::swapped_theme` runs after an
+/// informative abstain. 0 (absent) = a result from before it.
+pub const SWAP_RULE: u32 = 1;
+
 impl Snapshot {
     fn has_window(&self) -> bool {
         self.op.is_some() || self.ed.is_some()
@@ -583,7 +606,12 @@ impl Snapshot {
 /// Layer 1 themes). A result computed WITH a MAL id may answer a request
 /// without one: it only knows more.
 fn cached_serves(stored: &Snapshot, req: &Request) -> bool {
+    let pre_swap = |l1: L1State, w: &Option<WindowOut>| {
+        stored.swap_rule < SWAP_RULE && l1 == L1State::Informative && w.is_none()
+    };
     (!(req.op || req.ed) || stored.edge_rule == EDGE_RULE)
+        && (!req.op || !pre_swap(stored.op_l1, &stored.op))
+        && (!req.ed || !pre_swap(stored.ed_l1, &stored.ed))
         && (!req.op || (stored.requested_op && stored.op_l1 != L1State::Unknown))
         && (!req.ed || (stored.requested_ed && stored.ed_l1 != L1State::Unknown))
         && (req.mal_id.is_none() || stored.requested_mal == req.mal_id)
@@ -1313,7 +1341,170 @@ impl<'a> Decider<'a> {
             };
             return Decision::NoThemes { note: note.into() };
         }
-        exhausted_abstain(&tally, self.cat.siblings_incomplete)
+        let abstain = exhausted_abstain(&tally, self.cat.siblings_incomplete);
+        if matches!(abstain, Decision::Abstain { l1: L1State::Informative, .. }) {
+            if let Some(w) = self.swapped_theme(kind, region, media_end).await {
+                return Decision::Window(w);
+            }
+        }
+        abstain
+    }
+
+    /// The OTHER kind's song in this kind's place: the cour's opening played
+    /// as an episode's ending (Secrets of the Silent Witch E01 plays OP1 over
+    /// its credits and has no ending of its own), or its ending played as the
+    /// opening. Asked only after an informative abstain (every theme of the
+    /// kind was compared and none is in the file), so an episode whose own
+    /// theme matched never gets here. Free: the region is already decoded and
+    /// only a theme already loaded, in flight on this loader, or in the
+    /// fingerprint cache is compared (never a download), at most
+    /// `SWAP_MAX_THEMES`, each one full-region match (about 0.1 s).
+    ///
+    /// The match passes the same gates as any Layer 1 match, and its edges are
+    /// refined by THIS kind's edge rule. It is always prompt-only
+    /// (`SWAP_SOURCE`): nothing in the audio tells credits under the opening
+    /// song from a final episode's epilogue under it, and the user's call
+    /// (2026-11-16) is to ask rather than risk skipping story. It must sit in
+    /// its own half of the file (an ending starts in the second half, an
+    /// opening ends in the first); on a short file whose TAIL re-reads HEAD,
+    /// a swap that lands on the other kind's published window is withdrawn
+    /// by `Job::no_ed_inside_the_opening`.
+    async fn swapped_theme(&mut self, kind: Kind, region: &RegionOut, media_end: f64) -> Option<WindowOut> {
+        let other = match kind {
+            Kind::Op => Kind::Ed,
+            Kind::Ed => Kind::Op,
+        };
+        let own = self.cat.primary_len;
+        // A cour whose opening and ending share one audio file: that audio
+        // was just compared as this kind and did not match.
+        let compared: HashSet<u64> = self
+            .cat
+            .order(kind)
+            .into_iter()
+            .filter(|&i| i < own)
+            .map(|i| self.cat.recs[i].audio_id)
+            .collect();
+        let mut seen = compared;
+        let order = themes::candidate_order(&self.cat.metas[..own], other, self.cat.ep);
+        // The other kind's top candidate is the theme a detect of that kind
+        // loads first (and the prefetch warms), so when that kind was asked
+        // for, its fingerprint is in flight somewhere (the main loader while
+        // this runs on the OP fork, or the fork while this runs on the main
+        // decider) and lands in theme-fp/ for the next play. A lower-ranked
+        // one may never be loaded (its kind matched the top one), and with
+        // the kind not asked for (Off) nothing ever loads it.
+        let top_other = order.first().copied();
+        let other_requested = match other {
+            Kind::Op => self.req.op,
+            Kind::Ed => self.req.ed,
+        };
+        let mut top_skipped = false;
+        let cands: Vec<usize> = order
+            .into_iter()
+            .filter(|&i| seen.insert(self.cat.recs[i].audio_id))
+            .take(SWAP_MAX_THEMES)
+            .collect();
+        for i in cands {
+            let rec = self.cat.recs[i].clone();
+            let Some(t) = self.theme_without_download(i).await else {
+                crate::devlog!(
+                    debug, "skipdetect",
+                    "{} {} swap: theme {} not loaded or cached; not compared",
+                    self.who,
+                    kind_name(kind),
+                    rec.label()
+                );
+                if other_requested && Some(i) == top_other {
+                    top_skipped = true;
+                }
+                continue;
+            };
+            if matcher::too_short_to_match(t.audible) {
+                continue;
+            }
+            let (q, t2) = (region.fp.clone(), t.clone());
+            let Ok(m) = tokio::task::spawn_blocking(move || matcher::evaluate_theme(&t2.fp, t2.audible, &q)).await else {
+                continue;
+            };
+            crate::devlog!(
+                info, "skipdetect",
+                "{} {} swap: {} theme {} ({:.1}s) run {:.1}s ber {:?} best/second {:.3}/{:.3} margin {:.3} soft42 {:?} -> {}",
+                self.who,
+                kind_name(kind),
+                kind_name(other),
+                rec.label(),
+                m.ref_len_s,
+                m.longest_run_s,
+                m.run_ber,
+                m.best_ber,
+                m.second_ber,
+                m.margin,
+                m.soft42,
+                m.reject.map_or("accept", |r| r.as_str())
+            );
+            if !m.accepted {
+                continue;
+            }
+            let Some(w) = published_window(&m, Some(t.audible), kind, region, media_end) else { continue };
+            let half = media_end / 2.0;
+            let placed = match kind {
+                Kind::Ed => w.0 >= half,
+                Kind::Op => w.1 <= half,
+            };
+            if !placed {
+                crate::devlog!(
+                    info, "skipdetect",
+                    "{} {} swap: [{:.2}, {:.2}] is not in the {} half of the file; not used",
+                    self.who,
+                    kind_name(kind),
+                    w.0,
+                    w.1,
+                    if kind == Kind::Ed { "second" } else { "first" }
+                );
+                continue;
+            }
+            let mut out = layer1_out(&m, &rec, w, &self.cat.metas[i], region_refines(region));
+            out.source = SWAP_SOURCE.into();
+            out.auto_eligible = false;
+            out.transition = false;
+            return Some(out);
+        }
+        if top_skipped {
+            // Not a final answer: the next play can compare that theme. A
+            // cached informative abstain stamped with SWAP_RULE would never
+            // be detected again (24 h, or 30 d beside the other kind's window).
+            crate::devlog!(
+                info, "skipdetect",
+                "{} {} swap: the top {} theme was not available to compare; result not cached",
+                self.who,
+                kind_name(kind),
+                kind_name(other)
+            );
+            self.cacheable = false;
+        }
+        None
+    }
+
+    /// A theme's fingerprint without a network fetch: already loaded, a load
+    /// this loader already has in flight, or the on-disk fingerprint cache.
+    async fn theme_without_download(&mut self, i: usize) -> Option<Arc<ThemeFp>> {
+        if let Some(t) = self.loader.loaded.get(&i) {
+            return Some(t.clone());
+        }
+        if self.loader.pending.contains(&i) {
+            let who = self.who.clone();
+            return self.loader.wait_for(i, &self.cat, &who).await;
+        }
+        let dir = self.ctx.data_dir.clone()?;
+        let (id, size) = (self.cat.recs[i].audio_id, self.cat.recs[i].size);
+        let hit = tokio::task::spawn_blocking(move || cache::get_theme_fp(&dir, id, size)).await.ok()??;
+        if hit.fp.is_empty() {
+            return None;
+        }
+        let t = Arc::new(hit);
+        self.loader.failed.remove(&i);
+        self.loader.loaded.insert(i, t.clone());
+        Some(t)
     }
 
     /// The whole decision for one kind and region: the streaming acceptance
@@ -1558,6 +1749,7 @@ async fn run_stored(ctx: &Ctx, req: &Request) -> (Snapshot, bool) {
             requested_ed: req.ed,
             requested_mal: req.mal_id,
             edge_rule: EDGE_RULE,
+            swap_rule: SWAP_RULE,
             op_l1: if req.op { L1State::Pending } else { L1State::NotRequested },
             ed_l1: if req.ed { L1State::Pending } else { L1State::NotRequested },
             ..Default::default()
@@ -1723,6 +1915,26 @@ fn continuity_ed_clash(ed: &WindowOut, op: &WindowOut) -> Option<bool> {
         return None;
     }
     Some(op.source == "continuity")
+}
+
+/// Which window goes when a swap (`SWAP_SOURCE`) and the other kind's
+/// window share audio (a file so short that TAIL re-reads HEAD).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SwapClash {
+    /// The ending is the opening song found again: the opening stands.
+    DropEnding,
+    /// The opening is a swap of the song now matched as the ending itself.
+    DropOpening,
+}
+
+fn swap_clash(ed: &WindowOut, op: &WindowOut) -> Option<SwapClash> {
+    if ed.start.max(op.start) >= ed.end.min(op.end) {
+        return None;
+    }
+    if ed.source == SWAP_SOURCE {
+        return Some(SwapClash::DropEnding);
+    }
+    (op.source == SWAP_SOURCE && ed.source == "animethemes").then_some(SwapClash::DropOpening)
 }
 
 fn kind_name(kind: Kind) -> &'static str {
@@ -1947,6 +2159,34 @@ impl<'a> Job<'a> {
             return decision;
         }
         let Some(op) = self.snap.op.clone() else { return decision };
+        // On a file so short that TAIL re-reads HEAD, a swap can find the
+        // very song the other kind already located: that song keeps its own
+        // kind. The opening song again as the ending goes; the ending song
+        // published as a swapped opening goes once it is matched as the
+        // ending itself.
+        let clash = swap_clash(w, &op);
+        if clash == Some(SwapClash::DropEnding) {
+            crate::devlog!(
+                info, "skipdetect",
+                "{} ED swap [{:.2}, {:.2}] is the opening [{:.2}, {:.2}] {}: withdrawn",
+                self.d.who, w.start, w.end, op.start, op.end, op.source
+            );
+            return Decision::Abstain {
+                note: "opening song found again as the ending; withdrawn".into(),
+                cacheable: true,
+                l1: L1State::Informative,
+            };
+        }
+        if clash == Some(SwapClash::DropOpening) {
+            crate::devlog!(
+                info, "skipdetect",
+                "{} OP swap [{:.2}, {:.2}] is the matched ending [{:.2}, {:.2}]: opening withdrawn",
+                self.d.who, op.start, op.end, w.start, w.end
+            );
+            self.set_window(Kind::Op, None);
+            self.set_note(Kind::Op, "ending song found in the opening's place is the ending; withdrawn".into());
+            return decision;
+        }
         let Some(with_op) = continuity_ed_clash(w, &op) else { return decision };
         crate::devlog!(
             info, "skipdetect",
@@ -2400,8 +2640,11 @@ impl<'a> Job<'a> {
                 }
                 crate::devlog!(info, "skipdetect", "{} {name} final {}", self.d.who, fmt_win(&Some(w.clone())));
                 // A continuity window is Layer 3: it only runs when Layer 1 had
-                // no theme of the kind.
-                if w.source != "animethemes" {
+                // no theme of the kind. A swap stands after an informative
+                // abstain, which still holds for the kind's own themes.
+                if w.source == SWAP_SOURCE {
+                    self.set_l1(kind, L1State::Informative);
+                } else if w.source != "animethemes" {
                     self.set_l1(kind, L1State::NoThemes);
                 }
                 self.set_window(kind, Some(w));
@@ -2680,6 +2923,7 @@ mod tests {
             op_l1: l1(op),
             ed_l1: l1(ed),
             edge_rule: EDGE_RULE,
+            swap_rule: SWAP_RULE,
             ..Default::default()
         }
     }
@@ -2747,6 +2991,19 @@ mod tests {
     }
 
     #[test]
+    fn a_swap_never_publishes_the_other_kinds_song_twice() {
+        let w = |s: f64, e: f64, src: &str| WindowOut { start: s, end: e, source: src.into(), ..Default::default() };
+        // A 900 s file, OP1 at 460-550: HEAD matched it as the opening, TAIL
+        // (from 420 s) found it again as the swapped ending.
+        assert_eq!(swap_clash(&w(460.0, 550.0, SWAP_SOURCE), &w(460.0, 550.0, "animethemes")), Some(SwapClash::DropEnding));
+        // The ending song swapped into the opening, then matched as the ending.
+        assert_eq!(swap_clash(&w(200.0, 290.0, "animethemes"), &w(200.0, 290.0, SWAP_SOURCE)), Some(SwapClash::DropOpening));
+        // Apart: both stand. Two ordinary windows are not this rule's business.
+        assert_eq!(swap_clash(&w(1346.0, 1435.0, SWAP_SOURCE), &w(30.0, 120.0, "animethemes")), None);
+        assert_eq!(swap_clash(&w(60.0, 120.0, "animethemes"), &w(60.0, 120.0, "animethemes")), None);
+    }
+
+    #[test]
     fn a_stand_in_continuity_window_lives_no_longer_than_the_list_answer() {
         let l3 = WindowOut { start: 0.0, end: 89.0, source: "continuity".into(), ..Default::default() };
         let l1 = WindowOut { start: 0.0, end: 89.0, source: "animethemes".into(), auto_eligible: true, ..Default::default() };
@@ -2803,6 +3060,25 @@ mod tests {
         assert!(cached_serves(&old, &full));
         let back: Snapshot = serde_json::from_str(&serde_json::to_string(&stored(true, true, None)).unwrap()).unwrap();
         assert_eq!(back.edge_rule, EDGE_RULE, "the rule survives the cache");
+    }
+
+    #[test]
+    fn an_informative_abstain_from_before_the_swap_is_detected_again() {
+        let full = req("https://x/y").validate().unwrap();
+        let mut op_only = full.clone();
+        op_only.ed = false;
+        let mut old = stored(true, true, Some(56784));
+        old.swap_rule = 0;
+        old.op = Some(WindowOut { start: 30.0, end: 120.0, source: "animethemes".into(), ..Default::default() });
+        assert!(cached_serves(&old, &full), "matched kinds keep serving");
+        old.ed_l1 = L1State::Informative;
+        assert!(!cached_serves(&old, &full), "the swap may find the opening song where the ending would be");
+        assert!(cached_serves(&old, &op_only), "the opening it decided still answers");
+        old.swap_rule = SWAP_RULE;
+        assert!(cached_serves(&old, &full));
+        old.swap_rule = 0;
+        old.ed_l1 = L1State::NoThemes;
+        assert!(cached_serves(&old, &full), "no themes of the kind: the swap never ran for it");
     }
 
     // ── the decision's failure paths, driven through a fake theme loader ──
@@ -3001,6 +3277,111 @@ mod tests {
         assert!(fork_loaded);
         assert_eq!(calls_after, 2, "OP1 and ED1 were each loaded once");
         assert_eq!(main_dl, 1, "one real OP download, counted once");
+    }
+
+    /// `rec` with its own audio id (a swap skips audio already compared).
+    fn rec_id(slug: &str, op: bool, audio_id: u64) -> ThemeRec {
+        ThemeRec { audio_id, ..rec(slug, op, false, false) }
+    }
+
+    /// A complete region starting at `t0` (media seconds), `secs` long, with
+    /// `theme` mixed in at `at` (media seconds).
+    fn region_with(t0: f64, secs: f64, theme: &[f64], at: f64) -> RegionOut {
+        let mut ep: Vec<f64> = tone(secs, 9).iter().map(|v| v * 0.1).collect();
+        let off = ((at - t0) * SR as f64) as usize;
+        for (i, v) in theme.iter().enumerate() {
+            ep[off + i] += v * 0.8;
+        }
+        let ep = pcm(&ep, 0.9);
+        RegionOut {
+            fp: Arc::new(super::super::fingerprint::fingerprint(&ep, t0)),
+            levels: super::super::continuity::rms_levels(&ep),
+            silences: Vec::new(),
+            origin: Some(t0),
+            samples: ep.len() as u64,
+            complete: true,
+            failed: None,
+            early: None,
+        }
+    }
+
+    #[test]
+    fn the_opening_song_played_as_the_ending_is_a_prompt_only_swap() {
+        // Silent Witch E01: no ending theme in the tail, OP1 over the credits.
+        let op_song = tone(70.0, 5);
+        let op_fp = Arc::new(animethemes::theme_fp_from_pcm(&rec_id("OP1", true, 10), &pcm(&op_song, 0.8)));
+        let ed_fp = theme_of(70.0, 31);
+        let e2 = ed_fp.clone();
+        let h = harness(move |_| (Ok((e2.clone(), true)), 0));
+        let region = region_with(960.0, 480.0, &op_song, 1300.0);
+        let (d, calls) = rt().block_on(async {
+            let mut d = decider(&h, vec![rec_id("OP1", true, 10), rec_id("ED1", false, 20)]);
+            // HEAD loaded OP1 for its own search.
+            d.loader.loaded.insert(0, op_fp.clone());
+            let out = d.decide_complete(Kind::Ed, &region, 1440.0).await;
+            (out, h.calls.load(std::sync::atomic::Ordering::SeqCst))
+        });
+        let Decision::Window(w) = d else { panic!("expected the swapped window") };
+        assert_eq!(w.source, SWAP_SOURCE);
+        assert!(!w.auto_eligible, "a swap only ever prompts");
+        assert!(!w.transition);
+        assert_eq!(w.theme.as_deref(), Some("OP1"));
+        assert!((w.start - 1300.0).abs() < 1.5 && (w.end - 1370.0).abs() < 2.5, "{w:?}");
+        assert_eq!(calls, 1, "ED1 was loaded to be compared; OP1 was not fetched again");
+    }
+
+    #[test]
+    fn the_ending_song_played_as_the_opening_is_a_prompt_only_swap() {
+        let ed_song = tone(70.0, 31);
+        let ed_fp = Arc::new(animethemes::theme_fp_from_pcm(&rec_id("ED1", false, 20), &pcm(&ed_song, 0.8)));
+        let op_fp = theme_of(70.0, 5);
+        let o2 = op_fp.clone();
+        let h = harness(move |_| (Ok((o2.clone(), true)), 0));
+        let region = region_with(0.0, 300.0, &ed_song, 40.0);
+        let d = rt().block_on(async {
+            let mut d = decider(&h, vec![rec_id("OP1", true, 10), rec_id("ED1", false, 20)]);
+            d.loader.loaded.insert(1, ed_fp.clone());
+            d.decide_complete(Kind::Op, &region, 1440.0).await
+        });
+        let Decision::Window(w) = d else { panic!("expected the swapped window") };
+        assert_eq!(w.source, SWAP_SOURCE);
+        assert!(!w.auto_eligible);
+        assert_eq!(w.theme.as_deref(), Some("ED1"));
+        assert!((w.start - 40.0).abs() < 1.5, "{w:?}");
+    }
+
+    #[test]
+    fn a_swap_never_downloads_and_stays_in_its_half_of_the_file() {
+        let op_song = tone(70.0, 5);
+        let op_fp = Arc::new(animethemes::theme_fp_from_pcm(&rec_id("OP1", true, 10), &pcm(&op_song, 0.8)));
+        let ed_fp = theme_of(70.0, 31);
+        // OP1 neither loaded nor cached (no data dir): not compared, and not
+        // downloaded either. The ending stays an informative abstain.
+        let e2 = ed_fp.clone();
+        let h = harness(move |_| (Ok((e2.clone(), true)), 0));
+        let region = region_with(960.0, 480.0, &op_song, 1300.0);
+        let (d, calls) = rt().block_on(async {
+            let mut d = decider(&h, vec![rec_id("OP1", true, 10), rec_id("ED1", false, 20)]);
+            let out = d.decide_complete(Kind::Ed, &region, 1440.0).await;
+            (out, h.calls.load(std::sync::atomic::Ordering::SeqCst))
+        });
+        let (l1, cacheable, note) = abstain_of(d);
+        assert_eq!(l1, L1State::Informative, "{note}");
+        assert!(cacheable);
+        assert_eq!(calls, 1, "only ED1 was loaded");
+
+        // A short file whose TAIL re-reads HEAD: the opening at 20 s is the
+        // opening, never also the ending.
+        let e3 = ed_fp.clone();
+        let h = harness(move |_| (Ok((e3.clone(), true)), 0));
+        let region = region_with(0.0, 300.0, &op_song, 20.0);
+        let d = rt().block_on(async {
+            let mut d = decider(&h, vec![rec_id("OP1", true, 10), rec_id("ED1", false, 20)]);
+            d.loader.loaded.insert(0, op_fp.clone());
+            d.decide_complete(Kind::Ed, &region, 300.0).await
+        });
+        let (l1, _, note) = abstain_of(d);
+        assert_eq!(l1, L1State::Informative, "{note}");
     }
 
     #[test]

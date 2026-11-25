@@ -15,7 +15,7 @@
 // carry pointer-events so clicking them never falls through to play/pause.
 // ---------------------------------------------------------------------------
 
-import { useEffect, useRef, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import { useWatchTogether } from "./watchTogether/useWatchTogether";
 
 interface Props {
@@ -27,9 +27,11 @@ interface Props {
 }
 
 // Drop-shadow on text so labels stay legible over bright video (clouds, snow).
-const TEXT_SHADOW = "[text-shadow:_0_1px_4px_rgba(0,0,0,0.85)]";
+// Tight, like every player surface (styles/glass-player.css): the dense face
+// carries legibility, and a 4 px halo smudged the small line.
+const TEXT_SHADOW = "[text-shadow:_0_1px_1px_rgba(0,0,0,0.35)]";
 
-export default function PlayerPartyHud({ onStart, isFullscreen, controlsVisible }: Props) {
+function PlayerPartyHud({ onStart, isFullscreen, controlsVisible }: Props) {
   const w = useWatchTogether();
   // Transient "wake": a party toast briefly reveals the pill even when the
   // chrome is hidden, so a join/leave/host-change notification is seen, then it
@@ -67,7 +69,7 @@ export default function PlayerPartyHud({ onStart, isFullscreen, controlsVisible 
   return (
     <>
       {/* Presence cluster — top right, dropped BELOW the overlay's top action
-          bar (exit button + title span left-4→right-4) so it never covers a
+          bar (back button + title span left-6 to right-6) so it never covers a
           long title; above the overlay so it's never washed out; click to open
           the party panel. Fades with the player chrome (Request B); pulses while
           a stream is waiting to be joined (Request C). */}
@@ -75,18 +77,18 @@ export default function PlayerPartyHud({ onStart, isFullscreen, controlsVisible 
         type="button"
         data-party-anchor
         onClick={openPanel}
-        title={needsAttention ? "Stream selected — open to watch" : "Watch party — open"}
+        title={needsAttention ? "Stream selected: open to watch" : "Watch Party: open"}
         className={[
-          "fixed right-4 z-[10000] flex items-center gap-1.5 px-2.5 h-9",
-          "rounded-full bg-black/70 backdrop-blur-xl border border-white/15",
-          "shadow-[0_4px_16px_rgba(0,0,0,0.55)] hover:bg-black/80",
+          // Over the mpv video: the player material (no backdrop pass).
+          "aura-glass-player fixed right-4 z-[10000] flex items-center gap-1.5 px-2.5 h-9",
+          "rounded-full",
           needsAttention ? "aura-party-attention" : "",
         ].join(" ")}
         style={{
           top: isFullscreen ? 60 : 96,
           opacity: pillVisible ? 1 : 0,
           pointerEvents: pillVisible ? "auto" : "none",
-          transition: "opacity 320ms ease, background-color 150ms ease",
+          transition: "opacity 320ms ease",
         }}
       >
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
@@ -126,12 +128,12 @@ export default function PlayerPartyHud({ onStart, isFullscreen, controlsVisible 
       </button>
 
       {/* Staging banner — playback is held until the party joins. Solid dark
-          backdrop + text-shadow so it reads over any video. */}
+          player face (0.86, styles/glass-player.css) so it reads over any
+          video. */}
       {w.staging && (
         <div
-          className="fixed left-1/2 -translate-x-1/2 z-[10000] pointer-events-auto rounded-2xl
-                     bg-black/80 backdrop-blur-xl border border-white/15
-                     shadow-[0_8px_30px_rgba(0,0,0,0.65)] px-5 py-3 flex items-center gap-4"
+          className="aura-glass-player fixed left-1/2 -translate-x-1/2 z-[10000] pointer-events-auto rounded-[20px]
+                     px-5 py-3 flex items-center gap-4"
           // Raised to clear the player control bar (scrubber + buttons sit ~36px
           // up from the bottom; fullscreen's bar sits a touch lower).
           style={{ bottom: isFullscreen ? 124 : 156 }}
@@ -150,7 +152,7 @@ export default function PlayerPartyHud({ onStart, isFullscreen, controlsVisible 
               type="button"
               onClick={onStart}
               className="pointer-events-auto px-3.5 h-9 rounded-xl text-[13px] font-semibold
-                         bg-ln-accent text-black border border-ln-accent
+                         bg-ln-accent text-ln-accent-ink border border-ln-accent
                          hover:brightness-110 active:brightness-95 transition-[filter] whitespace-nowrap
                          shadow-[0_2px_10px_rgba(0,0,0,0.4)]"
             >
@@ -161,16 +163,20 @@ export default function PlayerPartyHud({ onStart, isFullscreen, controlsVisible 
       )}
 
       <style>{`
+        /* The "stream selected" pulse: a halo and a 1px ring in the THEME
+           accent that swell and fade back to the bare player material, so
+           the rest edge stays neutral (no accent border). Every frame
+           carries the glass list, so the material's edge and drop survive. */
         @keyframes aura-party-attention {
           0%, 100% {
             transform: scale(1);
-            box-shadow: 0 4px 16px rgba(0,0,0,0.55), 0 0 0 0 rgba(91,164,255,0);
-            border-color: rgba(91,164,255,0.65);
+            box-shadow: 0 0 0 0 rgb(var(--ln-accent-rgb) / 0), 0 0 0 0 rgb(var(--ln-accent-rgb) / 0),
+                        var(--lg-ring), var(--lg-rimlight), var(--lg-edge), var(--lg-drop);
           }
           50% {
             transform: scale(1.07);
-            box-shadow: 0 4px 16px rgba(0,0,0,0.55), 0 0 22px 3px rgba(91,164,255,0.6);
-            border-color: rgba(91,164,255,0.9);
+            box-shadow: 0 0 22px 3px rgb(var(--ln-accent-rgb) / 0.6), 0 0 0 1px rgb(var(--ln-accent-rgb) / 0.85),
+                        var(--lg-ring), var(--lg-rimlight), var(--lg-edge), var(--lg-drop);
           }
         }
         .aura-party-attention { animation: aura-party-attention 1.4s ease-in-out infinite; }
@@ -178,3 +184,6 @@ export default function PlayerPartyHud({ onStart, isFullscreen, controlsVisible 
     </>
   );
 }
+
+// Memoized: App renders it on every playback tick, and its props rarely change.
+export default memo(PlayerPartyHud);

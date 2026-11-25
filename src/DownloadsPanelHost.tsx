@@ -18,7 +18,7 @@ import {
   sortableKeyboardCoordinates,
 } from "@dnd-kit/sortable";
 import { invoke } from "@tauri-apps/api/core";
-import { SIDE_PILL_LEFT_PX, SIDE_PILL_TOP_PX } from "./SidePill";
+import { CHROME_LEFT_PX, CHROME_TOP_PX } from "./railLayout";
 import Tooltip from "./Tooltip";
 import DownloadRow from "./DownloadRow";
 import {
@@ -163,9 +163,9 @@ export default function DownloadsPanelHost({ isFullscreen }: { isFullscreen: boo
         "rounded-2xl overflow-hidden",
         phase === "closing" ? "aura-dl-panel-out" : "aura-dl-panel-in",
       ].join(" ")}
-      style={{ top: SIDE_PILL_TOP_PX, left: SIDE_PILL_LEFT_PX }}
+      style={{ top: CHROME_TOP_PX, left: CHROME_LEFT_PX }}
     >
-      <header className="flex items-center gap-2 px-3.5 pt-3 pb-2.5 border-b border-white/8">
+      <header className="flex items-center gap-2 px-3.5 pt-3 pb-2.5 border-b border-white/[0.09]">
         <h2 className="text-[13px] font-semibold text-white/85 flex-1 min-w-0 truncate">
           Downloads
           {active > 0 && (
@@ -179,8 +179,7 @@ export default function DownloadsPanelHost({ isFullscreen }: { isFullscreen: boo
             <button
               type="button"
               onClick={() => void pauseAllDownloads()}
-              className="text-[11px] px-2 py-1 rounded-md text-white/55 hover:text-white
-                         hover:bg-white/10 transition-colors"
+              className="aura-glass-item text-[11px] px-2 py-1 rounded-md text-white/55 hover:text-white"
             >
               Pause all
             </button>
@@ -191,8 +190,7 @@ export default function DownloadsPanelHost({ isFullscreen }: { isFullscreen: boo
             <button
               type="button"
               onClick={() => void clearFinishedDownloads()}
-              className="text-[11px] px-2 py-1 rounded-md text-white/55 hover:text-white
-                         hover:bg-white/10 transition-colors"
+              className="aura-glass-item text-[11px] px-2 py-1 rounded-md text-white/55 hover:text-white"
             >
               Clear
             </button>
@@ -202,8 +200,8 @@ export default function DownloadsPanelHost({ isFullscreen }: { isFullscreen: boo
           type="button"
           aria-label="Close downloads"
           onClick={closeDownloadsPanel}
-          className="w-6 h-6 rounded-md flex items-center justify-center text-white/50
-                     hover:text-white hover:bg-white/10 transition-colors"
+          className="aura-glass-item w-6 h-6 rounded-md flex items-center justify-center text-white/50
+                     hover:text-white"
         >
           <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor"
                strokeWidth="2" strokeLinecap="round">
@@ -238,7 +236,7 @@ export default function DownloadsPanelHost({ isFullscreen }: { isFullscreen: boo
               </SortableContext>
             </DndContext>
             {grouped.doneJobs.length > 0 && grouped.activeJobs.length > 0 && (
-              <div className="mx-3 my-1.5 h-px bg-white/8" />
+              <div className="mx-3 my-1.5 h-px bg-white/[0.09]" />
             )}
             {grouped.doneJobs.map((j, i) => (
               <div
@@ -253,8 +251,8 @@ export default function DownloadsPanelHost({ isFullscreen }: { isFullscreen: boo
         )}
       </div>
 
-      <footer className="px-3.5 py-2 border-t border-white/8 flex items-center gap-2">
-        <p className="flex-1 min-w-0 text-[11px] text-white/35 truncate" title={root || undefined}>
+      <footer className="px-3.5 py-2 border-t border-white/[0.09] flex items-center gap-2">
+        <p className="flex-1 min-w-0 text-[11px] text-white/55 truncate" title={root || undefined}>
           {root || "No download folder set yet"}
         </p>
         {/* Not during playback: the page would switch under the player and the
@@ -269,9 +267,8 @@ export default function DownloadsPanelHost({ isFullscreen }: { isFullscreen: boo
               );
               closeDownloadsPanel();
             }}
-            className="text-[11px] px-2 py-1 rounded-md text-white/50 hover:text-white
-                       hover:bg-white/10 transition-colors flex-shrink-0
-                       disabled:opacity-40 disabled:pointer-events-none"
+            className="aura-glass-item text-[11px] px-2 py-1 rounded-md text-white/50 hover:text-white
+                       flex-shrink-0 disabled:opacity-40 disabled:pointer-events-none"
           >
             Settings
           </button>
@@ -297,9 +294,7 @@ function Empty({ root }: { root: string }) {
             const picked = await invoke<string | null>("pick_folder").catch(() => null);
             if (picked) await invoke("downloads_set_root", { path: picked }).catch(() => {});
           }}
-          className="mt-3 text-[11.5px] px-3 py-1.5 rounded-lg text-white/80
-                     bg-white/[0.08] hover:bg-white/[0.14] border border-white/10
-                     transition-colors"
+          className="aura-glass-flat mt-3 text-[11.5px] px-3 py-1.5 rounded-lg text-white/80"
         >
           Choose a download folder
         </button>

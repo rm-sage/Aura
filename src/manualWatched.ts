@@ -163,7 +163,7 @@ export function isManuallyInProgress(id: string): boolean {
 }
 
 /** Per-id transition payload emitted on the SYNC_EVENT. Listeners that
- *  push to external systems (e.g. Stremio's library, Trakt) read these
+ *  push to external systems (e.g. Stremio's library) read these
  *  to drive their own diff round-trip. */
 export interface WatchedSyncDiff {
   id:       string;

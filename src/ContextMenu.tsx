@@ -1,9 +1,11 @@
 // Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useEffect, useLayoutEffect, useRef, useState, useCallback } from "react";
+import { memo, useEffect, useLayoutEffect, useRef, useState, useCallback } from "react";
 import { createPortal } from "react-dom";
 import Tooltip from "./Tooltip";
+import { animateSpan, cancelSpan } from "./liquidGlass";
+import { liquidActive } from "./glassStyle";
 
 // ---------------------------------------------------------------------------
 // ContextMenu — custom React-based right-click menu (singleton-style).
@@ -123,7 +125,7 @@ export function openContextMenu(x: number, y: number, items: ContextMenuItem[]) 
 // ContextMenuHost — mount once near the app root.
 // ---------------------------------------------------------------------------
 
-export default function ContextMenuHost() {
+function ContextMenuHost() {
   const [state, setState] = useState<OpenDetail | null>(null);
 
   useEffect(() => {
@@ -171,27 +173,94 @@ function MenuLabel({ hint, children }: { hint?: string; children: React.ReactNod
 }
 
 function rowToneClasses(tone: MenuTone, disabled: boolean | undefined): string {
+  // Text colour only. The hover lives in styles/glass-chrome.css
+  // (.aura-ctx-row[data-tone]): a tone tint in Frosted, the shared neutral
+  // hover droplet in Liquid. A Tailwind hover:bg-* here would lose to the
+  // glass row rule anyway (App.css loads after the utilities).
   if (disabled) return "text-white/25 cursor-not-allowed";
-  // Each row gets a tone-matched hover state: subtle bg tint + an inset
-  // glow that lights the row "from within" without bleeding onto
-  // neighbours. Combined with `transition-all` on the row so the glow
-  // ramps in/out smoothly with the bg.
   switch (tone) {
     case "success":
-      return "text-emerald-300/95 hover:bg-emerald-400/12 hover:shadow-[inset_0_0_22px_-4px_rgba(52,211,153,0.35)]";
+      return "text-emerald-300/95";
     case "warning":
-      return "text-amber-300/95   hover:bg-amber-400/12   hover:shadow-[inset_0_0_22px_-4px_rgba(251,191,36,0.32)]";
+      return "text-amber-300/95";
     case "danger":
-      return "text-rose-300/95    hover:bg-rose-400/12    hover:shadow-[inset_0_0_22px_-4px_rgba(251,113,133,0.34)]";
+      return "text-rose-300/95";
     case "notice":
-      return "text-ln-accent      hover:bg-ln-accent/12   hover:shadow-[inset_0_0_22px_-4px_rgba(91,164,255,0.34)]";
+      return "text-ln-accent";
     // purple-300 text over a purple-400 tint: the same pair the skip segment
     // (bg-purple-400) and the skipped-episode tag (text-purple-300) already use.
     case "skip":
-      return "text-purple-300/95  hover:bg-purple-400/12  hover:shadow-[inset_0_0_22px_-4px_rgba(192,132,252,0.34)]";
+      return "text-purple-300/95";
     default:
-      return "text-white/85       hover:bg-white/8        hover:shadow-[inset_0_0_22px_-4px_rgba(255,255,255,0.18)]";
+      return "text-white/85";
   }
+}
+
+/** Row classes shared by the menu and the submenu. */
+const ROW_CLS = "aura-glass-row aura-ctx-row relative w-full flex items-center gap-2.5 px-3.5 py-2 text-left text-[13px]";
+
+// ---------------------------------------------------------------------------
+// useMenuDroplet: Liquid's shared hover droplet for one menu. A single soft
+// face slides between rows on the glass spring instead of each row painting
+// its own fill (App.css drops the per-row hover inside [data-glass-droplet] in
+// Liquid). Inert in Frosted. Event driven: one rect pair per row change,
+// nothing per frame, and the spring is cancelled on unmount.
+// ---------------------------------------------------------------------------
+
+function useMenuDroplet() {
+  const ref = useRef<HTMLSpanElement>(null);
+  const lastRow = useRef<HTMLElement | null>(null);
+  // Armed by the first REAL pointermove over the menu. A menu that opens (or
+  // is clamped) under a stationary pointer gets a pointerover from Chromium's
+  // layout-driven hover re-test with no pointermove; lighting a row then would
+  // show a highlight the user never pointed at (native menus wait for a move).
+  // Never reset by hide(), so leaving and re-entering keeps working.
+  const moved = useRef(false);
+  useEffect(() => {
+    const el = ref.current;
+    return () => { if (el) cancelSpan(el); };
+  }, []);
+  const hide = () => {
+    lastRow.current = null;
+    const hl = ref.current;
+    if (!hl) return;
+    // Stop a spring in flight where it is, so the fade runs (the flight holds
+    // the CSS transitions off) instead of the droplet vanishing mid-move.
+    cancelSpan(hl);
+    hl.classList.remove("is-on");
+  };
+  const track = (e: React.PointerEvent<HTMLDivElement>) => {
+    const hl = ref.current;
+    if (!hl || !liquidActive()) return;
+    const row = (e.target as Element).closest<HTMLElement>(".aura-ctx-row");
+    if (!row || !e.currentTarget.contains(row)) return;
+    if (row === lastRow.current) return;
+    if ((row as HTMLButtonElement).disabled) { hide(); return; }
+    const box = e.currentTarget.getBoundingClientRect();
+    const r = row.getBoundingClientRect();
+    const a = r.top - box.top;
+    animateSpan(hl, "y", { a, b: a + r.height }, { snap: !hl.classList.contains("is-on"), spring: "hover" });
+    hl.classList.add("is-on");
+    lastRow.current = row;
+  };
+  const onPointerOver = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (!moved.current) return;
+    track(e);
+  };
+  // Only the FIRST move tracks (it lights the row the pointer is resting on);
+  // after that pointerover drives every row change, as before.
+  const onPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (moved.current) return;
+    moved.current = true;
+    track(e);
+  };
+  return { ref, onPointerOver, onPointerMove, onPointerLeave: hide };
+}
+
+/** The pop morph grows from the corner the menu opened at: a menu flipped
+ *  left or up by the viewport clamp grows from its right or bottom edge. */
+function popOrigin(flippedX: boolean, flippedY: boolean): string {
+  return `${flippedY ? "bottom" : "top"} ${flippedX ? "right" : "left"}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -214,6 +283,7 @@ function ContextMenuRender({ x, y, items, onClose }: RenderProps) {
   // bounding rect so we can anchor the child menu next to it.
   const [openSub, setOpenSub] = useState<{ idx: number; rect: DOMRect } | null>(null);
   const subOpenTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const droplet = useMenuDroplet();
 
   useLayoutEffect(() => {
     const el = ref.current;
@@ -289,13 +359,26 @@ function ContextMenuRender({ x, y, items, onClose }: RenderProps) {
       data-aura-context-menu
       // aura-float-glass carries the background, border and shadow, so the
       // utilities that used to set those are gone rather than fighting it.
-      className="aura-float-glass fixed z-[200] min-w-[220px] py-1.5 rounded-xl select-none"
+      // aura-glass-pop-in is the shared open morph (a droplet grow in Liquid,
+      // a short fade and lift in Frosted); positioned by left/top, never by
+      // transform, so the morph's transform cannot displace it.
+      data-glass-droplet=""
+      onPointerOver={droplet.onPointerOver}
+      onPointerMove={droplet.onPointerMove}
+      onPointerLeave={droplet.onPointerLeave}
+      className="aura-float-glass aura-glass-pop-in fixed z-[200] min-w-[220px] py-1.5 rounded-xl select-none"
       style={{
         left: pos.left,
         top:  pos.top,
-        animation: "ctx-menu-in 120ms ease-out",
+        ["--lg-origin" as string]: popOrigin(pos.left < x, pos.top < y),
+        // Anchored at the pointer: the pop grows from the click corner with
+        // NO lift. A lift slides the menu over the stationary pointer, which
+        // unhovers the card under it and lights row 1 until the spring
+        // settles (App.css aura-glass-pop-shape).
+        ["--lg-pop-dy" as string]: "0px",
       }}
     >
+      <span ref={droplet.ref} aria-hidden className="aura-glass-hl aura-ctx-hl" />
       {items.map((item, idx) => {
         if (item.kind === "divider") {
           return (
@@ -331,10 +414,8 @@ function ContextMenuRender({ x, y, items, onClose }: RenderProps) {
                 console.info(`[ctx] submenu click idx=${idx} isOpen=${isOpen} → ${isOpen ? "close" : "open"}`);
                 setOpenSub(isOpen ? null : { idx, rect });
               }}
-              className={`w-full flex items-center gap-2.5 px-3.5 py-2 text-left text-[13px]
-                          transition-all duration-150
-                          ${rowToneClasses("default", item.disabled)}
-                          ${isOpen ? "bg-white/8" : ""}`}
+              data-tone="default"
+              className={`${ROW_CLS} ${rowToneClasses("default", item.disabled)}`}
             >
               {item.icon && <span className="flex-shrink-0 text-white/55">{item.icon}</span>}
               <MenuLabel hint={item.hint}>{item.label}</MenuLabel>
@@ -372,10 +453,8 @@ function ContextMenuRender({ x, y, items, onClose }: RenderProps) {
               item.onClick();
               onClose();
             }}
-            className={`w-full flex items-center gap-2.5 px-3.5 py-2 text-left text-[13px]
-                        transition-all duration-150
-                        ${rowToneClasses(tone, item.disabled)}
-                        ${isOpen ? "bg-white/8" : ""}`}
+            data-tone={tone}
+            className={`${ROW_CLS} ${rowToneClasses(tone, item.disabled)}`}
           >
             {item.icon && <span className="flex-shrink-0 opacity-90">{item.icon}</span>}
             <MenuLabel hint={item.hint}>{item.label}</MenuLabel>
@@ -412,13 +491,6 @@ function ContextMenuRender({ x, y, items, onClose }: RenderProps) {
           document.body,
         );
       })()}
-
-      <style>{`
-        @keyframes ctx-menu-in {
-          from { opacity: 0; transform: translateY(-3px) scale(0.98); }
-          to   { opacity: 1; transform: translateY(0)    scale(1); }
-        }
-      `}</style>
     </div>
   );
 }
@@ -428,7 +500,7 @@ function ContextMenuRender({ x, y, items, onClose }: RenderProps) {
 // back to the LEFT of the parent menu when there isn't room.
 //
 // Portaled to document.body. The parent menu has a `transform` keyframe
-// animation which creates a containing block for any `position: fixed`
+// animation (the aura-glass-pop-in morph) which creates a containing block for any `position: fixed`
 // descendants, so without the portal the submenu's left/top would be
 // interpreted relative to the parent menu's transformed origin rather
 // than the viewport — symptom: submenu lands far away from the parent
@@ -445,6 +517,7 @@ interface SubmenuProps {
 
 function Submenu({ parentRect, items, onActivate, onMouseEnter, onMouseLeave }: SubmenuProps) {
   const ref = useRef<HTMLDivElement>(null);
+  const droplet = useMenuDroplet();
   const [pos, setPos] = useState<{ left: number; top: number }>({
     left: parentRect.right + SUBMENU_GAP,
     top:  parentRect.top,
@@ -475,13 +548,22 @@ function Submenu({ parentRect, items, onActivate, onMouseEnter, onMouseLeave }: 
       data-aura-submenu
       onMouseEnter={onMouseEnter}
       onMouseLeave={onMouseLeave}
-      className="aura-float-glass fixed z-[210] min-w-[220px] py-1.5 rounded-xl select-none"
+      data-glass-droplet=""
+      onPointerOver={droplet.onPointerOver}
+      onPointerMove={droplet.onPointerMove}
+      onPointerLeave={droplet.onPointerLeave}
+      className="aura-float-glass aura-glass-pop-in fixed z-[210] min-w-[220px] py-1.5 rounded-xl select-none"
       style={{
         left: pos.left,
         top:  pos.top,
-        animation: "ctx-menu-in 120ms ease-out",
+        // Grows out of its parent row: from the left edge normally, from the
+        // right edge when it flipped to the parent's left.
+        ["--lg-origin" as string]: popOrigin(pos.left < parentRect.left, false),
+        // Level with its parent row: no lift sliding it past the row's top.
+        ["--lg-pop-dy" as string]: "0px",
       }}
     >
+      <span ref={droplet.ref} aria-hidden className="aura-glass-hl aura-ctx-hl" />
       {items.map((item, idx) => {
         if (item.kind === "divider") {
           return <div key={`s-div-${idx}`} role="separator" className="h-px my-1 mx-2 bg-white/12" />;
@@ -502,9 +584,8 @@ function Submenu({ parentRect, items, onActivate, onMouseEnter, onMouseLeave }: 
               item.onClick();
               onActivate();
             }}
-            className={`w-full flex items-center gap-2.5 px-3.5 py-2 text-left text-[13px]
-                        transition-all duration-150
-                        ${rowToneClasses(tone, item.disabled)}`}
+            data-tone={tone}
+            className={`${ROW_CLS} ${rowToneClasses(tone, item.disabled)}`}
           >
             {item.icon && <span className="flex-shrink-0 opacity-90">{item.icon}</span>}
             <MenuLabel hint={item.hint}>{item.label}</MenuLabel>
@@ -514,3 +595,9 @@ function Submenu({ parentRect, items, onActivate, onMouseEnter, onMouseLeave }: 
     </div>
   );
 }
+
+// Memoized: App renders this host with no props (or only primitives / its own
+// stable state) and re-renders on every playback-update tick. The host is
+// driven by its own state and store subscriptions, so skipping those renders
+// changes nothing on screen.
+export default memo(ContextMenuHost);

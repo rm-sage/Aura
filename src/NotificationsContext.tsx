@@ -11,6 +11,7 @@ import {
   useState,
   type ReactNode,
 } from "react";
+import { SCROBBLE_ONBOARDING_SUBTITLE, isScrobbleService } from "./scrobbleConn";
 
 // ---------------------------------------------------------------------------
 // NotificationsContext — bell-store for new-release / new-episode / dismissed-
@@ -19,8 +20,9 @@ import {
 // Persisted to localStorage under `aura:notifications:v1`. Capped at 200 items
 // (drop oldest beyond cap, but never silently drop a kind:'update' — keeps the
 // most recent update plus 199 others when triaging). The context exposes a
-// minimal mutation surface (add / mark / dismiss / clearDismissed) plus a
-// transient `hasNew` pulse used by the bell to trigger its glow animation.
+// minimal mutation surface (add / mark / dismiss / clearDismissed). (The old
+// transient `hasNew` pulse is gone: nothing read it since the bell's glow was
+// retired, and its on / off flips re-rendered every consumer twice per add.)
 // ---------------------------------------------------------------------------
 
 /** Visual + semantic kind for the bell. Tones (used by NotificationsPanel
@@ -57,22 +59,31 @@ export interface Notification {
 interface NotificationsCtxValue {
   notifications: Notification[];
   unreadCount: number;
-  hasNew: boolean;
-  /** Most recently added notification — surfaced for ~10 s as a
-   *  thought-bubble popup over the bell, then auto-collapsed into
-   *  the bell. Cleared (set to null) when the timer fires or the
+  /** Most recently added notification: surfaced for about 5 s as
+   *  the arrival bubble beside the rail's Notifications row, then retracted
+   *  into the row. Cleared (set to null) when the timer fires or the
    *  user dismisses it manually via `dismissPopup`. */
   popup: Notification | null;
+  /** How many arrivals the current popup stands for: 1 for one, more when
+   *  several landed in quick succession (a coalesced batch, a backlog drained
+   *  after suppression, or a new arrival while the bubble was still up). The
+   *  arrival bubble shows it as a count and bumps on every increase; 0 while
+   *  no popup is up. */
+  popupCount: number;
   addNotification: (n: Omit<Notification, "createdAt" | "read" | "dismissed"> & {
     id?: string;
     createdAt?: number;
     read?: boolean;
     dismissed?: boolean;
   }) => void;
-  /** Manually dismiss the active popup (e.g. user clicked the bubble
-   *  to open the panel). Distinct from `dismissNotification`, which
-   *  removes the notification from the list entirely. */
-  dismissPopup: () => void;
+  /** Clear the popup ON SCREEN (the bubble retracted, or was clicked to
+   *  open the panel). Arrivals still waiting behind it (a coalesce timer, the
+   *  boot grace, the suppression queue) and their count are kept, so one that
+   *  lands while the bubble retracts still shows. `{ pending: true }` also
+   *  drops those (the panel opened: the user is looking at everything).
+   *  Distinct from `dismissNotification`, which removes the notification
+   *  from the list entirely. */
+  dismissPopup: (opts?: { pending?: boolean }) => void;
   /** Suppress popup display while the bell isn't visible (during
    *  stream playback, while the DetailView is open, anywhere else
    *  the bubble would be either hidden or distracting). The
@@ -98,8 +109,6 @@ interface NotificationsCtxValue {
 
 const STORAGE_KEY = "aura:notifications:v1";
 const MAX_ITEMS = 200;
-/** Hold the bell-glow pulse for ~3 s after addNotification fires. */
-const NEW_PULSE_MS = 3000;
 /** Grace period after app start before the first popup is allowed.
  *  The boot splash + initial library load can fire notifications
  *  (NotificationsScanner kicks off as soon as Home mounts) and the
@@ -117,6 +126,14 @@ const POPUP_BOOT_GRACE_MS = 5_000;
  *  resetting the timer) so a batch lands as one final popup. */
 const POPUP_COALESCE_MS = 150;
 const APP_BOOT_AT = Date.now();
+/** Cap on the arrivals remembered behind one pending bubble. */
+const FOLDED_CAP = 50;
+/** Delay before a live arrival's bubble: the boot grace, else the coalesce window. */
+function livePopupWait(): number {
+  const sinceBoot = Date.now() - APP_BOOT_AT;
+  const bootWait = sinceBoot < POPUP_BOOT_GRACE_MS ? POPUP_BOOT_GRACE_MS - sinceBoot : 0;
+  return Math.max(bootWait, POPUP_COALESCE_MS);
+}
 
 const NotificationsCtx = createContext<NotificationsCtxValue | null>(null);
 
@@ -142,6 +159,10 @@ function loadFromStorage(): Notification[] {
       // the whole report), so drop any that a previous build persisted rather
       // than leaving dead entries in the bell forever.
       if (id.startsWith("download:") && kind === "success") continue;
+      // An expired-token alert for a scrobble service Aura no longer has (a
+      // removed provider) can never be resolved by a Reconnect: drop it.
+      if (id.startsWith("scrobble-auth-expired:")
+        && !isScrobbleService(id.split(":")[1] ?? "")) continue;
       if (
         kind !== "release"
         && kind !== "episode"
@@ -157,7 +178,11 @@ function loadFromStorage(): Notification[] {
         id,
         kind,
         title,
-        subtitle: typeof obj.subtitle === "string" ? obj.subtitle : undefined,
+        // The scrobble onboarding notice always reads the current copy, so a
+        // stored one never names a provider that is gone.
+        subtitle: id === "notice:scrobble-onboarding"
+          ? SCROBBLE_ONBOARDING_SUBTITLE
+          : typeof obj.subtitle === "string" ? obj.subtitle : undefined,
         data: obj.data && typeof obj.data === "object"
           ? (obj.data as Record<string, unknown>)
           : undefined,
@@ -255,13 +280,26 @@ export function NotificationsProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     liveIdsRef.current = new Set(notifications.map((n) => n.id));
   }, [notifications]);
-  /** Transient pulse — flips true for NEW_PULSE_MS after every addNotification. */
-  const [hasNew, setHasNew] = useState(false);
-  const hasNewTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  /** Active thought-bubble popup. Set to the freshly added
+  /** Active arrival-bubble popup. Set to the freshly added
    *  notification on every addNotification; cleared after
    *  POPUP_LIFETIME_MS or on user dismissal. */
   const [popup, setPopup] = useState<Notification | null>(null);
+  /** See `popupCount` in the context type. `pendingCountRef` counts the
+   *  candidates folded into the popup a pending timer (or the suppression
+   *  queue) will show. */
+  const [popupCount, setPopupCount] = useState(0);
+  const pendingCountRef = useRef(0);
+  // The arrivals behind pendingCountRef, oldest first (capped). When the
+  // candidate they collapsed into is auto-dismissed, the bubble falls back to
+  // the newest one still live instead of dropping every arrival with it.
+  const foldedRef = useRef<Notification[]>([]);
+  const showPopup = useCallback((n: Notification) => {
+    const add = Math.max(1, pendingCountRef.current);
+    pendingCountRef.current = 0;
+    foldedRef.current = [];
+    setPopup(n);
+    setPopupCount((c) => c + add);
+  }, []);
   const popupTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Suppression flag + queued popup candidate. The flag is mirrored
   // into a ref so addNotification can read it synchronously without
@@ -279,6 +317,16 @@ export function NotificationsProvider({ children }: { children: ReactNode }) {
   // The candidate a pending popupTimerRef will show, so a suppress that
   // cancels the timer can queue it instead of losing it.
   const pendingPopupRef = useRef<Notification | null>(null);
+  /** (Re)arm the timer that shows `candidate` after `wait` ms. */
+  const armPopup = useCallback((candidate: Notification, wait: number) => {
+    if (popupTimerRef.current) clearTimeout(popupTimerRef.current);
+    pendingPopupRef.current = candidate;
+    popupTimerRef.current = setTimeout(() => {
+      showPopup(candidate);
+      popupTimerRef.current = null;
+      pendingPopupRef.current = null;
+    }, wait);
+  }, [showPopup]);
 
   // Persist on every change. Cheap (≤200 items) and saves us from re-deriving
   // the list on remount. Also fires the change event the cloud sync layer
@@ -393,13 +441,6 @@ export function NotificationsProvider({ children }: { children: ReactNode }) {
       }
       return capItems(merged);
     });
-    // Pulse the bell.
-    setHasNew(true);
-    if (hasNewTimerRef.current) clearTimeout(hasNewTimerRef.current);
-    hasNewTimerRef.current = setTimeout(() => {
-      setHasNew(false);
-      hasNewTimerRef.current = null;
-    }, NEW_PULSE_MS);
     // Float a thought-bubble popup over the bell. Latest add wins —
     // a rapid-fire batch (multiple new episodes resolving at once)
     // collapses to just the freshest popup so the user isn't chased
@@ -423,6 +464,10 @@ export function NotificationsProvider({ children }: { children: ReactNode }) {
       // every individual notification, but we don't want to chase
       // the user with a backlog of 5 popups when they exit a
       // 30-minute stream.
+      pendingCountRef.current += 1;
+      const folded = foldedRef.current.filter((f) => f.id !== id);
+      folded.push(popupCandidate);
+      foldedRef.current = folded.length > FOLDED_CAP ? folded.slice(-FOLDED_CAP) : folded;
       if (popupSuppressedRef.current) {
         queuedPopupRef.current = popupCandidate;
         return;
@@ -447,20 +492,9 @@ export function NotificationsProvider({ children }: { children: ReactNode }) {
       // install scan that surfaces 4 episodes from one show would
       // visibly chase the user with 4 sequential popups; React's
       // auto-batch doesn't help across await boundaries.
-      const sinceBoot = Date.now() - APP_BOOT_AT;
-      const bootWait = sinceBoot < POPUP_BOOT_GRACE_MS
-        ? POPUP_BOOT_GRACE_MS - sinceBoot
-        : 0;
-      const wait = Math.max(bootWait, POPUP_COALESCE_MS);
-      if (popupTimerRef.current) clearTimeout(popupTimerRef.current);
-      pendingPopupRef.current = popupCandidate;
-      popupTimerRef.current = setTimeout(() => {
-        setPopup(popupCandidate);
-        popupTimerRef.current = null;
-        pendingPopupRef.current = null;
-      }, wait);
+      armPopup(popupCandidate, livePopupWait());
     }
-  }, []);
+  }, [armPopup]);
 
   /** Setter exposed via context. Updates BOTH the ref (for synchronous
    *  reads inside addNotification) and the state (so React subscribers
@@ -474,13 +508,7 @@ export function NotificationsProvider({ children }: { children: ReactNode }) {
     if (prev && !suppressed && queuedPopupRef.current) {
       const queued = queuedPopupRef.current;
       queuedPopupRef.current = null;
-      if (popupTimerRef.current) clearTimeout(popupTimerRef.current);
-      pendingPopupRef.current = queued;
-      popupTimerRef.current = setTimeout(() => {
-        setPopup(queued);
-        popupTimerRef.current = null;
-        pendingPopupRef.current = null;
-      }, POPUP_COALESCE_MS);
+      armPopup(queued, POPUP_COALESCE_MS);
     } else if (suppressed && popupTimerRef.current) {
       // Suppressing while a deferred (timer-pending) popup is armed:
       // cancel it and queue the candidate instead. Prevents the timer
@@ -491,15 +519,20 @@ export function NotificationsProvider({ children }: { children: ReactNode }) {
       queuedPopupRef.current = pendingPopupRef.current;
       pendingPopupRef.current = null;
     }
-  }, []);
+  }, [armPopup]);
 
-  const dismissPopup = useCallback(() => {
+  const dismissPopup = useCallback((opts?: { pending?: boolean }) => {
     setPopup(null);
+    setPopupCount(0);
+    if (!opts?.pending) return;
+    pendingCountRef.current = 0;
+    foldedRef.current = [];
+    queuedPopupRef.current = null;
     if (popupTimerRef.current) {
       clearTimeout(popupTimerRef.current);
       popupTimerRef.current = null;
-      pendingPopupRef.current = null;
     }
+    pendingPopupRef.current = null;
   }, []);
 
   const markRead = useCallback((id: string) => {
@@ -514,9 +547,41 @@ export function NotificationsProvider({ children }: { children: ReactNode }) {
     setNotifications((prev) => prev.map((p) => (p.read ? p : { ...p, read: true })));
   }, []);
 
+  // A dismissed notification takes its popup bubble with it: the one showing,
+  // the one a coalesce timer is about to show, and the one queued while
+  // popups are held (playback, detail page). Otherwise an auto-dismissed
+  // notice (the HDR offer once Send HDR is on, a cleared sign-in alert) could
+  // still float its bubble after it left the bell.
   const dismissNotification = useCallback((id: string) => {
     setNotifications((prev) => prev.filter((p) => p.id !== id));
-  }, []);
+    // Take it out of the waiting batch; the bubble then stands for the newest
+    // arrival still in the bell (none left: nothing floats).
+    const folded = foldedRef.current;
+    const kept = folded.filter((f) => f.id !== id);
+    if (kept.length !== folded.length) {
+      foldedRef.current = kept;
+      pendingCountRef.current = Math.max(0, pendingCountRef.current - (folded.length - kept.length));
+    }
+    const fallback = kept.length > 0 ? kept[kept.length - 1] : null;
+    if (!fallback) pendingCountRef.current = 0;
+    if (queuedPopupRef.current?.id === id) {
+      queuedPopupRef.current = fallback;
+    }
+    if (pendingPopupRef.current?.id === id) {
+      if (popupTimerRef.current) {
+        clearTimeout(popupTimerRef.current);
+        popupTimerRef.current = null;
+      }
+      pendingPopupRef.current = null;
+      if (fallback) armPopup(fallback, livePopupWait());
+    }
+    setPopup((p) => (p?.id === id ? null : p));
+  }, [armPopup]);
+  // The count belongs to the popup on screen: whatever cleared it (a dismiss,
+  // the notification itself going away) starts the next one from zero.
+  useEffect(() => {
+    if (!popup) setPopupCount(0);
+  }, [popup]);
 
   const dismissAll = useCallback(() => {
     // Keep `update` entries — they aren't individually dismissable
@@ -538,8 +603,8 @@ export function NotificationsProvider({ children }: { children: ReactNode }) {
     () => ({
       notifications,
       unreadCount,
-      hasNew,
       popup,
+      popupCount,
       addNotification,
       dismissPopup,
       setPopupSuppressed,
@@ -550,22 +615,28 @@ export function NotificationsProvider({ children }: { children: ReactNode }) {
       clearDismissed,
     }),
     [
-      notifications, unreadCount, hasNew, popup,
+      notifications, unreadCount, popup, popupCount,
       addNotification, dismissPopup, setPopupSuppressed,
       markRead, markAllRead,
       dismissNotification, dismissAll, clearDismissed,
     ],
   );
 
-  // Cleanup pulse + popup timers on unmount so long-lived timers don't leak.
+  // Cleanup the popup timer on unmount so a long-lived timer doesn't leak.
   useEffect(() => {
     return () => {
-      if (hasNewTimerRef.current) clearTimeout(hasNewTimerRef.current);
-      if (popupTimerRef.current)  clearTimeout(popupTimerRef.current);
+      if (popupTimerRef.current) clearTimeout(popupTimerRef.current);
     };
   }, []);
 
   return <NotificationsCtx.Provider value={value}>{children}</NotificationsCtx.Provider>;
+}
+
+/** A poster url safe to store on (and show from) a notification: http(s)
+ *  only, at most 2048 characters. Anything else is dropped, so an oversized or
+ *  odd string never reaches the persisted, cloud-synced list. */
+export function safeNotifPoster(p: unknown): string | undefined {
+  return typeof p === "string" && p.length <= 2048 && /^https?:\/\//i.test(p) ? p : undefined;
 }
 
 export function useNotifications(): NotificationsCtxValue {

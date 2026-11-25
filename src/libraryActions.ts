@@ -253,6 +253,10 @@ export async function libraryWriteProgress(
 export async function libraryClearProgress(
   authKey: string,
   item: LibraryItem,
+  /** RAW records READ FRESH from the account (library_get) right before this
+   *  call, never the cached snapshot: App's snapshot can be minutes old, and
+   *  writing it back resurrected titles another device removed and put back
+   *  older progress. Removed records are absent from a library_get. */
   rawLibrary: LibraryItem[],
 ): Promise<void> {
   if (!authKey) return;
@@ -309,30 +313,12 @@ export async function libraryClearProgress(
     return;
   }
 
-  // Fallback: no raw snapshot for this id (empty or stale raw array). Behave
-  // exactly as before and rewind the single normalized record.
-  const prevState = (item.state ?? {}) as Record<string, unknown>;
-  const nextState = {
-    ...prevState,
-    timeOffset: 0,
-  };
-  const change: Record<string, unknown> = {
-    _id:        item.id,
-    type:       item.media_type,
-    name:       item.name,
-    poster:     item.poster ?? null,
-    background: item.background ?? null,
-    logo:       item.logo ?? null,
-    year:       item.year ?? null,
-    removed:    item.removed ?? false,
-    temp:       item.temp ?? false,
-    _ctime:     item.ctime ?? mtime,
-    _mtime:     mtime,
-    state:      nextState,
-  };
-  console.info("[libraryClearProgress] rewind (no raw match)", { id: item.id, mtime });
-  await invoke("library_put", { authKey, changes: [change] });
-  // Intentionally NOT dispatching `aura:library-changed` here — the
+  // No record of this title on the account (removed elsewhere, or never
+  // written): there is nothing to rewind, and writing one from the
+  // normalized item would bring back a title another device removed.
+  console.info("[libraryClearProgress] no raw record - nothing written", { id: item.id });
+  // Intentionally NOT dispatching `aura:library-changed` (here or after the
+  // write above): the
   // App's clear handler does the optimistic local update, and triggering
   // a fresh library_get right after a write races with Stremio's
   // eventual consistency (the server's diff-by-mtime hasn't seen our

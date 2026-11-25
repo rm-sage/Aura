@@ -1,0 +1,380 @@
+/* Aura - (c) 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice. */
+/* SPDX-License-Identifier: AGPL-3.0-or-later */
+
+/* The LEFT RAIL (NavSidebar.tsx, Direction A "Obsidian rail"). Loaded once,
+   after App.css (main.tsx), so a rule here at equal specificity wins over
+   App.css. Uses the GLASS SYSTEM classes and custom properties defined in
+   App.css; never redefine them here.
+
+   The rail element is `.aura-rail.aura-float-glass.aura-glass-control`: the
+   shared control-tier material in both Liquid and Frosted (the paint rule,
+   the lens binder and every material token apply to it as to any floating
+   control). This sheet owns only its LAYOUT, its rows, its hover droplet
+   tint and its nested active pill. The cursor light finds the rail by
+   `[data-glass-light="panel"]` and the pill by `[data-glass-light="rim"]`. */
+
+/* ---- The rail ------------------------------------------------------- */
+/* An in-flow flex item of the app body (App.tsx `flex gap-3 p-3`): 12 px
+   from the window edge, 204 px wide, so the page column starts at 228 px.
+   `align-self: center` with `max-height: 100%` hugs the content and centres
+   it in the body under the 36 px title bar (the body's padding box is the
+   viewport minus 60 px). Row geometry lives in the tokens below and steps
+   down on short windows; NavSidebar measures rows, it never assumes them. */
+.aura-rail {
+  --rail-row-h: 48px;   /* nav rows */
+  --rail-sub-h: 40px;   /* Library's sub-rows */
+  --rail-urow-h: 44px;  /* User Panel, Watch Party, Notifications */
+  --rail-gap: 6px;      /* between nav rows */
+  --rail-ugap: 4px;     /* between section rows */
+  --rail-hair-m: 8px;   /* section hairline, vertical margin */
+  --rail-div-m: 6px;    /* nav divider, vertical margin */
+  --rail-pad: 10px;
+  position: relative;
+  z-index: 20;
+  flex: none;
+  align-self: center;
+  display: flex;
+  flex-direction: column;
+  width: 204px;
+  max-height: 100%;
+  padding: var(--rail-pad);
+  border-radius: 22px;
+}
+/* The rail is one surface, not a control: it never lifts on hover (the rows
+   carry the hover). Beats `html[data-glass="liquid"] .aura-glass-control:hover`. */
+html[data-glass="liquid"] .aura-rail.aura-glass-control:hover { --lg-lift: 0; }
+
+/* Short windows. Full size needs about 790 px of viewport; the first step
+   about 670 px, the second about 580 px (900 x 600 fits with room to
+   spare). Below that the nav section scrolls inside the rail while the
+   section rows above it (Notifications, User Panel, Watch Party) stay in
+   view. */
+@media (max-height: 800px) {
+  .aura-rail {
+    --rail-row-h: 40px;
+    --rail-sub-h: 34px;
+    --rail-urow-h: 38px;
+    --rail-gap: 4px;
+    --rail-hair-m: 6px;
+  }
+}
+@media (max-height: 680px) {
+  .aura-rail {
+    --rail-row-h: 36px;
+    --rail-sub-h: 30px;
+    --rail-urow-h: 34px;
+    --rail-gap: 2px;
+    --rail-ugap: 2px;
+    --rail-hair-m: 5px;
+    --rail-div-m: 4px;
+    --rail-pad: 6px;
+  }
+}
+
+/* ---- Sections, hairlines, the nav scroller --------------------------- */
+.aura-rail-sec {
+  position: relative;
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: var(--rail-ugap);
+}
+.aura-rail-hair {
+  flex: none;
+  height: 1px;
+  margin: var(--rail-hair-m) 6px;
+  background: rgb(255 255 255 / 0.09);
+}
+/* The only part that shrinks. The 6 px of padding (cancelled by the negative
+   margin, so nothing moves) keep the pill's soft drop inside the scroller's
+   clip box at the sides and ends. */
+.aura-rail-nav {
+  flex: 0 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  margin: -6px;
+  padding: 6px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  scrollbar-color: rgb(255 255 255 / 0.18) transparent;
+}
+.aura-rail-list {
+  position: relative;
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: var(--rail-gap);
+}
+.aura-rail-div {
+  flex: none;
+  height: 1px;
+  margin: var(--rail-div-m) 8px;
+  background: rgb(255 255 255 / 0.10);
+}
+
+/* ---- Rows ------------------------------------------------------------ */
+/* List rows on the rail's surface: transparent, no glass of their own. The
+   `.aura-nav-row.nav-tap` classes they also carry give the press squash and
+   let the Liquid [data-glass-droplet] rule drop their hover fill. */
+.aura-rail-row {
+  position: relative;
+  z-index: 1;
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  padding: 0 12px;
+  border: 0;
+  border-radius: 12px;
+  background: none;
+  text-align: left;
+  font-weight: 500;
+  cursor: pointer;
+}
+.aura-rail-navrow {
+  height: var(--rail-row-h);
+  font-size: 13.5px;
+  letter-spacing: 0.025em;
+  color: rgb(255 255 255 / 0.6);
+}
+.aura-rail-sub {
+  height: var(--rail-sub-h);
+  gap: 10px;
+  padding-left: 32px;
+  font-size: 12.5px;
+  letter-spacing: 0.025em;
+  color: rgb(255 255 255 / 0.6);
+}
+.aura-rail-urow {
+  height: var(--rail-urow-h);
+  font-size: 13px;
+  color: rgb(255 255 255 / 0.82);
+}
+.aura-rail-navrow:hover,
+.aura-rail-sub:hover { color: rgb(255 255 255 / 0.9); }
+.aura-rail-urow:hover { color: #fff; }
+/* Frosted keeps a per-row hover fill (Liquid's droplet replaces it). */
+html:not([data-glass="liquid"]) .aura-rail-row:hover:not([aria-current="page"]) {
+  background-color: rgb(255 255 255 / 0.06);
+}
+.aura-rail-row:focus-visible {
+  outline: 1px solid rgb(255 255 255 / 0.32);
+  outline-offset: -1px;
+}
+
+/* The lit row: the page (`aria-current`), Library while one of its sub-views
+   is the page (`data-parent-lit`), and an open or live section row
+   (`.is-active`: the profile popover or notifications panel open, in a watch
+   party). Frosted: the theme accent. Liquid: accent 34% over white (the
+   accent reads on the glass without going neon; the pill carries no accent). */
+.aura-rail-row:is([aria-current="page"], [data-parent-lit], .is-active) {
+  color: var(--ln-accent-mark);
+}
+html[data-glass="liquid"] .aura-rail-row:is([aria-current="page"], [data-parent-lit], .is-active) {
+  color: color-mix(in srgb, rgb(var(--ln-accent-rgb)) 34%, white);
+}
+/* An open / live section row also takes a faint wash (it has no pill). */
+html:not([data-glass="liquid"]) .aura-rail-urow.is-active {
+  background-color: rgb(var(--ln-accent-rgb) / 0.10);
+}
+html[data-glass="liquid"] .aura-rail-urow.is-active {
+  background: linear-gradient(rgb(255 255 255 / 0.06), rgb(255 255 255 / 0.035));
+}
+
+/* Icon slot, label, badges. */
+.aura-rail-icon {
+  position: relative;
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+}
+.aura-rail-sub .aura-rail-icon { width: 18px; height: 18px; }
+.aura-rail-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.aura-rail-tail {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+}
+.aura-rail-monogram {
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 1;
+  letter-spacing: -0.01em;
+  /* The accent MARK (the accent with its lightness floored at 0.66, App.css),
+     like the rail's count badges: the raw accent vanished on the rail with a
+     dark custom accent. Every built-in accent is above the floor, so they
+     draw exactly as before. */
+  color: var(--ln-accent-mark);
+  user-select: none;
+}
+/* The same initials in the profile popover's 48 px identity circle
+   (AccountButton.tsx), scaled to the circle. */
+.aura-profile-monogram {
+  font-size: 19px;
+  letter-spacing: 0;
+}
+/* Watch party member count. The count badges fill with the accent MARK (the
+   accent, lightness floored, App.css): a dark custom accent's raw fill
+   vanished on the rail. A mark is always light, so its text is the dark
+   mark ink. */
+.aura-rail-count {
+  min-width: 17px;
+  height: 17px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: var(--ln-accent-mark);
+  color: rgb(var(--ln-accent-mark-ink-rgb));
+  font-size: 10.5px;
+  font-weight: 700;
+  line-height: 17px;
+  text-align: center;
+  letter-spacing: 0;
+}
+/* Notifications unread count. */
+.aura-rail-unread {
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: var(--ln-accent-mark);
+  color: rgb(var(--ln-accent-mark-ink-rgb));
+  font-size: 10.5px;
+  font-weight: 700;
+  line-height: 18px;
+  text-align: center;
+  letter-spacing: 0;
+  box-shadow: 0 0 10px color-mix(in srgb, var(--ln-accent-mark) 55%, transparent);
+}
+
+/* Library's sub-rows: a tree connector from the parent's icon column. Every
+   sub-row but the last draws a straight trunk (from the gap above to its own
+   bottom, so the next one continues it) and a tick into its icon; the last
+   draws one rounded L that stops at its icon. */
+.aura-rail-sub::before,
+.aura-rail-sub::after {
+  content: "";
+  position: absolute;
+  left: 16.8px;
+  pointer-events: none;
+}
+.aura-rail-sub::before {
+  top: calc(-1 * var(--rail-gap));
+  bottom: 0;
+  border-left: 1px solid rgb(255 255 255 / 0.2);
+}
+.aura-rail-sub::after {
+  top: 50%;
+  width: 9px;
+  border-top: 1px solid rgb(255 255 255 / 0.2);
+}
+.aura-rail-sub.is-last::before {
+  bottom: auto;
+  width: 9px;
+  height: calc(50% + var(--rail-gap));
+  border-bottom: 1px solid rgb(255 255 255 / 0.2);
+  border-bottom-left-radius: 6px;
+}
+.aura-rail-sub.is-last::after { display: none; }
+
+/* ---- Hover droplet --------------------------------------------------- */
+/* ONE for the whole rail (NavSidebar useRailDroplet, `.aura-rail-hl`, the
+   rail's first child), Liquid only, so it slides between any two rows across
+   the hairlines and the divider. Its left and width are inline (the row's
+   rect), its translate and height animateSpan's. In the rail it is a faint
+   fill with no rim or meniscus: the active pill is the only raised thing.
+   Its clip (`.aura-rail-hlclip`) is the rail's rounded padding box: a long
+   slide overshoots its target row (the hover spring), and at the rail's
+   ends it poked about 3 px out past the rail's edge. */
+.aura-rail-hlclip {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  border-radius: inherit;
+  overflow: hidden;
+  pointer-events: none;
+}
+/* Round 12 ("physical glass, not a spotlight": the interior stays cool and
+   dark, the rim carries the light): 0.028 to 0.016, was 0.035 to 0.02. */
+html[data-glass="liquid"] .aura-rail .aura-glass-hl {
+  background: linear-gradient(rgb(255 255 255 / 0.028), rgb(255 255 255 / 0.016));
+  box-shadow: none;
+}
+
+/* ---- The active pill ------------------------------------------------- */
+/* A NESTED inner pill on the rail's surface, never its own glass pass (a
+   backdrop-filter inside the rail would sample only the rail: Backdrop Root).
+   NavSidebar's NavPill moves it with liquidGlass.animateSpan (translate +
+   height inline) and keeps two twins for the click hand-off, shown by
+   `.is-on`; a hidden twin is visibility: hidden after its fade.
+   Frosted: the glass study's style A accent wash and inset hairline.
+   Liquid: a faint raised face (white 0.075) with a soft drop and NO accent;
+   the cursor light draws its rim (data-glass-light="rim"). */
+.aura-rail-pill {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 0;
+  z-index: 0;
+  border-radius: 13px;
+  pointer-events: none;
+  background:
+    var(--lg-rim-layer),
+    linear-gradient(135deg,
+      rgb(var(--ln-accent-rgb) / 0.22) 0%,
+      rgb(var(--ln-accent-rgb) / 0.14) 50%,
+      rgb(var(--ln-accent-rgb) / 0.07) 100%);
+  box-shadow:
+    inset 0 0 0 1px rgb(var(--ln-accent-rgb) / 0.35),
+    0 0 12px rgb(var(--ln-accent-rgb) / 0.18);
+  opacity: 0;
+  visibility: hidden;
+  transition:
+    translate  380ms cubic-bezier(0.34, 1.56, 0.64, 1),
+    height     380ms cubic-bezier(0.34, 1.56, 0.64, 1),
+    opacity    200ms ease-out,
+    visibility 0s linear 200ms;
+  will-change: translate, opacity;
+}
+.aura-rail-pill.is-on {
+  opacity: 1;
+  visibility: visible;
+  transition-delay: 0s;
+}
+/* Liquid: the springs move it in JS, so no translate / height transition. */
+html[data-glass="liquid"] .aura-rail-pill {
+  isolation: isolate;
+  /* The ring is a background layer (the cursor light's contract): it must
+     come first, or this face replaces it. Idle strengths are the mockup's.
+     The inner glow (white 0.015, the mockup's) is at zero alpha since round
+     17: like the rail's own 22 px glow it drew a +1 to +2 level band about
+     5 px inside the pill's edge. The same on every copy of this pill face
+     (the selected sheet, History, Detail, HUD tab and player rows). */
+  background: var(--lg-rim-layer), rgb(255 255 255 / 0.075);
+  --lg-idle-tl: 0.30;
+  --lg-idle-mid: 0.04;
+  --lg-idle-br: 0.16;
+  box-shadow:
+    inset 0 0 12px rgb(255 255 255 / 0),
+    0 2px 8px rgb(0 0 0 / 0.28);
+  transition: opacity 220ms ease-out, visibility 0s linear 220ms;
+}
+html[data-glass="liquid"] .aura-rail-pill.is-on { transition-delay: 0s; }
+html[data-reduced-motion="true"] .aura-rail-pill { transition-duration: 1ms !important; }
+
+/* High Contrast: the pill keeps a clear edge in both materials. */
+html:is([data-theme="contrast"], [data-theme="contrast-azure"]) .aura-rail-pill {
+  box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.35);
+}

@@ -94,6 +94,55 @@ pub struct AddonEntry {
     /// manifest refresh).
     #[serde(default)]
     pub configurable: bool,
+    /// Addons this one re-serves (AIOStreams wrapping AIOMetadata), as its
+    /// manifest declares them in `behaviorHints.wrappedAddons`: manifest id
+    /// and name only, never a URL. Empty for an ordinary addon and for a
+    /// wrapper that does not declare them. Lets Aura recognise AIOMetadata
+    /// inside AIOStreams, which no id / name / url test can.
+    #[serde(default)]
+    pub wrapped: Vec<WrappedAddon>,
+    /// The manifest declares `behaviorHints.landscapeArt: true`: the addon
+    /// answers `{base}/api/art/landscape/{type}/{id}.json`, AIOMetadata's
+    /// Continue Watching art route (AIOStreams forwarding it to the
+    /// AIOMetadata it wraps).
+    #[serde(default)]
+    pub landscape_art: bool,
+}
+
+/// One addon a wrapper re-serves (`AddonEntry::wrapped`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WrappedAddon {
+    pub manifest_id: String,
+    pub name: String,
+}
+
+/// At most this many wrapped addons are recorded per entry.
+pub const MAX_WRAPPED: usize = 32;
+
+/// `behaviorHints.wrappedAddons` and `behaviorHints.landscapeArt` from a
+/// manifest's raw `behaviorHints` value. Lenient: anything malformed is
+/// skipped or reads as false, never an error (the hints are optional
+/// extensions, so a bad one must not cost the addon its install).
+pub fn wrapped_from_hints(hints: Option<&serde_json::Value>) -> (Vec<WrappedAddon>, bool) {
+    let Some(h) = hints else { return (Vec::new(), false) };
+    let text = |v: Option<&serde_json::Value>| {
+        v.and_then(|s| s.as_str()).map(|s| s.trim().chars().take(128).collect::<String>()).unwrap_or_default()
+    };
+    let wrapped = h
+        .get("wrappedAddons")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|w| {
+                    let w = WrappedAddon { manifest_id: text(w.get("id")), name: text(w.get("name")) };
+                    (!w.manifest_id.is_empty() || !w.name.is_empty()).then_some(w)
+                })
+                .take(MAX_WRAPPED)
+                .collect()
+        })
+        .unwrap_or_default();
+    let art = h.get("landscapeArt").and_then(|v| v.as_bool()) == Some(true);
+    (wrapped, art)
 }
 
 // ---------------------------------------------------------------------------
@@ -170,4 +219,41 @@ pub fn reorder<R: tauri::Runtime>(
     next.extend(by_url.into_values());
     save(app, &next)?;
     Ok(next)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn wrapped_hints_are_lenient_and_bounded() {
+        let h = json!({
+            "configurable": true,
+            "landscapeArt": true,
+            "wrappedAddons": [
+                {"id": "aio-metadata", "name": "AIOMetadata (Sage's Fork)"},
+                {"id": "", "name": ""},
+                {"id": 7, "name": "Watchly"},
+                "not an object",
+                {"id": "x".repeat(300)}
+            ]
+        });
+        let (w, art) = wrapped_from_hints(Some(&h));
+        assert!(art);
+        assert_eq!(w.len(), 3, "empty and non-object entries are skipped: {w:?}");
+        assert_eq!(w[0], WrappedAddon { manifest_id: "aio-metadata".into(), name: "AIOMetadata (Sage's Fork)".into() });
+        assert_eq!(w[1], WrappedAddon { manifest_id: String::new(), name: "Watchly".into() });
+        assert_eq!(w[2].manifest_id.chars().count(), 128);
+        // Absent, malformed or non-true values read as nothing.
+        assert_eq!(wrapped_from_hints(None), (Vec::new(), false));
+        assert_eq!(wrapped_from_hints(Some(&json!({"landscapeArt": "yes", "wrappedAddons": {}}))), (Vec::new(), false));
+        let many: Vec<_> = (0..100).map(|i| json!({"id": format!("a{i}")})).collect();
+        assert_eq!(wrapped_from_hints(Some(&json!({"wrappedAddons": many}))).0.len(), MAX_WRAPPED);
+        // An entry from an older addons.json loads without the fields.
+        let old: AddonEntry = serde_json::from_value(json!({
+            "url": "https://x.invalid", "name": "X", "manifest_id": "x", "has_search": false
+        })).unwrap();
+        assert!(old.wrapped.is_empty() && !old.landscape_art);
+    }
 }

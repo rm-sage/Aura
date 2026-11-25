@@ -3,10 +3,10 @@
 
 //! Simkl: sign-in, the completion push and the History backfill.
 //!
-//! Simkl is the third scrobble provider, and it SUPPLEMENTS the other two
-//! rather than replacing either: an anime episode still goes to AniList (list
-//! progress) and now also to Simkl (a history row), and Simkl takes movies and
-//! series too, like Trakt. Every path here is inert while
+//! Simkl is the second scrobble provider, and it SUPPLEMENTS AniList rather
+//! than replacing it: an anime episode still goes to AniList (list progress)
+//! and also to Simkl (a history row), and Simkl takes movies and series too.
+//! Every path here is inert while
 //! `scrobble_auth::SIMKL_CLIENT_ID` is empty: no request is made, and the only
 //! trace is one info line per process.
 //!
@@ -36,7 +36,7 @@
 //!
 //! Simkl's AUTH V2 treats a desktop app as a PUBLIC client: no client_secret,
 //! with PKCE proving that whoever redeems the code is whoever started the flow.
-//! So unlike Trakt and AniList there is nothing for the aura.animasec.dev proxy
+//! So unlike AniList there is nothing for the aura.animasec.dev proxy
 //! to hold, and Aura talks to Simkl directly: `authorize_url` mints a verifier
 //! and a single-use `state` (an `oauth_callback` nonce that carries the
 //! verifier), the user consents in their own browser, Simkl redirects to
@@ -45,14 +45,13 @@
 //! deep-link, so the token reaches the keyring through `set_scrobble_auth_token`
 //! exactly like every other provider's.
 //!
-//! ## Completion-only, like Trakt
+//! ## Completion-only
 //!
 //! One `POST /sync/history` when playback ends past Aura's completion rule
 //! (plus one fallback POST with show-level ids when an anime episode's
 //! cour-level ids come back not_found; see `targets`), never
 //! `/scrobble/start|pause|stop`. Three reasons: Aura deliberately avoids
-//! live "watching now" pushes for Trakt (a preview should not land on a public
-//! feed); Simkl's docs do not say who can see its "Watching now" banner; and
+//! live "watching now" pushes (a preview should not land on a public feed); Simkl's docs do not say who can see its "Watching now" banner; and
 //! live scrobbling multiplies POSTs against a budget of ONE POST per second
 //! with a 20-second per-user write lock. Real-time can be a later opt-in.
 //!
@@ -513,14 +512,14 @@ pub(crate) async fn fetch_username(access_token: &str) -> Option<String> {
     (!name.is_empty()).then(|| name.chars().take(64).collect())
 }
 
-/// The `simkl` arm of `scrobble_auth::refresh_access_token`, with the same
-/// contract as Trakt's: serialised per scope, a caller whose failing token was
+/// The `simkl` arm of `scrobble_auth::refresh_access_token`: serialised per
+/// scope, a caller whose failing token was
 /// already replaced gets the fresh one without a second refresh, `Rejected`
 /// clears the keyring entry, `Transient` leaves it alone.
 ///
 /// Simkl's refresh is NON-rotating (the same refresh token comes back), so
-/// the serialisation is not about a double-spent refresh token as it is for
-/// Trakt. It matters for a different reason: a refresh replaces the grant's
+/// the serialisation is not about a double-spent refresh token. It matters
+/// for a different reason: a refresh replaces the grant's
 /// access token and the previous one stops working at once, so two
 /// overlapping refreshes would each invalidate what the other just stored.
 pub(crate) async fn refresh_token(
@@ -775,7 +774,7 @@ fn targets(sess: &ScrobbleSession) -> Vec<SimklTarget> {
     if let Some(v) = show_video {
         show_ids.entry(v.key.to_string()).or_insert_with(|| v.value.clone());
     }
-    // The VideoEntry's own numbers win over the id-parsed ones, as for Trakt.
+    // The VideoEntry's own numbers win over the id-parsed ones.
     let numbering = match (sess.season, sess.episode_num) {
         (Some(season), Some(number)) => Some((season, number)),
         _ => show_video.filter(|v| v.rest.len() == 2).map(|v| (v.rest[0], v.rest[1])),
@@ -885,7 +884,7 @@ fn iso_utc(secs: u64) -> String {
 }
 
 /// A History row's `played_at` in Simkl's form. Empty means no backdate
-/// (Simkl then stamps the request time, as Trakt does on that path).
+/// (Simkl then stamps the request time).
 /// Fractional seconds, which JavaScript's `toISOString` always adds, are
 /// dropped. Anything that is not a UTC timestamp is an `Err`: a malformed value
 /// would otherwise fail the whole batched request with a 400.
@@ -1068,7 +1067,7 @@ async fn write_authed(
 ) -> Authed {
     let mut write = post_history_retrying(client_id, &token.access_token, body).await;
 
-    // Reactive refresh on a 401, then the write once more, as Trakt does.
+    // Reactive refresh on a 401, then the write once more.
     if let Write::Unauthorized = write {
         match scrobble_auth::refresh_access_token("simkl", scope, Some(&token.access_token)).await {
             Ok(refreshed) => {
@@ -1233,8 +1232,7 @@ pub async fn push_completion(scope: &str, sess: &ScrobbleSession) -> SimklSyncRe
                         reply.status, reply.not_found.len(), sess.imdb_id, describe(target), preview,
                     );
                 } else {
-                    // Same call as Trakt's parse-failure branch: never report
-                    // a write nobody could confirm as fired.
+                    // Never report a write nobody could confirm as fired.
                     crate::devlog!(
                         warn, "scrobble",
                         "Simkl /sync/history body unreadable (status={}) for {} as {}; treating as not_found. body: {}",
@@ -1277,8 +1275,8 @@ pub async fn flush_on_shutdown(scope: &str, sess: &ScrobbleSession, progress_pct
 // History backfill (`scrobble_history_simkl`)
 // ---------------------------------------------------------------------------
 
-/// One History row to backfill. The fields are the ones the Trakt / AniList
-/// history commands take, under the same camelCase keys the frontend already
+/// One History row to backfill. The fields are the ones the AniList
+/// history command takes, under the same camelCase keys the frontend already
 /// sends for them (`parentId`, `mediaType`, `playedAt`, ...); the snake_case
 /// spellings of a `HistoryEntry` are accepted too. Deserialize-only: this
 /// never flows back to the frontend.
@@ -1457,8 +1455,7 @@ fn attribute(entries: &[(&'static str, Value)], reply: &HistoryReply) -> Vec<(Si
 /// rows pass 0 reported not_found. A signed-out, quota or 412 answer stops the
 /// run and fails every row not yet answered with that reason.
 ///
-/// `Err` only for the whole-batch conditions the Trakt command also reports as
-/// errors (not configured, not connected); otherwise one result per item.
+/// `Err` only for the whole-batch conditions (not configured, not connected); otherwise one result per item.
 pub async fn history_batch(
     scope: &str,
     items: Vec<SimklHistoryItem>,
@@ -1592,11 +1589,8 @@ mod tests {
             season: None,
             episode_num: None,
             series_imdb_id: None,
-            absolute_episode_num: None,
             anilist_id: None,
             anilist_episode: None,
-            episode_title: None,
-            episode_released: None,
         }
     }
 

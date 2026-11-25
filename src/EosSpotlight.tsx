@@ -324,11 +324,13 @@ function EosSpotlight({
   const tag = isNextUp ? formatEpisodeTag(shownEp!) : "";
   const epTitle = (shownEp?.title ?? "").trim() || "Untitled episode";
 
-  // Shared button class fragments.
+  // Shared button class fragments. Ghost and accent buttons are glass flat
+  // controls (App.css GLASS SYSTEM; is-primary carries the accent), so they
+  // take the chosen material and never a bg / border utility.
   const btnBase =
-    "px-5 py-2.5 rounded-xl text-[13px] font-semibold tracking-wide transition-colors flex items-center justify-center gap-2";
-  const btnGhost =
-    "text-white/85 bg-white/[0.06] border border-white/10 hover:bg-white/[0.10] hover:text-white";
+    "px-5 py-2.5 rounded-xl text-[13px] font-semibold tracking-wide flex items-center justify-center gap-2";
+  const btnGhost = "aura-glass-flat text-white/85 hover:text-white";
+  const btnAccent = "aura-glass-flat is-primary";
 
   return (
     <div
@@ -347,8 +349,7 @@ function EosSpotlight({
       onMouseDown={(e) => e.stopPropagation()}
       onDoubleClick={(e) => e.stopPropagation()}
     >
-      <div className="relative aura-glass-menu rounded-3xl w-[92%] max-w-[760px] p-7 text-white
-                      shadow-[0_40px_90px_-20px_rgba(0,0,0,0.85)]">
+      <div className="relative aura-glass-player rounded-3xl w-[92%] max-w-[760px] p-7 text-white">
         {/* Dismiss — hides the Spotlight without tearing playback down.
             The reverted DXGI flip model retains the last decoded frame,
             so the user is left on the paused final frame. Distinct from
@@ -367,7 +368,7 @@ function EosSpotlight({
         </button>
         {isNextUp ? (
           <>
-            <p className="text-white/45 text-[11px] font-mono uppercase tracking-[0.22em] mb-4">
+            <p className="text-white/60 text-[11px] font-mono uppercase tracking-[0.22em] mb-4">
               Up next
             </p>
             <div className="flex gap-6 items-stretch">
@@ -399,7 +400,7 @@ function EosSpotlight({
 
               {/* ── Body ── */}
               <div className="flex-1 min-w-0 flex flex-col">
-                <span className="text-white/45 text-[11px] font-mono uppercase tracking-[0.18em]">
+                <span className="text-white/60 text-[11px] font-mono uppercase tracking-[0.18em]">
                   {title} · {tag}
                 </span>
                 <h2 className="text-white text-[22px] font-semibold leading-tight mt-1 line-clamp-2">
@@ -460,8 +461,8 @@ function EosSpotlight({
                           aria-hidden
                           className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2
                                      opacity-0 group-hover:opacity-100 pointer-events-none whitespace-nowrap
-                                     px-2.5 py-1 rounded-md bg-black/80 backdrop-blur-sm
-                                     text-white/85 text-[11px] tracking-wide border border-white/10"
+                                     px-2.5 py-1 rounded-md aura-glass-player
+                                     text-white/85 text-[11px] tracking-wide"
                         >
                           Click to reveal spoilers
                         </span>
@@ -498,7 +499,7 @@ function EosSpotlight({
                         onMouseLeave={() => setPreviewCanon(false)}
                         onFocus={() => setPreviewCanon(true)}
                         onBlur={() => setPreviewCanon(false)}
-                        className={`relative overflow-hidden ${btnBase}
+                        className={`relative overflow-hidden ${btnBase} transition-colors
                                     border border-purple-400/45 bg-purple-500/20 text-purple-200
                                     hover:bg-purple-500/30 min-w-[170px]`}
                       >
@@ -553,9 +554,8 @@ function EosSpotlight({
                       type="button"
                       disabled={loading}
                       onClick={() => onPlayNext(false)}
-                      className={`relative overflow-hidden ${btnBase}
-                                  border border-ln-accent/45 bg-ln-accent/20 text-ln-accent
-                                  hover:bg-ln-accent/30 disabled:opacity-55 disabled:cursor-progress
+                      className={`relative overflow-hidden ${btnBase} ${btnAccent}
+                                  disabled:opacity-55 disabled:cursor-progress
                                   min-w-[170px]`}
                     >
                       {countdownActive && (
@@ -635,7 +635,7 @@ function EosSpotlight({
                 />
               </div>
             )}
-            <p className="text-white/45 text-[11px] font-mono uppercase tracking-[0.22em] mb-2">
+            <p className="text-white/60 text-[11px] font-mono uppercase tracking-[0.22em] mb-2">
               {title}
             </p>
             <h2 className="text-white text-[22px] font-semibold leading-tight mb-6
@@ -680,7 +680,7 @@ function EosSpotlight({
                 />
               </div>
             )}
-            <p className="text-white/45 text-[11px] font-mono uppercase tracking-[0.22em] mb-2">
+            <p className="text-white/60 text-[11px] font-mono uppercase tracking-[0.22em] mb-2">
               {caughtUpUnaired ? "Caught up" : isSeries ? "Series finale" : "Finished"}
             </p>
             <h2 className="text-white text-[24px] font-semibold leading-tight mb-2 max-w-[34ch]">
@@ -705,7 +705,7 @@ function EosSpotlight({
               <button
                 type="button"
                 onClick={onReplay}
-                className={`${btnBase} border border-ln-accent/45 bg-ln-accent/20 text-ln-accent hover:bg-ln-accent/30`}
+                className={`${btnBase} ${btnAccent}`}
               >
                 <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
                   <path d="M12 5V1L7 6l5 5V7c3.31 0 6 2.69 6 6s-2.69 6-6 6-6-2.69-6-6H4c0 4.42 3.58 8 8 8s8-3.58 8-8-3.58-8-8-8z" />

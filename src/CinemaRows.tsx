@@ -16,13 +16,15 @@ import { getMetaDetailFallback, useCanonicalReleaseYear } from "./metaCache";
 import { closeHoverNow } from "./catalogHoverStore";
 import { useHoverCardActivation } from "./useHoverCardActivation";
 import { getReleaseSignal, useReleaseSignalsVersion } from "./releaseSignalStore";
-import { formatCountdown, formatTargetDate, airingInfo, nextAiringEpisode, useAvailableEarlyVersion, useCountdownNow } from "./releaseCountdown";
+import { formatCountdown, formatTargetDate, nextAiringEpisode, useAvailableEarlyVersion, useCountdownNow } from "./releaseCountdown";
 import { cloudNextIsOut } from "./availableEarly";
 import { useLandscapeArt, LANDSCAPE_CARD_WIDTH } from "./landscapeArt";
-import { findAIOMetadataAddon, isAnimeMeta } from "./aiometadata";
+import { findLandscapeArtAddon, isAnimeMeta } from "./aiometadata";
+import { useAddonHints } from "./addonHints";
 import { shrinkPoster } from "./posterSize";
 import { BarTooltip, episodeTag, formatProgressPct, type BarTip } from "./progressBar";
 import { loadAuraSettings } from "./auraSettings";
+import { bleedTitleRef } from "./bleedTint";
 import {
   arcArtFor, arcsKnownUnavailable, fetchStoryArcs, loadArcMode, storyArcsAvailable,
 } from "./storyArcs";
@@ -115,43 +117,17 @@ export interface ContinueWatchingCardProps {
 }
 
 // ---------------------------------------------------------------------------
-// LatestAiredCaret — the "newest aired episode" marker on CW progress bars.
-// A small green caret pointing DOWN at the latest-aired segment that bobs
-// gently (signalling "this is the latest"). Double-stroked (dark halo under
-// the green) plus a drop-shadow so it stays legible over bright or similarly
-// green backgrounds. aria-hidden + pointer-events-none so it never blocks the
-// bar's own hover tooltip.
-// ---------------------------------------------------------------------------
-function LatestAiredCaret({ leftPct }: { leftPct?: number }) {
-  return (
-    <span
-      aria-hidden
-      className="absolute -top-[9px] -translate-x-1/2 z-20 pointer-events-none"
-      style={{ left: leftPct != null ? `${leftPct}%` : "50%" }}
-    >
-      <svg
-        width="11"
-        height="7"
-        viewBox="0 0 11 7"
-        fill="none"
-        className="aura-latest-aired-caret block"
-        style={{ filter: "drop-shadow(0 1px 1.5px rgba(0,0,0,0.85))" }}
-      >
-        {/* dark halo underneath for contrast on any background */}
-        <path d="M1.3 1.4 L5.5 5.8 L9.7 1.4" stroke="#0a0a0a" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" />
-        {/* green caret on top */}
-        <path d="M1.3 1.4 L5.5 5.8 L9.7 1.4" stroke="#3DF08A" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" />
-      </svg>
-    </span>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// SegmentedSeasonBar — for series / anime CW cards. Renders one segment
-// per episode in the resume episode's season; segments are colored:
-//   • emerald  — watched (manual mark OR position-implied)
-//   • amber    — currently watching (state.video_id resume hint)
-//   • white/15 — unwatched
+// SegmentedSeasonBar: for series / anime CW cards. Renders one segment
+// per episode in the resume episode's season, in the SAME tokens as the
+// detail page's Your Progress bar (DetailView.tsx SEG_CLASS):
+//   • purple-400: skipped
+//   • emerald: watched (manual mark OR position-implied)
+//   • amber: currently watching (state.video_id resume hint)
+//   • white/70: aired, not watched (available now)
+//   • white/15: not yet aired
+// The tints alone say what has aired (round 12, the user's call): the old
+// latest-aired caret above the bar is gone (it clipped into the countdown
+// pill), as on the detail bar, which never had one.
 //
 // The "position-implied" rule: episodes earlier in the season than the
 // resume episode are treated as watched. Stremio doesn't track per-
@@ -242,18 +218,12 @@ function SegmentedSeasonBar({
   // The 8 px inset is enough to clear the curvature on a 5 px-tall
   // bar without leaving an obvious gap.
   //
-  // Airing marker: a green caret (LatestAiredCaret) bobs above the latest-
-  // aired segment, and aired-but-unwatched segments are tinted brighter than
-  // not-yet-aired ones so "available to watch now" reads at a glance.
-  // overflow-visible lets the caret (and the Task-5 tooltip) sit above the bar.
-  const air = airingInfo(episodes);
-  const latestAiredIdx = air.isAiring && air.latestAiredId
-    ? episodes.findIndex((v) => v.id === air.latestAiredId)
-    : -1;
+  // Aired-but-unwatched segments are tinted brighter than not-yet-aired ones,
+  // so "available to watch now" reads at a glance with no marker.
 
   // Tooltip label for the segment under the cursor (4b). State-driven so the
-  // user learns what each colour means + the latest-aired marker. Mirrors the
-  // segment colour branches below so the words match the colour.
+  // user learns what each colour means. Mirrors the segment colour branches
+  // below so the words match the colour.
   const segLabel = (ep: VideoEntry, i: number): string => {
     const sxe = episodeTag(ep.season, ep.episode);
     const manual = getManualWatchedState(ep.id);
@@ -265,20 +235,32 @@ function SegmentedSeasonBar({
     else if ((manual === "in-progress" || (i === currentIdx && resumeActive)) && i >= lastWatchedIdx) state = "In progress";
     else if (isVideoAired(ep)) state = "Available now";
     else state = "Not yet aired";
-    return i === latestAiredIdx ? `${sxe} · ${state} · Latest aired` : `${sxe} · ${state}`;
+    return `${sxe} · ${state}`;
   };
 
+  // A glass track (round 9): the segments sit in a real-frost pill, lit as a
+  // rim-only light surface. The pill takes the hover (a bigger target than
+  // the 5 px bar); the fraction is still read off the bar itself.
+  // Round 12 performance: on a Continue Watching card only the bezel takes the
+  // cursor light; the track, the SxxEyy badge and the countdown keep their idle
+  // rim but opt out (`data-glass-glint="off"`). Each lit one repainted its card
+  // on every light frame (Home, pointer over the CW row: 184 to 215 fps at
+  // 2575 x 1038, 203 to 234 moving slowly at 1600 x 900).
+  const lastIdx = episodes.length - 1;
   return (
     <div
-      className="absolute left-2 right-2 bottom-1 h-[5px] flex gap-[1.5px] rounded-full overflow-visible"
+      className="aura-frost aura-frost-track"
+      data-glass-light="rim" data-glass-glint="off"
       onMouseMove={(e) => {
-        const r = e.currentTarget.getBoundingClientRect();
+        const bar = e.currentTarget.firstElementChild as HTMLElement | null;
+        const r = (bar ?? e.currentTarget).getBoundingClientRect();
         const frac = Math.max(0, Math.min(0.9999, (e.clientX - r.left) / r.width));
         const idx = Math.min(episodes.length - 1, Math.floor(frac * episodes.length));
-        setTip({ x: e.clientX, y: r.top, text: segLabel(episodes[idx], idx) });
+        setTip({ x: e.clientX, y: e.currentTarget.getBoundingClientRect().top, text: segLabel(episodes[idx], idx) });
       }}
       onMouseLeave={() => setTip(null)}
     >
+      <div className="aura-frost-bar flex gap-[1.5px]">
       {episodes.map((ep, i) => {
         const manual = getManualWatchedState(ep.id);
         let cls: string;
@@ -296,18 +278,19 @@ function SegmentedSeasonBar({
           // "available" below instead.
           cls = "bg-amber-400";
         } else if (i < impliedThroughIdx) {
-          cls = "bg-emerald-400/85"; // implied-watched (earlier in season)
+          // Implied-watched (earlier in season): the detail bar's watched
+          // tint exactly, so one show reads the same on both bars.
+          cls = "bg-emerald-400";
         } else if (isVideoAired(ep)) {
-          cls = "bg-white/70"; // aired but unwatched — available to watch now
+          cls = "bg-white/70"; // aired but unwatched: available to watch now
         } else {
           cls = "bg-white/15"; // not yet aired
         }
-        return (
-          <div key={ep.id} className={`relative flex-1 h-full ${cls}`}>
-            {i === latestAiredIdx && <LatestAiredCaret />}
-          </div>
-        );
+        // Rounded ends on the first and last segment only.
+        const ends = `${i === 0 ? " rounded-l-full" : ""}${i === lastIdx ? " rounded-r-full" : ""}`;
+        return <div key={ep.id} className={`flex-1 h-full ${cls}${ends}`} />;
       })}
+      </div>
       <BarTooltip tip={tip} />
     </div>
   );
@@ -317,9 +300,9 @@ function SegmentedSeasonBar({
  *  bar with a green-to-amber gradient ending at the in-progress
  *  episode's position. Watched-only ranges (no current in-progress) get
  *  a solid green fill; the gradient is only painted when there's a real
- *  "you are here" position to mark. The unwatched remainder uses the
- *  same white/15 background colour the segmented version's empty
- *  segments use, so the visual language stays consistent.
+ *  "you are here" position to mark. The unwatched remainder takes the
+ *  segmented version's tints: white/70 up to the last aired episode,
+ *  white/15 past it, so the visual language stays consistent.
  *
  *  Position math walks the episode list once to find the rightmost
  *  "engaged" episode (watched / in-progress / implied-watched). The
@@ -375,11 +358,28 @@ function ContinuousProgressBar({
       || (currentIdx >= 0 && i <= currentIdx);
     if (engaged) engagedThroughIdx = i;
   }
+  // The aired range, as a tint (round 12; the latest-aired caret is gone): the
+  // track is the not-yet-aired white/15, the part up to the last aired episode
+  // the detail bar's "available" white/70, and the fill paints over both. One
+  // reverse walk, stopping at the first aired episode from the end.
+  let lastAiredIdx = -1;
+  for (let i = total - 1; i >= 0; i -= 1) {
+    if (isVideoAired(episodes[i])) { lastAiredIdx = i; break; }
+  }
+  const airedPct = ((lastAiredIdx + 1) / total) * 100;
+  const airedLayer = airedPct > 0
+    ? <div aria-hidden className="absolute inset-y-0 left-0 bg-white/70" style={{ width: `${airedPct}%` }} />
+    : null;
+
   if (engagedThroughIdx < 0) {
-    // Nothing engaged yet — render the empty track only so the bar
-    // height stays consistent with the segmented version.
+    // Nothing engaged yet: the tinted track only, so the bar height stays
+    // consistent with the segmented version.
     return (
-      <div className="absolute left-2 right-2 bottom-1 h-[5px] rounded-full overflow-hidden bg-white/15" />
+      <div className="aura-frost aura-frost-track" data-glass-light="rim" data-glass-glint="off">
+        <div className="aura-frost-bar">
+          <div className="absolute inset-0 rounded-full overflow-hidden bg-white/15">{airedLayer}</div>
+        </div>
+      </div>
     );
   }
 
@@ -413,14 +413,6 @@ function ContinuousProgressBar({
         background: "rgb(52,211,153)",
       };
 
-  // Latest-aired caret at the airing frontier position. Same marker the
-  // segmented bar uses, placed at the latest-aired fraction along the bar.
-  const air = airingInfo(episodes);
-  const latestAiredIdx = air.isAiring && air.latestAiredId
-    ? episodes.findIndex((v) => v.id === air.latestAiredId)
-    : -1;
-  const frontierPct = latestAiredIdx >= 0 ? ((latestAiredIdx + 1) / total) * 100 : null;
-
   // Counted by the SEGMENTED bar's rule, not by `engagedThroughIdx`.
   //
   // The distinction matters: `engaged` folds in "in-progress" marks, so a
@@ -452,7 +444,8 @@ function ContinuousProgressBar({
 
   return (
     <div
-      className="absolute left-2 right-2 bottom-1 h-[5px] rounded-full overflow-visible"
+      className="aura-frost aura-frost-track"
+      data-glass-light="rim" data-glass-glint="off"
       // The label does not vary along this bar, so the pill is anchored to the
       // bar's CENTRE and the state is only written when it would actually
       // differ; returning `prev` lets React bail out of the render entirely.
@@ -460,7 +453,7 @@ function ContinuousProgressBar({
       // a season exceeds the segmented bar's 50-aired cap, so its episode list
       // is long by construction and four figures on a long-runner, and its
       // whole derivation lives in the render body (seven O(n) passes, one of
-      // them a Date.parse per episode via airingInfo). A pointer-following
+      // them a Date.parse per episode via isVideoAired). A pointer-following
       // tooltip would re-run all of that on every pixel of travel.
       onMouseMove={(e) => {
         const r = e.currentTarget.getBoundingClientRect();
@@ -472,10 +465,12 @@ function ContinuousProgressBar({
       }}
       onMouseLeave={() => setTip(null)}
     >
-      <div className="absolute inset-0 rounded-full overflow-hidden bg-white/15">
-        <div aria-hidden className="h-full" style={fillStyle} />
+      <div className="aura-frost-bar">
+        <div className="absolute inset-0 rounded-full overflow-hidden bg-white/15">
+          {airedLayer}
+          <div aria-hidden className="relative h-full" style={fillStyle} />
+        </div>
       </div>
-      {frontierPct != null && <LatestAiredCaret leftPct={frontierPct} />}
       <BarTooltip tip={tip} />
     </div>
   );
@@ -804,13 +799,17 @@ function CWReleaseCountdown({ seriesId, episodes }: { seriesId: string; episodes
   const now = useCountdownNow(Number.isFinite(targetMs) ? targetMs : undefined);
   if (!Number.isFinite(targetMs) || targetMs <= now) return null;
   return (
-    <div className="absolute inset-x-0 bottom-[28px] flex justify-center pointer-events-none z-10">
+    // aura-cw-countdown: a width container, so a card too narrow for the
+    // one-line pill (about 150 px of art, a 900 px window) drops it instead
+    // of wrapping it onto the SxxEyy badge (glass-cards.css).
+    <div className="aura-cw-countdown absolute inset-x-0 bottom-[28px] flex justify-center pointer-events-none z-10">
       <span
         title={`Next episode airs ${formatTargetDate(targetMs)}`}
-        className="pointer-events-auto inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full
-                   bg-black/72 border border-white/15
-                   text-white text-[12.5px] font-semibold tabular-nums"
-        style={{ textShadow: "0 1px 2px rgba(0,0,0,0.9)" }}
+        // Real frost, a rim-only light surface (round 9, the mockup's .cd).
+        data-glass-light="rim" data-glass-glint="off"
+        className="aura-frost pointer-events-auto inline-flex items-center gap-1.5 px-2.5 py-[5px] rounded-full whitespace-nowrap
+                   text-white/92 text-[12.5px] leading-none font-semibold tabular-nums"
+        style={{ textShadow: "0 1px 2px rgba(0,0,0,0.5)" }}
       >
         <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor"
              strokeWidth="2.2" className="text-ln-accent" aria-hidden>
@@ -832,9 +831,15 @@ export const ContinueWatchingCard = memo(function ContinueWatchingCard(
   // title — which drives the logo overlay below. The box is already 16:9, so
   // a proper landscape fills it cleanly; the heavy crop only happened when
   // an item had no landscape at all and a portrait poster got cover-fit.
-  // Until AIOMeta's endpoint ships, `art` is null and we fall back to the
-  // old `background ?? poster` chain — inert, not broken.
-  const aioAddon = useMemo(() => findAIOMetadataAddon(addons ?? []), [addons]);
+  // The route exists only in the rm-sage AIOMetadata fork (since 2026-06);
+  // elsewhere `art` is null and the card keeps the `background ?? poster`
+  // chain. AIOMetadata
+  // wrapped inside AIOStreams answers the route only when AIOStreams declares
+  // it forwards it (`landscape_art`); without that the chain falls back too.
+  // The wrapper's live manifest says whether it forwards the route
+  // (addonHints.ts); the memo re-derives when that read lands.
+  const hintsVersion = useAddonHints(addons);
+  const aioAddon = useMemo(() => findLandscapeArtAddon(addons ?? []), [addons, hintsVersion]);
   const art = useLandscapeArt(item, aioAddon, LANDSCAPE_CARD_WIDTH);
   // Hoisted above the art chain because useCwArcArt needs it. Same single
   // fetch the card already made further down; the declaration just moved.
@@ -952,9 +957,10 @@ export const ContinueWatchingCard = memo(function ContinueWatchingCard(
 
   return (
     <div
-      className="card-grow group relative cursor-pointer card-contain text-left
+      className="aura-cw-card card-grow group relative cursor-pointer card-contain text-left
                  focus-within:ring-2 focus-within:ring-ln-accent/60 rounded-xl"
       data-meta-card={`${item.media_type}:${item.id}`}
+      data-card-glow
     >
       <button
         type="button"
@@ -972,8 +978,9 @@ export const ContinueWatchingCard = memo(function ContinueWatchingCard(
         className="block w-full text-left rounded-xl focus:outline-none"
       >
         <div
-          className="relative overflow-hidden rounded-xl bg-white/5 border border-white/8"
+          className="relative overflow-hidden rounded-xl bg-white/5"
           style={{ aspectRatio: "16 / 9" }}
+          data-card-art
         >
           {src ? (
             <ImageLoader
@@ -992,9 +999,9 @@ export const ContinueWatchingCard = memo(function ContinueWatchingCard(
               cleanly at sofa distance. */}
           {badge && (
             <span
-              className="absolute top-1.5 left-1.5 px-2 py-1 rounded
-                         bg-black/75 border border-white/15
-                         text-white/90 text-[13px] font-mono font-semibold
+              data-glass-light="rim" data-glass-glint="off"
+              className="aura-frost absolute top-2 left-2 z-10 px-2 py-[5px] rounded-[7px]
+                         text-white/90 text-[13px] leading-none font-mono font-semibold
                          tracking-wider tabular-nums"
               aria-label={`Resume at ${badge}`}
             >
@@ -1033,14 +1040,18 @@ export const ContinueWatchingCard = memo(function ContinueWatchingCard(
               resumeActive={resumeActive}
             />
           ) : progress > 0 && (
-            <div className="absolute inset-x-0 bottom-0 h-[5px] bg-white/15">
-              <div className="h-full bg-ln-accent" style={{ width: `${progress * 100}%` }} />
+            <div className="aura-frost aura-frost-track" data-glass-light="rim" data-glass-glint="off">
+              <div className="aura-frost-bar is-empty">
+                <div className="h-full rounded-full bg-ln-accent" style={{ width: `${progress * 100}%` }} />
+              </div>
             </div>
           )}
           <CWReleaseCountdown seriesId={item.id} episodes={seasonEpisodes} />
+          {/* The bezel: the cursor light's rim (glass-cards.css). */}
+          <span aria-hidden className="aura-card-bezel" data-glass-light="rim" />
         </div>
         <p
-          className="text-white/90 text-[17px] font-medium mt-2 leading-tight line-clamp-1 text-center"
+          className="aura-card-title text-white/90 text-[17px] font-medium mt-2 leading-tight line-clamp-1 text-center"
           title={item.name}
         >
           {item.name}
@@ -1065,14 +1076,14 @@ export const ContinueWatchingCard = memo(function ContinueWatchingCard(
           }}
           title="Remove from Continue Watching"
           aria-label="Remove from Continue Watching"
-          className="absolute top-2 right-2 w-7 h-7 rounded-full
-                     bg-black/70 text-white/85 hover:bg-black/90 hover:text-white
-                     border border-white/20
-                     opacity-0 group-hover:opacity-100 transition-opacity
+          data-glass-light="rim"
+          className="aura-frost aura-frost-btn absolute top-2 right-2 w-7 h-7 rounded-full
+                     text-white/90 hover:text-white
+                     opacity-0 group-hover:opacity-100
                      flex items-center justify-center
                      focus:outline-none focus-visible:opacity-100"
         >
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
             <path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" />
           </svg>
         </button>
@@ -1103,9 +1114,13 @@ export const ContinueWatchingRow = memo(function ContinueWatchingRow(
   const visible = have16x9.slice(0, CONTINUE_VISIBLE);
 
   return (
-    <section className="relative px-6">
+    <section className="relative px-6" data-card-glow-host>
+      <CardGlowSlots />
       <div className="flex items-baseline gap-3 mb-3 px-1">
-        <h3 className="aura-row-title text-2xl font-semibold tracking-tight">
+        {/* Row titles (round 11, App.css .aura-row-title): a soft tint from the
+            hero bleed around them (bleedTint.ts) and the cursor light on the
+            glyphs (glassGlint.ts "text" kind). */}
+        <h3 ref={bleedTitleRef} data-glass-light="text" className="aura-row-title text-2xl font-semibold tracking-tight">
           Continue Watching
         </h3>
         <p className="text-white/65 text-[13px] font-mono tabular-nums tracking-wide">
@@ -1128,6 +1143,29 @@ export const ContinueWatchingRow = memo(function ContinueWatchingRow(
 // ---------------------------------------------------------------------------
 // Discovery row — 10-column CSS Grid. 9 catalog items + 1 "View All" cell.
 // ---------------------------------------------------------------------------
+
+/** A poster's watch-progress track (round 12). Rating posters (RPDB,
+ *  AIOMetadata's `/poster`) bake their rating chips into the bottom of the
+ *  IMAGE, about the bottom 8.5% of its height, so a track pinned 7 px from the
+ *  bottom sat across the chips. `.is-poster` (glass-cards.css) lifts it above
+ *  that band on EVERY poster: the band cannot be detected from the url (any
+ *  host can serve a rating poster, and a failed RPDB url falls back to a
+ *  plain metahub one), and one fixed height keeps a row's bars in line.
+ *  Shared by CatalogCard (Home and Search rows) and the catalog page's poster
+ *  grid. `ratio` null renders nothing. */
+export function PosterProgressTrack({ ratio }: { ratio: number | null }) {
+  if (ratio == null) return null;
+  return (
+    <div className="aura-frost aura-frost-track is-poster" data-glass-light="rim">
+      <div className="aura-frost-bar is-thin is-empty">
+        <div
+          className="h-full rounded-full bg-ln-accent"
+          style={{ width: `${Math.max(0, Math.min(1, ratio)) * 100}%` }}
+        />
+      </div>
+    </div>
+  );
+}
 
 interface CatalogCardProps {
   meta: MetaPreview;
@@ -1173,10 +1211,12 @@ export const CatalogCard = memo(function CatalogCard({ meta, onSelect, fixedTitl
       className="card-grow group flex flex-col gap-2 cursor-pointer card-contain text-left
                  focus:outline-none focus-visible:ring-2 focus-visible:ring-ln-accent/60 rounded-xl"
       data-meta-card={`${meta.media_type}:${meta.id}`}
+      data-card-glow
     >
       <div
-        className="relative overflow-hidden rounded-xl bg-white/5 border border-white/8"
+        className="relative overflow-hidden rounded-xl bg-white/5"
         style={{ aspectRatio: "2 / 3" }}
+        data-card-art
       >
         {meta.poster ? (
           <ImageLoader
@@ -1218,20 +1258,16 @@ export const CatalogCard = memo(function CatalogCard({ meta, onSelect, fixedTitl
         <WatchedBadge
           metaId={meta.id}
           mediaType={meta.media_type}
-          className="absolute top-1.5 left-1.5"
+          material="frost"
+          className="absolute top-2 left-2 z-10"
         />
 
-        {/* In-progress bar — bottom edge, only when partially watched
-            via library state. The badge above gives the AT-A-GLANCE
-            signal; this bar adds fine-grained position info. */}
-        {progress?.partial && (
-          <div className="absolute inset-x-0 bottom-0 h-[3px] bg-black/55">
-            <div
-              className="h-full bg-ln-accent"
-              style={{ width: `${progress.ratio * 100}%` }}
-            />
-          </div>
-        )}
+        {/* In-progress bar, only when partially watched via library state.
+            The badge above gives the AT-A-GLANCE signal; this bar adds
+            fine-grained position info. Lifted above the rating chips. */}
+        <PosterProgressTrack ratio={progress?.partial ? progress.ratio : null} />
+        {/* The bezel: the cursor light's rim (glass-cards.css). */}
+        <span aria-hidden className="aura-card-bezel" data-glass-light="rim" />
       </div>
       {/* Native browser tooltip surfaces the full title when the
           rendered text gets clipped by line-clamp-2 — common for
@@ -1249,7 +1285,7 @@ export const CatalogCard = memo(function CatalogCard({ meta, onSelect, fixedTitl
       {fixedTitle ? (
         <div className="h-[4.55rem] overflow-hidden">
           <p
-            className="text-white/90 text-[19px] font-medium leading-tight line-clamp-2 text-center"
+            className="aura-card-title text-white/90 text-[19px] font-medium leading-tight line-clamp-2 text-center"
             title={meta.name}
           >
             {meta.name}
@@ -1261,7 +1297,7 @@ export const CatalogCard = memo(function CatalogCard({ meta, onSelect, fixedTitl
       ) : (
         <>
           <p
-            className="text-white/90 text-[19px] font-medium leading-tight line-clamp-2 text-center"
+            className="aura-card-title text-white/90 text-[19px] font-medium leading-tight line-clamp-2 text-center"
             title={meta.name}
           >
             {meta.name}
@@ -1339,6 +1375,32 @@ export const DiscoveryRow = memo(function DiscoveryRow(
     return () => onOverflowChange(rowKey, false);
   }, [overflowOpen, rowKey, onOverflowChange]);
 
+  // Defensive dedupe by `${media_type}:${id}`. Some addons (notably AI
+  // Search) occasionally return the same series twice in one catalog
+  // response, observed in production for "jjk" (series:tt12343534 x2),
+  // which crashed React with "Encountered two children with the same
+  // key". First occurrence wins, preserving native order. Memoized on
+  // `items` (and declared above the early returns, as hooks must be): the
+  // row re-renders for its popup state and the parent's window steps, and
+  // the walk and the visible slice only change with the items.
+  const dedupedItems = useMemo(() => {
+    const seen = new Set<string>();
+    const out: MetaPreview[] = [];
+    for (const m of items) {
+      const k = `${m.media_type}:${m.id}`;
+      if (seen.has(k)) continue;
+      seen.add(k);
+      out.push(m);
+    }
+    return out;
+  }, [items]);
+
+  // The home row renders up to HOME_VISIBLE = 10 items. At 1080p only
+  // the first 8 are actually visible (CSS hides 9-10 via :nth-child),
+  // so we offer the View-all popup whenever the catalog has at least
+  // one item (the popup paginates up to 100 lazily on click).
+  const visible = useMemo(() => dedupedItems.slice(0, HOME_VISIBLE), [dedupedItems]);
+
   // Skeleton — render exactly 10 placeholder cells.
   if (loading && items.length === 0) {
     return (
@@ -1366,28 +1428,6 @@ export const DiscoveryRow = memo(function DiscoveryRow(
 
   if (items.length === 0) return null;
 
-  // Defensive dedupe by `${media_type}:${id}`. Some addons (notably AI
-  // Search) occasionally return the same series twice in one catalog
-  // response — observed in production for "jjk" → series:tt12343534 ×2,
-  // which crashed React with "Encountered two children with the same
-  // key". First occurrence wins, preserving native order.
-  const seen = new Set<string>();
-  const dedupedItems: MetaPreview[] = [];
-  for (const m of items) {
-    const k = `${m.media_type}:${m.id}`;
-    if (seen.has(k)) continue;
-    seen.add(k);
-    dedupedItems.push(m);
-  }
-
-  // The home row renders up to HOME_VISIBLE = 10 items. At 1080p only
-  // the first 8 are actually visible (CSS hides 9-10 via :nth-child),
-  // so we offer the View-all popup whenever the catalog has at least
-  // one item — the popup paginates up to 100 lazily on click. The
-  // count we show in the subtitle is `home-visible cap or higher`
-  // suffixed with `+` since we don't know the true total without
-  // paginating, and showing a bare "View all" feels under-informative.
-  const visible = dedupedItems.slice(0, HOME_VISIBLE);
   const canPaginate = !!(addonUrl && catalogType && catalogId);
   // A catalog row can still expand beyond what's loaded if it's wired
   // to fetch_catalog_paginated. If it isn't (search rows), only show
@@ -1575,6 +1615,18 @@ function RowFailedNotice({ onRetry, withTitle }: { onRetry?: () => void; withTit
   );
 }
 
+/** The hover underglow's two slots (cardGlow.ts), the FIRST children of a
+ *  row's <section data-card-glow-host> so they paint under every card in it.
+ *  Empty and transparent until a card in the row is hovered. */
+function CardGlowSlots() {
+  return (
+    <>
+      <div aria-hidden className="aura-card-glow" />
+      <div aria-hidden className="aura-card-glow" />
+    </>
+  );
+}
+
 // ---------------------------------------------------------------------------
 // RowFrame — header + grid body. Subtitle becomes a clickable
 // "View all N →" affordance when an onSubtitleClick is provided.
@@ -1607,17 +1659,23 @@ function RowFrame({
   // surrounding label muted — same emphasis pattern the previous
   // "<N> total" subtitle used.
   const m = shownSubtitle ? /^(.*?)(\d[\d,]*)(.*)$/.exec(shownSubtitle) : null;
+  // The button is a small flat glass control (round 9, glass-cards.css
+  // .aura-row-viewall): mono label, accent chevron.
+  const chevron = asButton ? (
+    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+         strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+      <path d="M9 6l6 6-6 6" />
+    </svg>
+  ) : null;
   const subtitleContent = m ? (
     <>
-      <span className="text-white/55">{m[1]}</span>
-      <span className="text-white/95 font-semibold">{m[2]}</span>
-      <span className="text-white/45">{m[3]}</span>
-      {asButton && <span className="text-ln-accent ml-1">→</span>}
+      <span>{m[1]}<span className="text-white/95 font-semibold">{m[2]}</span>{m[3]}</span>
+      {chevron}
     </>
   ) : (
     <>
-      <span className={asButton ? "text-white/85" : "text-white/55"}>{shownSubtitle}</span>
-      {asButton && <span className="text-ln-accent ml-1">→</span>}
+      <span>{shownSubtitle}</span>
+      {chevron}
     </>
   );
 
@@ -1639,9 +1697,10 @@ function RowFrame({
   );
 
   return (
-    <section className="relative px-6">
-      <div className="flex items-baseline justify-between mb-3 px-1">
-        <h3 className="aura-row-title text-2xl font-semibold tracking-tight">{title}</h3>
+    <section className="relative px-6" data-card-glow-host>
+      <CardGlowSlots />
+      <div className="flex items-center justify-between gap-3 mb-3 px-1">
+        <h3 ref={bleedTitleRef} data-glass-light="text" className="aura-row-title text-2xl font-semibold tracking-tight">{title}</h3>
         {shownSubtitle && (
           asButton ? (
             <button
@@ -1651,15 +1710,14 @@ function RowFrame({
               // of the tab order and the accessibility tree.
               aria-hidden={reserved || undefined}
               tabIndex={reserved ? -1 : undefined}
-              className={`text-[15px] font-mono tabular-nums tracking-wide
-                         hover:opacity-90 transition-opacity cursor-pointer
-                         bg-transparent p-0 border-0 focus:outline-none
-                         focus-visible:underline${reserved ? " invisible" : ""}`}
+              data-glass-light="control"
+              className={`aura-glass-flat aura-row-viewall shrink-0 font-mono tabular-nums
+                         focus:outline-none${reserved ? " invisible" : ""}`}
             >
               {subtitleContent}
             </button>
           ) : (
-            <p className="text-[15px] font-mono tabular-nums tracking-wide">
+            <p className="text-[13px] font-mono tabular-nums tracking-wide text-white/55">
               {subtitleContent}
             </p>
           )
@@ -1748,15 +1806,23 @@ function CatalogOverlay({
   return (
     <div
       className="fixed inset-0 z-[55] flex items-center justify-center p-6"
-      style={{
-        backgroundColor: opening ? "transparent" : "rgba(0,0,0,0.80)",
-        backdropFilter: opening ? "blur(0px)" : "blur(8px)",
-        transition: "background-color 200ms ease, backdrop-filter 200ms ease",
-      }}
       onClick={onClose}
     >
+      {/* The dim + blur is a SIBLING layer, not the wrapper: a backdrop-filter
+          on an ancestor would blind the card's own glass. */}
       <div
-        className="glass-panel rounded-2xl flex flex-col overflow-hidden"
+        aria-hidden
+        className="absolute inset-0"
+        style={{
+          backgroundColor: opening ? "transparent" : "rgba(0,0,0,0.80)",
+          backdropFilter: opening ? "blur(0px)" : "blur(8px)",
+          transition: "background-color 200ms ease, backdrop-filter 200ms ease",
+        }}
+      />
+      <div
+        // The shared floating glass (menu tier). Too large for a Liquid lens,
+        // so it keeps the CSS face (liquidGlass.ts MAX_AREA).
+        className="aura-float-glass relative rounded-2xl flex flex-col overflow-hidden"
         style={{
           width:    "var(--catalog-popup-w)",
           maxHeight: "var(--catalog-popup-h)",
@@ -1786,8 +1852,8 @@ function CatalogOverlay({
             <button
               onClick={onClose}
               aria-label="Close"
-              className="w-8 h-8 rounded-full glass-panel flex items-center justify-center
-                         text-white/50 hover:text-white transition-colors"
+              className="aura-glass-flat aura-glass-press w-8 h-8 rounded-full flex items-center justify-center
+                         text-white/50 hover:text-white"
             >
               <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
                 <path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" />

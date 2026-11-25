@@ -1,0 +1,545 @@
+/* Aura - (c) 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice. */
+/* SPDX-License-Identifier: AGPL-3.0-or-later */
+
+/* NOTIFICATIONS from the rail (round 10): the side sheet
+   (NotificationsPanel.tsx), the arrival bubble and the Notifications row's
+   arrival cues (NotificationsBell.tsx). Loaded after App.css (main.tsx), so a
+   rule here at equal specificity wins over App.css. The sheet and the bubble
+   are plain `.aura-float-glass` (the Liquid menu tier with the A idle rim and
+   the cursor light; Frosted in Matte): nothing here sets their
+   background, border, box-shadow or backdrop-filter. Their contents are
+   CONTENT rows, never glass. Accent through the accent tokens only, so a
+   custom accent follows. frontend-ui.md "Notifications". */
+
+/* ---- Shared motion ---------------------------------------------------- */
+/* Both grow out of the Notifications row, the rail's TOP row (round 12):
+   top flush with the rail's top, transform-origin (inline, NotificationsPanel
+   railOrigin) on the rail's edge at the row's middle, so they grow DOWNWARD.
+   Open springs on --lg-springy (transform only: the curve passes 1, so the
+   opacity rides its own short ease); close is a quicker accelerate back into
+   the row. The open style is `.is-open`, flipped by usePopPresence. */
+.aura-notif-sheet,
+.aura-notif-bubble {
+  position: fixed;
+  opacity: 0;
+  transform: translateX(-8px) scale(0.42, 0.2);
+  transition:
+    transform 200ms cubic-bezier(0.5, 0, 0.75, 0),
+    opacity 170ms ease-in 30ms;
+  will-change: transform, opacity;
+}
+.aura-notif-sheet.is-open,
+.aura-notif-bubble.is-open {
+  opacity: 1;
+  transform: none;
+  transition:
+    transform 460ms var(--lg-springy),
+    opacity 150ms ease-out;
+}
+/* The sheet is tall: a near-uniform collapsed scale (the bubble's 0.42 x 0.2
+   squashed its text about 1.7x sideways mid-grow) and no sideways offset, so
+   the collapsed card stays clear of the rail. Its content lands a beat after
+   the shape (below), as the bubble's does. */
+.aura-notif-sheet { transform: scale(0.6, 0.36); }
+.aura-notif-sheet .aura-notif-fadein {
+  opacity: 0;
+  transition: opacity 110ms ease-in;
+}
+.aura-notif-sheet.is-open .aura-notif-fadein {
+  opacity: 1;
+  transition: opacity 200ms ease-out 100ms;
+}
+.aura-notif-sheet:not(.is-open),
+.aura-notif-bubble:not(.is-open) { pointer-events: none; }
+/* Reduced motion: no grow, the fades only. */
+html[data-reduced-motion="true"] :is(.aura-notif-sheet, .aura-notif-bubble) {
+  transform: none !important;
+  transition: opacity 140ms ease-out !important;
+}
+html[data-reduced-motion="true"] .aura-notif-sheet .aura-notif-fadein {
+  transition: opacity 140ms ease-out !important;
+}
+
+/* ---- The side sheet ---------------------------------------------------- */
+/* z: the profile popover's level, over every page surface (it is portalled
+   into the rail popup host inside the body). Docked: its height is the rail's
+   own (inline), top flush with the rail's and bottom level with it. Grown
+   from the top row, the spring's overshoot runs down past the rail's bottom
+   (a few px, into the body's padding), never up into the title bar. */
+.aura-notif-sheet {
+  z-index: 10045;
+  display: flex;
+  flex-direction: column;
+  border-radius: 20px;
+  overflow: hidden;
+  outline: none;
+}
+.aura-notif-head {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 14px 12px 12px 18px;
+  box-shadow: inset 0 -1px 0 rgb(255 255 255 / 0.07);
+}
+.aura-notif-heading {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  color: rgb(255 255 255 / 0.94);
+  white-space: nowrap;
+}
+/* "3 new": text on a faint accent wash (the mark tokens, App.css, so a dark
+   custom accent still reads on the glass: text at 4.5:1 or more). */
+.aura-notif-newchip {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  height: 18px;
+  padding: 0 7px;
+  border-radius: 999px;
+  font-size: 10.5px;
+  letter-spacing: 0.02em;
+  color: var(--ln-accent-mark-text);
+  background: color-mix(in srgb, var(--ln-accent-mark) 16%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--ln-accent-mark) 22%, transparent);
+}
+/* Header actions: small flat glass controls (no backdrop pass inside the
+   sheet), so the cursor light reaches them. */
+.aura-notif-headbtn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 28px;
+  padding: 0 11px;
+  border-radius: 999px;
+  font-size: 11.5px;
+  letter-spacing: 0.03em;
+  color: rgb(255 255 255 / 0.88);
+}
+.aura-notif-headbtn.is-icon { width: 28px; padding: 0; }
+.aura-notif-headbtn:hover:not(:disabled) { color: #fff; }
+.aura-notif-headbtn.is-off { color: rgb(255 255 255 / 0.35); opacity: 0.6; cursor: default; }
+
+.aura-notif-scroll {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 2px 0 8px;
+  scrollbar-width: thin;
+  scrollbar-color: rgb(255 255 255 / 0.12) transparent;
+}
+/* Scrolled: rows fade out under the header over 12 px instead of being cut
+   by its hairline (`data-scrolled`, NotificationsPanel; a 12 px ramp is far
+   too short to band). */
+.aura-notif-scroll[data-scrolled] {
+  -webkit-mask-image: linear-gradient(to bottom, transparent, #000 12px);
+  mask-image: linear-gradient(to bottom, transparent, #000 12px);
+}
+/* The Liquid hover droplet, inset like a menu's: rows sit 6 px in. */
+.aura-glass-hl.aura-notif-hl {
+  left: 6px;
+  right: 6px;
+  border-radius: 12px;
+}
+.aura-notif-group {
+  padding: 12px 24px 5px;
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: rgb(255 255 255 / 0.46);
+  user-select: none;
+}
+.aura-notif-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+/* A row: CONTENT on the sheet (no glass, no backdrop). Hover: the shared
+   droplet in Liquid, a faint fill in Frosted. A hairline between rows hides
+   next to a hovered or focused one. */
+.aura-notif-item {
+  position: relative;
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  margin: 0 6px;
+  padding: 10px 12px 10px 20px;
+  border-radius: 12px;
+  cursor: pointer;
+  transition: background-color 150ms ease;
+}
+.aura-notif-item + .aura-notif-item::before {
+  content: "";
+  position: absolute;
+  left: 20px;
+  right: 12px;
+  top: 0;
+  height: 1px;
+  background: rgb(255 255 255 / 0.06);
+  pointer-events: none;
+  transition: opacity 150ms ease;
+}
+.aura-notif-item:is(:hover, :focus-visible)::before,
+.aura-notif-item:is(:hover, :focus-visible) + .aura-notif-item::before { opacity: 0; }
+html:not([data-glass="liquid"]) .aura-notif-item:hover { background-color: rgb(255 255 255 / 0.06); }
+.aura-notif-item:focus-visible { outline: 1px solid rgb(255 255 255 / 0.32); outline-offset: -1px; }
+
+/* Unread: an accent dot in the left gutter (the accent MARK, so a dark custom
+   accent still shows on the dark glass, with its own glow). */
+.aura-notif-dot {
+  position: absolute;
+  left: 8px;
+  top: 50%;
+  width: 6px;
+  height: 6px;
+  margin-top: -3px;
+  border-radius: 999px;
+  background: var(--ln-accent-mark);
+  box-shadow: 0 0 8px color-mix(in srgb, var(--ln-accent-mark) 55%, transparent);
+  opacity: 0;
+  transform: scale(0.5);
+  transition: opacity 200ms ease, transform 200ms ease;
+}
+.aura-notif-item.is-unread .aura-notif-dot { opacity: 1; transform: none; }
+
+/* Landed on from the arrival bubble: one accent wash that fades out. */
+.aura-notif-item.is-target::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  background: color-mix(in srgb, var(--ln-accent-mark) 14%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--ln-accent-mark) 22%, transparent);
+  animation: aura-notif-target 1600ms ease-out 200ms both;
+}
+@keyframes aura-notif-target {
+  from { opacity: 1; }
+  to   { opacity: 0; }
+}
+
+.aura-notif-body { flex: 1 1 auto; min-width: 0; }
+.aura-notif-line {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+.aura-notif-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  line-height: 1.35;
+  color: rgb(255 255 255 / 0.74);
+}
+.aura-notif-item.is-unread .aura-notif-title { color: rgb(255 255 255 / 0.95); font-weight: 500; }
+.aura-notif-time {
+  flex: none;
+  font-size: 10.5px;
+  letter-spacing: 0.02em;
+  color: rgb(255 255 255 / 0.56);
+  transition: opacity 120ms ease;
+}
+.aura-notif-sub {
+  margin-top: 2px;
+  font-size: 12px;
+  line-height: 1.4;
+  color: rgb(255 255 255 / 0.58);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+}
+/* Frosted (Matte) keeps more of a bright backdrop in its face, so its
+   small grey text sits a step lighter (measured over yellow, white and blue
+   blocks: time 3.1:1 and subtitle 4.1:1 at the Liquid values). */
+html:not([data-glass="liquid"]) .aura-notif-time { color: rgb(255 255 255 / 0.62); }
+html:not([data-glass="liquid"]) .aura-notif-sub { color: rgb(255 255 255 / 0.66); }
+/* Dismiss: over the time stamp, shown on hover or keyboard focus. Rose on
+   its own hover so the destructive intent reads before the click. */
+.aura-notif-x {
+  position: absolute;
+  top: 7px;
+  right: 8px;
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 999px;
+  color: rgb(255 255 255 / 0.6);
+  opacity: 0;
+  transition: opacity 120ms ease, background-color 150ms ease, color 150ms ease;
+}
+/* Keyboard focus only (:focus-visible): a row the sheet focused for a pointer
+   user (landing from the bubble) keeps its time stamp. */
+.aura-notif-item:is(:hover, :focus-visible, :has(:focus-visible)) .aura-notif-x { opacity: 1; }
+.aura-notif-item:is(:hover, :focus-visible, :has(:focus-visible)):has(.aura-notif-x) .aura-notif-time { opacity: 0; }
+.aura-notif-x:hover,
+.aura-notif-x:focus-visible { color: #fff; background-color: rgb(244 63 94 / 0.55); }
+.aura-notif-x:focus-visible { outline: 1px solid rgb(255 255 255 / 0.4); outline-offset: 1px; }
+
+/* Thumbs: a poster (2:3) with the round 9 card bezel (`.aura-card-bezel`, a
+   rim-only cursor-light surface laid over the art), or the kind's icon on a
+   small tile in its tone. */
+.aura-notif-thumb {
+  position: relative;
+  flex: none;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+}
+.aura-notif-thumb.is-poster { width: 34px; height: 51px; border-radius: 7px; background: rgb(255 255 255 / 0.05); }
+.aura-notif-thumb.is-poster.is-bubble { width: 36px; height: 54px; border-radius: 8px; }
+.aura-notif-thumb.is-poster img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border-radius: inherit;
+  user-select: none;
+}
+.aura-notif-thumb.is-icon {
+  width: 34px;
+  height: 34px;
+  border-radius: 10px;
+  color: rgb(255 255 255 / 0.75);
+  background: rgb(255 255 255 / 0.06);
+  box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.06);
+}
+.aura-notif-thumb.is-icon.is-bubble { width: 36px; height: 36px; border-radius: 11px; }
+.aura-notif-thumb.is-icon[data-tone="notice"]  { color: var(--ln-accent-mark-text); background: color-mix(in srgb, var(--ln-accent-mark) 12%, transparent); }
+.aura-notif-thumb.is-icon[data-tone="warning"] { color: rgb(252 211 77); background: rgb(251 191 36 / 0.10); }
+.aura-notif-thumb.is-icon[data-tone="error"]   { color: rgb(253 164 175); background: rgb(251 113 133 / 0.10); }
+.aura-notif-thumb.is-icon[data-tone="success"] { color: rgb(110 231 183); background: rgb(52 211 153 / 0.10); }
+
+.aura-notif-empty {
+  box-sizing: border-box;
+  min-height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 30px 24px 26px;
+  text-align: center;
+}
+.aura-notif-empty-icon { width: 30px; height: 30px; color: rgb(255 255 255 / 0.22); margin-bottom: 10px; }
+.aura-notif-empty-title { margin: 0; font-size: 13px; color: rgb(255 255 255 / 0.82); }
+.aura-notif-empty-sub { margin: 4px 0 0; font-size: 12px; color: rgb(255 255 255 / 0.58); }
+
+/* ---- The arrival bubble ------------------------------------------------ */
+/* z-31: over the Home search focus dim (fixed z-30; the popup host sits before
+   the main content, so at 30 it lost the tie), under the detail page (z-60). */
+.aura-notif-bubble {
+  z-index: 31;
+  display: flex;
+  align-items: center;
+  border-radius: 16px;
+  overflow: hidden;
+}
+.aura-notif-bubble-main {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 8px 4px 8px 9px;
+  border: 0;
+  background: none;
+  text-align: left;
+  color: inherit;
+  cursor: pointer;
+  border-radius: inherit;
+}
+.aura-notif-bubble-main:focus-visible { outline: 1px solid rgb(255 255 255 / 0.36); outline-offset: -2px; }
+/* The content lands a beat after the shape, so the grow reads as the bubble
+   leaving the row rather than a squashed card. */
+.aura-notif-bubble .aura-notif-bubble-main,
+.aura-notif-bubble .aura-notif-bubble-x {
+  opacity: 0;
+  transition: opacity 120ms ease-in;
+}
+.aura-notif-bubble.is-open .aura-notif-bubble-main,
+.aura-notif-bubble.is-open .aura-notif-bubble-x {
+  opacity: 1;
+  transition: opacity 200ms ease-out 110ms;
+}
+.aura-notif-bubble-text { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.aura-notif-bubble-line { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.aura-notif-bubble-title {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.3;
+  color: rgb(255 255 255 / 0.95);
+}
+.aura-notif-bubble-sub {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  line-height: 1.35;
+  color: rgb(255 255 255 / 0.6);
+}
+.aura-notif-bubble-x {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  margin-right: 8px;
+  border-radius: 999px;
+  color: rgb(255 255 255 / 0.42);
+}
+.aura-notif-bubble-x:hover,
+.aura-notif-bubble-x:focus-visible { color: rgb(255 255 255 / 0.9); background-color: rgb(255 255 255 / 0.08); }
+.aura-notif-bubble-x:focus-visible { outline: 1px solid rgb(255 255 255 / 0.36); outline-offset: 0; }
+html[data-reduced-motion="true"] .aura-notif-bubble :is(.aura-notif-bubble-main, .aura-notif-bubble-x) {
+  transition: opacity 140ms ease-out !important;
+}
+
+/* ---- The light bridge (RailBridge) -------------------------------------- */
+/* The arrival bubble only: the side sheet has no bridge (round 17, user's call). */
+/* Ties the bubble to the row with ONE laser line across the
+   10 px gap at the row's middle, between a lit point on the rail's edge (the
+   origin) and on the popup's edge (the end). Nothing else: the round 14 seam
+   down the whole gap (haze, scan lines, long edge lines) was dropped as
+   clutter (user's call, 2026-11-22). Light is the rail's white with a little
+   of the accent in it (the lit row's label colour family). Its height is the
+   row's less 6 px (at most 44, inline: RailBridge), so the points never reach
+   past the row. 12 x at most 44 px: no dither needed.
+   Open, in step with the popup's grow (460 ms spring, full size about
+   225 ms in, measured): the origin lights (40 to 120 ms), the beam draws out
+   of it to the popup's edge (70 to 260 ms, landing as the spring peaks; a
+   scaleX on the 2 px beam only, so the points stay crisp), and the end point
+   flashes once as the beam lands (peak about 300 ms), then settles by 650 ms.
+   One shot, no loop.
+   Close: the whole bridge fades first, before the popup shrinks. */
+.aura-notif-bridge {
+  --nb-light: color-mix(in srgb, var(--ln-accent-mark) 40%, white);
+  position: fixed;
+  height: 28px;
+  margin-top: -14px;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 110ms ease-in;
+}
+.aura-notif-bridge.is-bubble { z-index: 32; }
+.aura-notif-bridge.is-on {
+  opacity: 1;
+  transition: opacity 80ms ease-out 40ms;
+}
+.aura-notif-bridge::before,
+.aura-notif-bridge::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: linear-gradient(
+    rgb(255 255 255 / 0),
+    color-mix(in srgb, var(--nb-light) 62%, transparent) 50%,
+    rgb(255 255 255 / 0));
+}
+.aura-notif-bridge::before { left: 0; }
+.aura-notif-bridge::after { right: 0; opacity: 0; }
+.aura-notif-bridge.is-on::after {
+  opacity: 1;
+  animation: aura-notif-bridge-land 420ms ease-out 220ms both;
+}
+@keyframes aura-notif-bridge-land {
+  0%   { opacity: 0; box-shadow: 0 0 0 0 transparent; }
+  20%  { opacity: 1; box-shadow: 0 0 6px 1px color-mix(in srgb, var(--nb-light) 70%, transparent); }
+  100% { opacity: 1; box-shadow: 0 0 0 0 transparent; }
+}
+.aura-notif-bridge > i {
+  position: absolute;
+  left: 1px;
+  right: 1px;
+  top: 50%;
+  height: 2px;
+  margin-top: -1px;
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--nb-light) 45%, transparent);
+  box-shadow: 0 0 6px 1px color-mix(in srgb, var(--nb-light) 30%, transparent);
+  transform: scaleX(0);
+  transform-origin: left center;
+  transition: transform 100ms ease-in;
+}
+.aura-notif-bridge.is-on > i {
+  transform: none;
+  transition: transform 190ms cubic-bezier(0.3, 0.7, 0.2, 1) 70ms;
+}
+html[data-reduced-motion="true"] .aura-notif-bridge > i { transform: none !important; transition: none !important; }
+html[data-reduced-motion="true"] .aura-notif-bridge::after { opacity: 1; animation: none !important; }
+html[data-reduced-motion="true"] .aura-notif-bridge { transition: opacity 140ms ease-out !important; }
+/* High Contrast: no decorative light (its own 0.35 edges carry the shape). */
+html:is([data-theme="contrast"], [data-theme="contrast-azure"]) .aura-notif-bridge { display: none; }
+
+/* ---- Toasts over the open sheet ---------------------------------------- */
+/* App toasts (z-300, top centre) shared the shell's stacking context with the
+   sheet (z 10045) and hid under it on a narrow window, and the sheet's own
+   actions raise them (Send HDR, Reconnect). Lifted only while it is up. */
+:root:has(.aura-notif-sheet) .aura-app-toast-host { z-index: 10050; }
+
+/* ---- The Notifications row --------------------------------------------- */
+/* Unread (dismissable): a very faint STATIC accent wash behind the row; the
+   badge carries the count. Nothing on this row loops (the round 9 breathing
+   wash, the 5 s bell ring and badge bounce are gone). Under the row's
+   content: the row is its own stacking context (z-index 1). */
+.aura-rail-row.aura-notif-unread::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  border-radius: inherit;
+  pointer-events: none;
+  background: color-mix(in srgb, var(--ln-accent-mark) 4%, transparent);
+}
+/* An arrival: ONE accent light band sweeps across the row, left to right,
+   with the bubble growing out of it and the badge popping. A background-
+   position move inside the row's own box (so nothing spills past the row's
+   corners); about 1 s once, never a loop, so it needs no pause list. */
+.aura-rail-row.aura-notif-arrive::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  border-radius: inherit;
+  pointer-events: none;
+  /* The band is about a third of the row wide (12% of a 300% image). */
+  /* The accent MARK (App.css), so a dark custom accent sweeps as light, not
+     as a grey streak. */
+  --nb-sweep: var(--ln-accent-mark);
+  background: linear-gradient(100deg,
+      color-mix(in srgb, var(--nb-sweep) 0%, transparent) 44%,
+      color-mix(in srgb, var(--nb-sweep) 22%, transparent) 48.5%,
+      color-mix(in srgb, color-mix(in srgb, var(--nb-sweep) 30%, transparent), rgb(255 255 255 / 0.3)) 50%,
+      color-mix(in srgb, var(--nb-sweep) 22%, transparent) 51.5%,
+      color-mix(in srgb, var(--nb-sweep) 0%, transparent) 56%) no-repeat;
+  background-size: 300% 100%;
+  animation: aura-notif-sweep 1100ms cubic-bezier(0.4, 0, 0.3, 1) both;
+}
+/* 84% to 16% keeps the whole travel on the row (the band's centre runs from
+   just off the left edge to just off the right one), so no time is spent
+   moving it where it cannot be seen. */
+@keyframes aura-notif-sweep {
+  0%   { background-position: 84% 0; opacity: 0; }
+  10%  { opacity: 1; }
+  85%  { opacity: 1; }
+  100% { background-position: 16% 0; opacity: 0; }
+}
+/* Reduced motion: no sweep (the bubble's fade and the badge carry it). */
+html[data-reduced-motion="true"] .aura-rail-row.aura-notif-arrive::after { display: none; }

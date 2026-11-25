@@ -115,7 +115,7 @@ export async function fetchXtreamLiveChannels(
   }
 
   throw new Error(
-    "Couldn't load any channels from this Xtream login. The provider's player API and M3U export both returned nothing — usually wrong server/port, expired credentials, or a disabled account.",
+    "Couldn't load any channels from this Xtream login. The provider's player API and M3U export both returned nothing. Usually this is a wrong server or port, expired credentials, or a disabled account.",
   );
 }
 

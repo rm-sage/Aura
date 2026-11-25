@@ -28,6 +28,19 @@ export interface AddonEntry {
    *  Addons UI. Optional for back-compat with any cached pre-field shape;
    *  the Rust side now always emits it (default `false`). */
   configurable?: boolean;
+  /** Addons this one re-serves, as its manifest declares them
+   *  (`behaviorHints.wrappedAddons`, e.g. AIOStreams wrapping AIOMetadata):
+   *  manifest id and name only. Absent or empty for an ordinary addon. */
+  wrapped?: WrappedAddon[];
+  /** The addon serves AIOMetadata's Continue Watching art route
+   *  (`behaviorHints.landscapeArt`; AIOStreams forwarding it). */
+  landscape_art?: boolean;
+}
+
+/** One addon a wrapper re-serves (`AddonEntry.wrapped`). */
+export interface WrappedAddon {
+  manifest_id: string;
+  name: string;
 }
 
 /** The error every signed-in addon write (`cloud_add_addon`,
@@ -154,6 +167,24 @@ export interface SearchGroup {
   media_type:   string;
   items:        MetaPreview[];
 }
+
+/** One search catalog of an addon, announced before any is fetched
+ *  (Rust `SearchCatalogPlan`). */
+export interface SearchCatalogPlan {
+  order:        number;
+  addon_url:    string;
+  catalog_id:   string;
+  catalog_name: string;
+  media_type:   string;
+}
+
+/** A `search_addon_grouped` progress message (Rust `SearchProgress`):
+ *  the plan first, then one per catalog as it lands (`group` null when it
+ *  had no results or failed; `failed` true only when it did not answer:
+ *  no reply, an HTTP error, bad JSON or still rate limited after its retry). */
+export type SearchProgress =
+  | { kind: "plan"; catalogs: SearchCatalogPlan[] }
+  | { kind: "catalog"; order: number; group: SearchGroup | null; failed: boolean };
 
 export interface MetaPreview {
   id: string;
@@ -327,6 +358,12 @@ export function isVideoAired(v: { id?: string | null; released?: string | null }
 export interface StreamEntry {
   title: string;
   addon_name: string;
+  /** When Rust read this entry from its addon (or meta), ms since the epoch.
+   *  An addon url is not a fixed address (AIOStreams' proxy re-runs its debrid
+   *  lookup on every request), so playback re-reads a source whose url is older
+   *  than `STREAM_URL_MAX_AGE_MS` (`streamFreshness.ts`). Absent on entries
+   *  built in the frontend. */
+  resolved_at_ms?: number | null;
   url: string | null;
   info_hash: string | null;
   file_idx: number | null;

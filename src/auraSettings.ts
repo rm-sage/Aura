@@ -15,12 +15,85 @@
 
 import { safeSetItem } from "./storageQuota";
 import type { AddonEntry } from "./types";
+// No imports of its own, so no cycle: decideGlassDefaults reads it at load.
+import { isOnboardingComplete } from "./onboarding";
 // Circular (addonElection reads loadAuraSettings), and safe: neither module
 // calls into the other at load time, only from inside functions.
 import { applyOverride } from "./addonElection";
+// Import-free, so no cycle.
+import { sanitizeThemeAccents } from "./accentColor";
 
 const SETTINGS_KEY = "aura:settings:v1";
 const CHANGE_EVENT = "aura:settings-changed";
+/** The look a build from before the material choice drew: kept for installs and
+ *  accounts that existed before it (decideGlassDefaults, sync.ts writeSettingsBlob). */
+export const LEGACY_GLASS = { glassStyle: "frosted", glassCursorGlow: false } as const;
+
+/** The "Cursor glow" tuning (Settings > Theme, shown while Cursor glow is on;
+ *  drawn by src/glassGlint.ts). Multipliers of the built-in look, so a later
+ *  retune of the defaults carries every user's taste along with it. */
+export interface GlassGlowTune {
+  /** "Edge highlights": the lit rim ring and its halo, x the default. */
+  edge: number;
+  /** "Surface glow": the interior light on glass and the row-title text
+   *  light, x the default. */
+  surface: number;
+  /** "Glow size": the light's radius AND reach, px. */
+  size: number;
+  /** The defaults revision the tune was written under (round 12). A tune
+   *  WITHOUT it came from a build whose defaults were TUNE_V1_DEFAULTS, and
+   *  one equal to them is read as the current defaults (sanitizeGlassGlowTune):
+   *  those builds always stored the default object, so an untouched install,
+   *  an old cloud blob or an old export moves to the new look, while a value
+   *  the user moved keeps it. Every tune this build writes carries it, so a
+   *  deliberate pick of the old numbers later survives. */
+  rev?: 2;
+}
+/** Round 12 (the user's pick, 2026-11-22): edge 125%, surface 25%, size
+ *  300 px, a crisp rim with a cool, dark interior (frontend-ui.md "The cursor
+ *  light"). App.css :root holds the same numbers for --lg-glow-edge-k and
+ *  --lg-glow-surface-k, so a default install writes nothing on <html>. */
+export const DEFAULT_GLASS_GLOW_TUNE: GlassGlowTune = { edge: 1.25, surface: 0.25, size: 300, rev: 2 };
+/** The three tunable fields (everything but `rev`). */
+export type GlassGlowKey = "edge" | "surface" | "size";
+/** The defaults before round 12 (no `rev` was stored then). */
+const TUNE_V1_DEFAULTS = { edge: 1, surface: 1, size: 300 } as const;
+/** Inclusive ranges, shared by the sanitizer and the Settings sliders. */
+export const GLASS_GLOW_LIMITS = {
+  edge: [0, 2],
+  surface: [0, 2.5],
+  size: [200, 420],
+} as const satisfies Record<GlassGlowKey, readonly [number, number]>;
+/** Validates a tune from storage, a cloud blob or an import: finite numbers
+ *  clamped to GLASS_GLOW_LIMITS, anything else the default (per field). A
+ *  tune with no `rev` that equals the pre-round-12 defaults is the untouched
+ *  default of an older build and reads as today's defaults (see `rev`). */
+export function sanitizeGlassGlowTune(raw: unknown): GlassGlowTune {
+  const o = raw && typeof raw === "object" && !Array.isArray(raw) ? raw as Record<string, unknown> : {};
+  if (o.rev !== 2 && o.edge === TUNE_V1_DEFAULTS.edge && o.surface === TUNE_V1_DEFAULTS.surface
+      && o.size === TUNE_V1_DEFAULTS.size) {
+    return { ...DEFAULT_GLASS_GLOW_TUNE };
+  }
+  const pick = (k: GlassGlowKey, round: number): number => {
+    const v = o[k];
+    const [lo, hi] = GLASS_GLOW_LIMITS[k];
+    if (typeof v !== "number" || !Number.isFinite(v)) return DEFAULT_GLASS_GLOW_TUNE[k];
+    return Math.round(Math.min(hi, Math.max(lo, v)) * round) / round;
+  };
+  return { edge: pick("edge", 100), surface: pick("surface", 100), size: pick("size", 1), rev: 2 };
+}
+/** Set once this install has decided its glass defaults. Device-local. */
+const GLASS_DEFAULTS_KEY = "aura:glass-defaults:v1";
+/** "1" while the one-time "New look options" bell notice is owed. Device-local. */
+const MATERIAL_NOTICE_KEY = "aura:material-notice:v1";
+/** The notice's id. Device-local: sync.ts keeps it out of the cloud blob. */
+export const MATERIAL_NOTICE_ID = "notice:material-style";
+export function materialNoticeOwed(): boolean {
+  try { return localStorage.getItem(MATERIAL_NOTICE_KEY) === "1"; } catch { return false; }
+}
+export function spendMaterialNotice(): void {
+  try { localStorage.removeItem(MATERIAL_NOTICE_KEY); } catch { /* best effort */ }
+}
 /** Persistent "this user last modified settings at" stamp.
  *
  *  Used as `updated_at` on the cloud-sync `settings` blob so the
@@ -282,7 +355,7 @@ export interface AuraSettings {
    *
    *  Skipping marks every episode it jumped, logs them to History, and, when
    *  the user pressed Skip themselves and auto-scrobble is on, sends them to
-   *  Trakt / AniList as watched. An unattended skip marks locally and sends
+   *  AniList / Simkl as watched. An unattended skip marks locally and sends
    *  nothing. See skipActions.ts for the rule set. */
   nextUpSkipFillerRecap: "none" | "filler" | "recap" | "both";
   /** When the Next Up card offers a skip past filler / recap, the Play Next
@@ -373,6 +446,32 @@ export interface AuraSettings {
    *  portable (PORTABLE_AURA_FIELDS) and cloud-synced with the rest of the
    *  blob. */
   monitoredProviders: string[];
+  /** The material (src/glassStyle.ts), shown in Settings as "Material style":
+   *  "frosted" (shown as Matte, a soft blur under a dark tint) or
+   *  "liquid" (shown as Clear, dense glass that bends the light at its edges).
+   *  "liquid" is the default for new installs; installs that existed before the
+   *  material choice keep "frosted" and cursor glow off (decideGlassDefaults).
+   *  Liquid draws as Frosted while hardware acceleration is off. A taste
+   *  preference, so it is portable (PORTABLE_AURA_FIELDS) and cloud-synced; the
+   *  GPU fallback is decided on each machine, never synced. */
+  glassStyle: "frosted" | "liquid";
+  /** "Cursor glow": a soft light on the glass element under the pointer
+   *  (src/glassGlint.ts). Default true (off for installs from before the
+   *  material choice, decideGlassDefaults); never drawn on the High Contrast
+   *  themes. Portable and synced like glassStyle. */
+  glassCursorGlow: boolean;
+  /** "Cursor glow" tuning: Edge highlights, Surface glow, Glow size
+   *  (GlassGlowTune). A look, so portable and synced like glassCursorGlow;
+   *  sync.ts keeps the local value when an incoming blob has no key (a build
+   *  from before it). Validated on every read (sanitizeGlassGlowTune). */
+  glassGlowTune: GlassGlowTune;
+  /** Custom accent per theme (Settings > Theme > "Accent colour"): theme id ->
+   *  "#rrggbb". A theme with no entry draws its own accent. A taste, like the
+   *  theme, so portable (PORTABLE_AURA_FIELDS) and cloud-synced with this blob.
+   *  Validated on every read (sanitizeThemeAccents: hex only, theme-id keys,
+   *  capped); an id this build does not know is kept, never applied. Drawn by
+   *  src/themeAccent.ts. Default empty. */
+  themeAccents: Record<string, string>;
 }
 
 export const DEFAULT_AURA_SETTINGS: AuraSettings = {
@@ -416,6 +515,10 @@ export const DEFAULT_AURA_SETTINGS: AuraSettings = {
   showAdvancedSettings: false,
   smoothWheelScroll: true,
   monitoredProviders: [],
+  glassStyle: "liquid",
+  glassCursorGlow: true,
+  glassGlowTune: { ...DEFAULT_GLASS_GLOW_TUNE },
+  themeAccents: {},
 };
 
 // Module-level memoization snapshot. loadAuraSettings is called many
@@ -567,6 +670,20 @@ function readFromStorage(): AuraSettings {
       showAdvancedSettings: typeof parsed.showAdvancedSettings === "boolean"
         ? parsed.showAdvancedSettings
         : false,
+      // A present but unknown material reads as the default, so a blob from a
+      // newer build that adds a third cannot leave the shell unstyled. An ABSENT
+      // key is a blob from a build before the material choice (an old backup,
+      // say), so it reads as the look that build drew.
+      glassStyle: parsed.glassStyle === "liquid" || parsed.glassStyle === "frosted"
+        ? parsed.glassStyle
+        : (hasKey(parsed, "glassStyle") ? DEFAULT_AURA_SETTINGS.glassStyle : LEGACY_GLASS.glassStyle),
+      glassCursorGlow: typeof parsed.glassCursorGlow === "boolean"
+        ? parsed.glassCursorGlow
+        : (hasKey(parsed, "glassCursorGlow") ? DEFAULT_AURA_SETTINGS.glassCursorGlow : LEGACY_GLASS.glassCursorGlow),
+      glassGlowTune: sanitizeGlassGlowTune(parsed.glassGlowTune),
+      // From a cloud blob or an import as often as from this device: hex
+      // values and theme-id keys only, capped (accentColor.ts).
+      themeAccents: sanitizeThemeAccents(parsed.themeAccents),
       // Strings only, de-duplicated and capped: the list can arrive from a
       // cloud blob or an import. Unknown ids are harmless (Rust ignores an id
       // outside its table), so they are not filtered against the catalogue
@@ -599,6 +716,50 @@ if (typeof window !== "undefined") {
     if (e.key === SETTINGS_KEY) invalidate();
   });
 }
+
+function hasKey(obj: unknown, key: string): boolean {
+  return obj !== null && typeof obj === "object" && key in obj;
+}
+
+/** Once per install, before anything reads settings (glassStyle.ts computes its
+ *  state at module load). An install that finished or skipped setup before this
+ *  build is an existing user: keep the Matte (frosted) look with no cursor glow and
+ *  owe the "New look options" notice. Anyone else gets the new defaults. A key
+ *  already in the blob is never overwritten. Writes storage directly, never
+ *  through saveAuraSettings: that would stamp the sync clock and let this device
+ *  beat a newer cloud copy. Dispatches nothing and pushes nothing; the next real
+ *  edit carries the values. */
+function decideGlassDefaults(): void {
+  try {
+    if (typeof localStorage === "undefined" || localStorage.getItem(GLASS_DEFAULTS_KEY) !== null) return;
+    const existing = isOnboardingComplete();
+    const values = existing
+      ? LEGACY_GLASS
+      : { glassStyle: DEFAULT_AURA_SETTINGS.glassStyle, glassCursorGlow: DEFAULT_AURA_SETTINGS.glassCursorGlow };
+    // First: a crash after this re-runs the decision, which is idempotent.
+    if (existing) localStorage.setItem(MATERIAL_NOTICE_KEY, "1");
+    const raw = localStorage.getItem(SETTINGS_KEY);
+    if (raw !== null) {
+      let obj: Record<string, unknown> | null = null;
+      try {
+        const p: unknown = JSON.parse(raw);
+        if (p && typeof p === "object" && !Array.isArray(p)) obj = p as Record<string, unknown>;
+      } catch { /* readFromStorage handles a broken blob */ }
+      if (obj && (!("glassStyle" in obj) || !("glassCursorGlow" in obj))) {
+        safeSetItem(SETTINGS_KEY, JSON.stringify({
+          ...obj,
+          glassStyle: "glassStyle" in obj ? obj.glassStyle : values.glassStyle,
+          glassCursorGlow: "glassCursorGlow" in obj ? obj.glassCursorGlow : values.glassCursorGlow,
+        }));
+      }
+    } else if (existing) {
+      safeSetItem(SETTINGS_KEY, JSON.stringify({ ...DEFAULT_AURA_SETTINGS, ...LEGACY_GLASS }));
+    }
+    localStorage.setItem(GLASS_DEFAULTS_KEY, "1");
+    cached = null;
+  } catch { /* storage blocked: defaults apply, decided again next launch */ }
+}
+decideGlassDefaults();
 
 /** Diff two AuraSettings shallowly. Used by saveAuraSettings to emit a
  *  keyed change event so listeners can ignore irrelevant flips —

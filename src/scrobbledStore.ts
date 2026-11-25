@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { safeSetItem } from "./storageQuota";
-import type { ScrobbleService } from "./scrobbleConn";
+import { isScrobbleService, type ScrobbleService } from "./scrobbleConn";
 import { getHistory, historySize, isHistoryLoaded } from "./historyStore";
 
 // ---------------------------------------------------------------------------
@@ -12,11 +12,9 @@ import { getHistory, historySize, isHistoryLoaded } from "./historyStore";
 // WHY THIS IS NOT THE DUPE GATE. The real protection against double-scrobbling
 // lives on the services themselves and is already exercised by the single-row
 // buttons:
-//   • Trakt  — /sync/history is idempotent on `watched_at`. Aura sends the
-//     entry's exact `played_at`, so re-pushing the same row cannot create a
-//     second play.
 //   • AniList — save_progress returns AlreadyAhead when the entry's progress is
 //     already at or past this episode, and writes nothing.
+//   • Simkl: a re-sent row is a no-op on its side.
 // This store is a local FAST-PATH on top of those: it lets a bulk run SKIP rows
 // that are already done instead of spending a network round trip (and a slice of
 // the rate-limit budget) re-confirming what the service would just no-op. It
@@ -26,8 +24,8 @@ import { getHistory, historySize, isHistoryLoaded } from "./historyStore";
 //
 // STORAGE — `aura:scrobbled:<scope>`, a flat array of "<service>::<id>::<played_at>"
 // keys, bounded per the standing "never ship an unbounded cache" rule. The
-// bound FOLLOWS the history, which no longer has a row cap: 1.5 marks per row
-// per service (three services), never under MIN_KEYS (the old fixed cap) and
+// bound FOLLOWS the history, which no longer has a row cap: 4.5 marks per row
+// (one per service, with generous headroom), never under MIN_KEYS (the old fixed cap) and
 // never over MAX_KEYS_CEILING, which keeps the key list near 3 MB of the
 // origin's localStorage quota whatever the history grows to.
 //
@@ -42,8 +40,8 @@ import { getHistory, historySize, isHistoryLoaded } from "./historyStore";
 
 const STORAGE_KEY_PREFIX = "aura:scrobbled:";
 const CHANGE_EVENT = "aura:scrobbled-changed";
-/** The floor of the bound: the old fixed cap, 1.5x what a 1000-row history
- *  could need (one mark per row per service, three services). */
+/** The floor of the bound: the old fixed cap, more than twice what a 1000-row
+ *  history could need (one mark per row per service). */
 const MIN_KEYS = 4500;
 /** Hard ceiling, for safety: ~30k keys of ~50 chars. A history past ~6,700
  *  fully scrobbled rows starts losing its oldest marks here, which costs one
@@ -104,8 +102,13 @@ function hydrate(scope: string): void {
   try {
     const raw = localStorage.getItem(storageKey(scope));
     const parsed = raw ? JSON.parse(raw) : [];
+    // A mark for a service Aura no longer has (a removed provider) can never
+    // be read again: dropped here, so it stops holding a slot under the cap.
     _keys = new Set(
-      Array.isArray(parsed) ? parsed.filter((k): k is string => typeof k === "string") : [],
+      Array.isArray(parsed)
+        ? parsed.filter((k): k is string =>
+          typeof k === "string" && isScrobbleService(k.slice(0, k.indexOf("::"))))
+        : [],
     );
   } catch {
     _keys = new Set();
@@ -142,8 +145,8 @@ export function markScrobbled(
  *
  *  `markScrobbled` serializes the whole key set and re-renders the History view
  *  on every call, so a bulk run that marked each row individually would do one
- *  localStorage write and one full re-render PER PUSH (a whole history x 3
- *  services). The bulk runner therefore accumulates its successes and flushes
+ *  localStorage write and one full re-render PER PUSH (a whole history x every
+ *  service). The bulk runner therefore accumulates its successes and flushes
  *  them through here in chunks. */
 export function markScrobbledMany(
   scope: string,
@@ -167,14 +170,14 @@ export function markScrobbledMany(
 // ---------------------------------------------------------------------------
 // Ineligible rows — items a service has definitively REFUSED.
 //
-// Trakt does not carry Frieren S02E10 under this numbering, and says so every
-// time; AniList cannot resolve some titles at all. Those are verdicts about the
+// AniList cannot resolve some titles at all, and says so every time; Simkl can
+// have no catalog match for an item. Those are verdicts about the
 // ITEM, not about the attempt, so re-sending them on every run only burns
 // rate-limit budget and re-reports the same failure. Rust marks such errors with
 // `PERMANENT_PREFIX` (see scrobble.rs) and we retire the row here.
 //
-// Keyed by (service, id) WITHOUT played_at: if Trakt has no catalog entry for an
-// episode, that is equally true of a re-watch of it. TTL'd, because a catalog can
+// Keyed by (service, id) WITHOUT played_at: if a service has no catalog entry for
+// an episode, that is equally true of a re-watch of it. TTL'd, because a catalog can
 // gain the entry later — a permanent-forever verdict would be wrong.
 // ---------------------------------------------------------------------------
 
@@ -201,6 +204,10 @@ function hydrateIneligible(scope: string): void {
     const raw = localStorage.getItem(ineligibleKey(scope));
     const parsed = raw ? JSON.parse(raw) : {};
     _ineligible = parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+    // Same rule as the marks: a removed provider's verdicts are dropped.
+    for (const k of Object.keys(_ineligible)) {
+      if (!isScrobbleService(k.slice(0, k.indexOf("::")))) delete _ineligible[k];
+    }
   } catch {
     _ineligible = {};
   }

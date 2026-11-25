@@ -1,0 +1,183 @@
+/* Aura - (c) 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice. */
+/* SPDX-License-Identifier: AGPL-3.0-or-later */
+
+/* Glass surface rules for the "search" group. Loaded once, after App.css (main.tsx),
+   so a rule here at equal specificity wins over App.css. Uses the GLASS SYSTEM
+   classes and custom properties defined in App.css; never redefine them here. */
+
+/* ------------------------------------------------------------------ */
+/* Home search bar (SearchBar.tsx)                                     */
+/*                                                                    */
+/* A floating CONTROL (.aura-float-glass.aura-glass-control) around a  */
+/* bare input. At rest it is about two thirds of the column, centred;  */
+/* focused it widens to the full column (the recents dropdown below is */
+/* always full width). In Liquid the width rides a spring that          */
+/* overshoots slightly, so the parent centres it (flex) and it never    */
+/* shrinks. Its lens is the sliced, width-independent filter           */
+/* (liquidGlass.ts MORPH_SELECTOR, keyed by height), so it stays bound  */
+/* through the transition and nothing swaps at rest                     */
+/* (holdLensForMorph, on every focus change, is then a no-op).          */
+/* Hover and focus edges go through the hooks: --lg-border-c is a no-op */
+/* in Liquid (the tier's face ring, or transparent while bound, at      */
+/* higher specificity).                                                 */
+/* ------------------------------------------------------------------ */
+.aura-search-float {
+  display: flex;
+  justify-content: center;
+}
+.aura-search-shell {
+  --lg-search-rest-w: min(100%, max(68%, 440px));
+  width: var(--lg-search-rest-w);
+  flex-shrink: 0;
+  transition:
+    width 240ms var(--lg-cinematic),
+    border-color 150ms ease,
+    box-shadow 150ms ease,
+    --lg-lift 160ms ease;
+}
+.aura-search-shell.is-open { width: 100%; }
+.aura-search-shell:hover { --lg-border-c: rgba(255, 255, 255, 0.25); }
+.aura-search-shell:focus-within { --lg-border-c: rgba(255, 255, 255, 0.30); }
+.aura-search-shell input::-webkit-search-cancel-button { cursor: pointer; }
+
+/* Liquid: the springy width, and focus as a faint neutral inner edge.
+   Deliberately NOT the mockup's accent underglow (the maintainer asked for
+   no bottom-pooled accent on active states). No hover or focus lift (round
+   9, the A face never lifts): the generic control hover lift brightened the
+   whole face evenly, even 300 px from the pointer where the cursor light is
+   0; the cursor light and the focus hairline are the feedback now. */
+html[data-glass="liquid"] .aura-search-shell {
+  /* Rest ring: the focus hairline at zero alpha. Both inset, so the
+     box-shadow transition fades the hairline instead of snapping it (an
+     inset entry against an outer one does not interpolate). */
+  --lg-ring: inset 0 0 0 1px rgb(255 255 255 / 0);
+  /* The contact shadow pulled in from the ends (2026-11-23; the user: "a
+     feint black line on the left side of the bar"). The control tier's
+     `0 1px 2px` black 0.30 sat just outside the whole outline, so along the
+     rounded ends it read as a thin dark line, up to 15 levels under the page
+     beside the left and right ends, two device px on whichever end a 125%
+     layer offset favoured. Spread -2 keeps it off the ends and the 3 px
+     offset puts it back under the bottom edge: the straight bottom is pixel
+     for pixel the old one (100 / 125 / 150%, a mica and a light page), the
+     ends match no contact shadow at all within 0.5. The bottom arcs keep a
+     lighter crescent (left as is, the user's call). Same three-entry shape
+     as the tier's list. */
+  --lg-drop:
+    0 3px 2px -2px rgb(0 0 0 / 0.30),
+    0 18px 48px rgb(0 0 0 / 0.55),
+    0 0 0 rgb(0 0 0 / 0);
+  transition:
+    width 360ms var(--lg-springy),
+    box-shadow 200ms ease,
+    --lg-lift 160ms ease;
+}
+html[data-glass="liquid"] .aura-search-shell:hover,
+html[data-glass="liquid"] .aura-search-shell:focus-within { --lg-lift: 0; }
+html[data-glass="liquid"] .aura-search-shell:focus-within {
+  --lg-ring: inset 0 0 0 1px rgb(255 255 255 / 0.10);
+}
+
+/* Droplet inset for the recents rows (the mockup's menu droplet: 6px in
+   from each side, 10px corners). animateSpan owns translate and height. */
+.aura-glass-hl.aura-glass-hl-inset {
+  left: 6px;
+  right: 6px;
+  border-radius: 10px;
+}
+
+/* ------------------------------------------------------------------ */
+/* Small search boxes (ListSearchInput: Library, Queue, History)       */
+/*                                                                    */
+/* .aura-glass-field on a <label> wrapper. Widens 4rem on focus from    */
+/* the caller's rest width (w-56 at every call site today). Frosted     */
+/* keeps the old hover edge; the icon picks up the accent while the box */
+/* has focus, in both materials (the label, never a fill or a ring).    */
+/* ------------------------------------------------------------------ */
+.aura-list-search {
+  max-width: 100%;
+  transition:
+    width 220ms var(--lg-cinematic),
+    border-color 160ms ease,
+    box-shadow 200ms ease;
+}
+.aura-list-search:focus-within { width: 18rem; }
+html:not([data-glass="liquid"]) .aura-list-search:hover:not(:focus-within) { --lg-border-c: rgba(255, 255, 255, 0.20); }
+.aura-list-search .aura-list-search-icon { transition: color 160ms ease; }
+.aura-list-search:focus-within .aura-list-search-icon { color: rgb(var(--ln-accent-rgb) / 0.85); }
+html[data-glass="liquid"] .aura-list-search {
+  transition:
+    width 340ms var(--lg-springy),
+    box-shadow 200ms ease;
+}
+/* Liquid hover: no edge rule of its own. The Liquid field rule already makes
+   the border transparent at lower specificity, so the High Contrast edge
+   (App.css) still wins on the contrast themes. */
+
+/* ------------------------------------------------------------------ */
+/* Filter chips and header triggers (FilterBar.tsx, LibraryView.tsx)    */
+/*                                                                    */
+/* .aura-glass-flat chips that can be SELECTED (aria-pressed /          */
+/* aria-checked / .is-selected). Frosted: the accent wash and hairline  */
+/* of style A. Liquid: the raised face at the selected lift and the     */
+/* accent on the label only; the Liquid flat rules (higher specificity) */
+/* already replace the face and the border (the dark face ring).        */
+/* ------------------------------------------------------------------ */
+.aura-filter-chip:is([aria-pressed="true"], [aria-checked="true"], .is-selected) {
+  --lg-face: linear-gradient(rgb(var(--ln-accent-rgb) / 0.18), rgb(var(--ln-accent-rgb) / 0.18));
+  --lg-border-c: rgb(var(--ln-accent-rgb) / 0.40);
+  /* The readable accent TEXT (round 11): the raw accent on its own 0.18
+     wash put a 10 px chip count at 2.67:1 in Matte. */
+  color: var(--ln-accent-mark-text);
+}
+html[data-glass="liquid"] .aura-filter-chip:is([aria-pressed="true"], [aria-checked="true"], .is-selected) {
+  --lg-lift: var(--lg-lift-selected);
+  --lg-drop: 0 1px 2px rgb(0 0 0 / 0.22), 0 6px 18px -6px rgb(0 0 0 / 0.36);
+  /* Lifted toward white: the Liquid flat face is luminous now, and the bare
+     accent label fell to 2.7:1 over a light page (3.9 with this, 3.6 on the
+     old dark face). */
+  color: color-mix(in oklab, rgb(var(--ln-accent-rgb)) 70%, white);
+}
+/* An idle chip's dim label (text-white/55) over the luminous Liquid face:
+   white 0.70 keeps it at 4.5:1 or better over a light page (5.1; 0.55 gave
+   3.5). :where keeps it at (0,1,1), so a hover:text-* utility still wins. */
+html[data-glass="liquid"] :where(.aura-filter-chip.text-white\/55:not([aria-pressed="true"]):not([aria-checked="true"]):not(.is-selected)) {
+  color: rgb(255 255 255 / 0.7);
+}
+
+/* Discover's addon / catalog pill: open is a brighter NEUTRAL face (it
+   marks an open menu, not a choice), so no accent in either material. */
+.aura-pill-dd[aria-expanded="true"] {
+  --lg-lift: 0.06;
+  --lg-border-c: rgba(255, 255, 255, 0.25);
+}
+html[data-glass="liquid"] .aura-pill-dd[aria-expanded="true"] {
+  --lg-lift: var(--lg-lift-selected);
+}
+
+/* Library's "clear the watched backlog?" confirm: the destructive hint is a
+   rose hairline through the ring hook (never ring-* utilities on glass).
+   Liquid keeps it inside the rim and fainter, so there is no crisp outline. */
+.aura-danger-dialog { --lg-ring: 0 0 0 1px rgb(251 113 133 / 0.40); }
+html[data-glass="liquid"] .aura-danger-dialog { --lg-ring: inset 0 0 0 1px rgb(251 113 133 / 0.20); }
+
+/* ------------------------------------------------------------------ */
+/* Subtitle Live Sync cue rows (SubtitleSyncPanel.tsx)                  */
+/*                                                                    */
+/* The anchor row is .is-selected (the shared row selection). Two extra */
+/* states: the search match sits a step brighter than hover, and a fresh */
+/* pick flashes. Frosted: the old fills. Liquid: the match is the raised */
+/* hover face held on; the flash is the selected face (the Liquid row    */
+/* selection rule replaces the whole background), accent label only.     */
+/* ------------------------------------------------------------------ */
+.aura-glass-row.is-match {
+  background-color: rgba(255, 255, 255, 0.14);
+  color: #fff;
+}
+.aura-glass-row.is-flash {
+  background-color: rgb(var(--ln-accent-rgb) / 0.25);
+  color: rgb(var(--ln-accent-rgb));
+}
+html[data-glass="liquid"] .aura-glass-row.is-match {
+  background: linear-gradient(rgb(255 255 255 / 0.10), rgb(255 255 255 / 0.05));
+  box-shadow: inset 0 6px 10px -8px rgb(255 255 255 / 0.09), inset 0 -8px 12px -9px rgb(0 0 0 / 0.40);
+}

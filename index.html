@@ -18,6 +18,18 @@
           document.documentElement.setAttribute("data-theme", t || "mica");
           var a = localStorage.getItem("aura:accent-rgb");
           if (a) document.documentElement.style.setProperty("--boot-accent-rgb", a);
+          // The user's custom accent for this theme (src/themeAccent.ts writes
+          // the cache), so the first frame is not the theme's own accent.
+          var av = JSON.parse(localStorage.getItem("aura:accent-vars") || "null");
+          if (av && av.v && av.t === (t || "mica")) {
+            for (var k in av.v) {
+              if (/^--ln-accent(-rgb|-ink-rgb)?$/.test(k) && typeof av.v[k] === "string") {
+                document.documentElement.style.setProperty(k, av.v[k]);
+              }
+            }
+            // A very light custom accent: switch knobs take a dark edge.
+            if (av.l === 1) document.documentElement.setAttribute("data-accent-light", "");
+          }
         } catch (e) {}
       })();
     </script>

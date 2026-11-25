@@ -64,6 +64,15 @@ pub struct AppSettings {
     #[serde(default = "default_audio_priority")]
     pub audio_priority: Vec<String>,
 
+    /// The one-time check of `audio_priority` for the single-language list
+    /// the old setup wizard wrote has run for this account
+    /// (`src/audioPriorityRepair.ts`). Account data, so it syncs with the
+    /// list it describes: once any device has run the check, no other device
+    /// runs it again and rewrites a list the user later set on purpose. Not
+    /// in settings export / import (an imported `false` would re-arm it).
+    #[serde(default)]
+    pub audio_priority_repaired: bool,
+
     /// When true, dub disposition (or "Dub" in the track title) penalises
     /// the track heavily so the scorer strongly prefers original audio
     /// even when the language matches a higher-priority dub.
@@ -282,6 +291,16 @@ pub struct AppSettings {
     /// when the WebView2 environment is created.
     #[serde(default = "default_true")]
     pub gpu_acceleration: bool,
+
+    /// "Real glass over video" (experimental, default OFF): an mpv user
+    /// shader blurs and darkens the live video under the player's control
+    /// bar and open menus (`mpv/glass.rs`). Depends on this machine's GPU,
+    /// so it is MACHINE-LOCAL: kept in `render.json` like
+    /// `gpu_acceleration`, stripped from the cloud blob in `sync.ts`
+    /// (`readSettingsBlob` / `writeSettingsBlob` / `MACHINE_LOCAL_BACKEND_KEYS`),
+    /// and absent from `PORTABLE_BACKEND_FIELDS`.
+    #[serde(default)]
+    pub real_glass: bool,
 
     // ── Playback buffer tuning (power-user; applied by apply_buffer_settings) ─
     /// Demuxer forward cache, seconds (mpv `cache-secs`). Larger = more buffered
@@ -514,6 +533,7 @@ impl Default for AppSettings {
             subtitle_font:               String::new(),
             subtitle_brightness:         default_sub_brightness(),
             audio_priority:              default_audio_priority(),
+            audio_priority_repaired:     false,
             avoid_dubs:                  false,
             user_region:                 String::new(),
             keybindings:                 default_keybindings(),
@@ -523,6 +543,7 @@ impl Default for AppSettings {
             trailer_quality:             default_trailer_quality(),
             skip_treat_mixed_op_as_op:   true,
             gpu_acceleration:            true,
+            real_glass:                  false,
             cache_secs:                  default_cache_secs(),
             demuxer_readahead_secs:      default_readahead_secs(),
             demuxer_max_mib:             default_demuxer_max_mib(),
@@ -544,21 +565,21 @@ impl Default for AppSettings {
 static CACHE: OnceLock<Arc<Mutex<AppSettings>>> = OnceLock::new();
 
 fn cache() -> &'static Arc<Mutex<AppSettings>> {
-    CACHE.get_or_init(|| Arc::new(Mutex::new(initial_cache(read_render_pref()))))
+    CACHE.get_or_init(|| Arc::new(Mutex::new(initial_cache(read_render_file()))))
 }
 
-/// The cache's first value: defaults, with the machine-local
-/// `gpu_acceleration` from `render.json` (`render_pref`). The launch read
+/// The cache's first value: defaults, with the machine-local fields
+/// (`gpu_acceleration`, the HDR trio) from `render.json`. The launch read
 /// render.json for the WebView2 arguments (`load_pre_init`), so the cold cache
 /// must say the same: `load()` returns the cache unchanged when the active
 /// scope has no settings file (or an empty or unreadable one), and a cache
 /// left at the default `true` there showed the switch ON for a launch that
 /// ran with it OFF, and the next unrelated `save` rewrote render.json to
 /// `true`. Read once, here, never in `snapshot()` (a hot path).
-fn initial_cache(render_pref: Option<bool>) -> AppSettings {
+fn initial_cache(render_pref: Option<RenderPref>) -> AppSettings {
     let mut s = AppSettings::default();
-    if let Some(gpu) = render_pref {
-        s.gpu_acceleration = gpu;
+    if let Some(p) = render_pref {
+        p.apply_to(&mut s);
     }
     s
 }
@@ -616,6 +637,13 @@ pub fn scope_from_auth_key(auth_key: &str) -> String {
 // next launch does. It is also kept out of the cloud blob and settings
 // export (sync.ts, settingsTransfer.ts).
 //
+// The HDR settings (`hdr_mode`, `hdr_enabled`, `hdr_target_peak_nits`) share
+// that home: they describe the display this machine is plugged into, not the
+// account, so a sign-in on the same machine must not swap them for whatever
+// that account's scope file held. They are optional in render.json: a file
+// written before they moved there (or by the legacy scan below) has none, and
+// the scope file's values then stand until the next save writes them.
+//
 // Only when `render.json` is absent (the first launch after an upgrade) does
 // the launch fall back, once, to the legacy scan: walk every scope file
 // under `%APPDATA%\com.aura.app\settings\*.json` and treat the launch as off
@@ -649,25 +677,71 @@ fn render_pref_path() -> Option<PathBuf> {
     Some(pre_init_settings_root()?.parent()?.join("render.json"))
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 struct RenderPref {
     gpu_acceleration: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hdr_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hdr_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hdr_target_peak_nits: Option<u32>,
+    /// "Real glass over video" (optional like the HDR fields: absent in a
+    /// render.json written before it existed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    real_glass: Option<bool>,
+}
+
+impl RenderPref {
+    /// Every machine-local field of `s`, as the next save writes them.
+    fn from_settings(s: &AppSettings) -> Self {
+        RenderPref {
+            gpu_acceleration: s.gpu_acceleration,
+            hdr_mode: Some(s.hdr_mode.clone()),
+            hdr_enabled: Some(s.hdr_enabled),
+            hdr_target_peak_nits: Some(s.hdr_target_peak_nits),
+            real_glass: Some(s.real_glass),
+        }
+    }
+
+    /// Lay the machine-local values over a scope's settings. An HDR field
+    /// render.json does not hold yet leaves the scope's value in place.
+    fn apply_to(&self, s: &mut AppSettings) {
+        s.gpu_acceleration = self.gpu_acceleration;
+        if let Some(m) = &self.hdr_mode {
+            s.hdr_mode = m.clone();
+        }
+        if let Some(e) = self.hdr_enabled {
+            s.hdr_enabled = e;
+        }
+        if let Some(n) = self.hdr_target_peak_nits {
+            s.hdr_target_peak_nits = n;
+        }
+        if let Some(g) = self.real_glass {
+            s.real_glass = g;
+        }
+    }
+}
+
+/// The machine-local `render.json`; None when it is absent or unreadable.
+fn read_render_file() -> Option<RenderPref> {
+    let text = std::fs::read_to_string(render_pref_path()?).ok()?;
+    serde_json::from_str::<RenderPref>(&text).ok()
 }
 
 /// The machine-local `gpu_acceleration`; None when `render.json` is absent or
 /// unreadable.
 fn read_render_pref() -> Option<bool> {
-    let text = std::fs::read_to_string(render_pref_path()?).ok()?;
-    serde_json::from_str::<RenderPref>(&text).ok().map(|p| p.gpu_acceleration)
+    read_render_file().map(|p| p.gpu_acceleration)
 }
 
 /// Atomic write of `render.json` (tmp, fsync, rename), like `save`.
-fn write_render_pref(gpu_acceleration: bool) -> Result<(), String> {
+fn write_render_pref(pref: &RenderPref) -> Result<(), String> {
     let path = render_pref_path().ok_or("render.json path unresolvable")?;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     }
-    let text = serde_json::to_string(&RenderPref { gpu_acceleration }).map_err(|e| e.to_string())?;
+    let text = serde_json::to_string(pref).map_err(|e| e.to_string())?;
     let tmp = path.with_extension("json.tmp");
     {
         use std::io::Write;
@@ -713,7 +787,13 @@ pub fn load_pre_init() -> Result<AppSettings, String> {
     if any_gpu_off {
         s.gpu_acceleration = false;
     }
-    let _ = write_render_pref(s.gpu_acceleration);
+    let _ = write_render_pref(&RenderPref {
+        gpu_acceleration: s.gpu_acceleration,
+        hdr_mode: None,
+        hdr_enabled: None,
+        hdr_target_peak_nits: None,
+        real_glass: None,
+    });
     Ok(s)
 }
 
@@ -789,10 +869,10 @@ pub fn load<R: Runtime>(app: &AppHandle<R>) -> AppSettings {
 
     match serde_json::from_str::<AppSettings>(&raw) {
         Ok(mut parsed) => {
-            // Machine-local: render.json wins over the scope file's value
+            // Machine-local: render.json wins over the scope file's values
             // (see the "Pre-init load" block comment).
-            if let Some(gpu) = read_render_pref() {
-                parsed.gpu_acceleration = gpu;
+            if let Some(p) = read_render_file() {
+                p.apply_to(&mut parsed);
             }
             // Merge any newly-added default keybinding actions into
             // the user's saved map. `#[serde(default = ...)]` only
@@ -880,9 +960,11 @@ pub fn save<R: Runtime>(app: &AppHandle<R>, settings: &AppSettings) -> Result<()
     }
     std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
     *cache().lock().unwrap() = settings.clone();
-    // The machine-local render switch, read by the next launch.
-    if read_render_pref() != Some(settings.gpu_acceleration) {
-        if let Err(e) = write_render_pref(settings.gpu_acceleration) {
+    // The machine-local fields: the render switch (read by the next launch)
+    // and the HDR settings (read back over every scope's file).
+    let pref = RenderPref::from_settings(settings);
+    if read_render_file().as_ref() != Some(&pref) {
+        if let Err(e) = write_render_pref(&pref) {
             crate::devlog!(warn, "settings", "render.json write failed: {e}");
         }
     }
@@ -1033,7 +1115,11 @@ fn fold_retired_scrobble_master(
 pub async fn reset_settings<R: Runtime>(
     app: AppHandle<R>,
 ) -> Result<AppSettings, String> {
-    let next = AppSettings::default();
+    let mut next = AppSettings::default();
+    // Bookkeeping, not a preference: a reset must not re-arm the one-time
+    // audio order check, which would then rewrite a single-language list the
+    // user picks after the reset.
+    next.audio_priority_repaired = snapshot().audio_priority_repaired;
     save(&app, &next)?;
     Ok(next)
 }
@@ -1082,9 +1168,38 @@ mod tests {
     fn cold_cache_follows_render_json() {
         // The launch ran with Hardware acceleration off: a scope with no
         // settings file must still show (and later save) it off.
-        assert!(!initial_cache(Some(false)).gpu_acceleration);
-        assert!(initial_cache(Some(true)).gpu_acceleration);
+        let gpu_only = |gpu: bool| RenderPref {
+            gpu_acceleration: gpu,
+            hdr_mode: None,
+            hdr_enabled: None,
+            hdr_target_peak_nits: None,
+            real_glass: None,
+        };
+        assert!(!initial_cache(Some(gpu_only(false))).gpu_acceleration);
+        assert!(initial_cache(Some(gpu_only(true))).gpu_acceleration);
         // No render.json: the default.
         assert_eq!(initial_cache(None).gpu_acceleration, AppSettings::default().gpu_acceleration);
+    }
+
+    #[test]
+    fn render_json_carries_hdr_when_present() {
+        // A render.json written before the HDR fields moved there leaves the
+        // scope's values alone.
+        let old: RenderPref = serde_json::from_str(r#"{"gpu_acceleration":true}"#).unwrap();
+        let s = initial_cache(Some(old));
+        assert_eq!(s.hdr_mode, AppSettings::default().hdr_mode);
+        assert_eq!(s.hdr_target_peak_nits, AppSettings::default().hdr_target_peak_nits);
+        // A current one wins over them.
+        let mut src = AppSettings::default();
+        src.hdr_mode = "passthrough".into();
+        src.hdr_target_peak_nits = 465;
+        let pref = RenderPref::from_settings(&src);
+        let text = serde_json::to_string(&pref).unwrap();
+        let back: RenderPref = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, pref);
+        let s = initial_cache(Some(back));
+        assert_eq!(s.hdr_mode, "passthrough");
+        assert_eq!(s.hdr_target_peak_nits, 465);
+        assert!(s.hdr_enabled);
     }
 }

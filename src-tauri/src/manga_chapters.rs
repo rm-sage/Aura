@@ -89,7 +89,7 @@ fn client() -> &'static reqwest::Client {
             .https_only(true)
             .timeout(TIMEOUT)
             .pool_max_idle_per_host(1)
-            .user_agent("Aura/2 (+https://github.com/rm-sage/Aura) manga-chapters")
+            .user_agent(concat!("Aura/", env!("CARGO_PKG_VERSION"), " (+https://github.com/rm-sage/Aura) manga-chapters"))
             .build()
             .expect("manga_chapters HTTP client init failed")
     })

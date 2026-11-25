@@ -292,8 +292,9 @@ export function RatingsTab({ cours }: { cours: CourRef[] }) {
                   </span>
                   <div className="flex-1 h-3.5 rounded bg-white/6 overflow-hidden">
                     <div
-                      className="h-full rounded bg-ln-accent/70"
-                      style={{ width: `${(b.votes / peak) * 100}%` }}
+                      // The accent MARK (a dark custom accent still reads on the glass).
+                      className="h-full rounded opacity-80"
+                      style={{ width: `${(b.votes / peak) * 100}%`, background: "var(--ln-accent-mark)" }}
                     />
                   </div>
                   <span className="w-[92px] shrink-0 text-white/35 text-[10.5px] font-mono tabular-nums text-right">
@@ -402,7 +403,7 @@ export function StaffTab({ cours, compact = false, onSearchName }: {
                   <div className="min-w-0">
                     <p className={"text-[12.5px] leading-tight truncate "
                       + (onSearchName
-                        ? "text-white/85 group-hover/staff:text-ln-accent transition-colors"
+                        ? "text-white/85 group-hover/staff:text-[color:var(--ln-accent-mark-text)] transition-colors"
                         : "text-white/85")}>
                       {c.name}
                     </p>
@@ -577,17 +578,19 @@ function CharacterCard({
   const restNameIsChar = !c.actor;
   return (
     <div
-      className="min-w-0"
+      className="aura-tile min-w-0"
       onMouseEnter={() => setHover(true)}
       onMouseLeave={() => setHover(false)}
     >
+      {/* The art box carries the card bezel (a rim-only cursor-light surface)
+          instead of a 1px border (round 11, glass-detail.css). */}
       <button
         type="button"
         onClick={() => { if (hideChar) setRevealed(true); }}
         aria-label={hideChar ? `Reveal ${c.actor ?? "character"}'s role` : c.name}
         className="block w-full aspect-[2/3] rounded-lg overflow-hidden
-                   bg-white/6 border border-white/8 relative
-                   focus-visible:outline focus-visible:outline-2 focus-visible:outline-ln-accent"
+                   bg-white/6 relative
+                   focus-visible:outline focus-visible:outline-2 focus-visible:outline-white/60"
       >
         {restImage && (
           <ImageLoader
@@ -631,12 +634,16 @@ function CharacterCard({
           </span>
         )}
         {c.role === "Main" && !showChar && (
-          <span className="absolute top-1.5 left-1.5 px-1.5 py-0.5 rounded
-                           bg-black/70 text-white/85 text-[9px] font-mono
+          // Frost look, FAUX inside the panel (glass-detail.css): a real one
+          // would sample only the panel, and a grid holds dozens.
+          <span data-glass-light="rim"
+                className="aura-frost absolute top-1.5 left-1.5 px-1.5 py-0.5 rounded-[6px]
+                           text-white/90 text-[9px] font-mono
                            uppercase tracking-[0.14em]">
             Main
           </span>
         )}
+        <span aria-hidden data-glass-light="rim" className="aura-card-bezel" />
       </button>
 
       {/* Both lines are FIXED: only the image swaps on hover. Swapping the
@@ -654,15 +661,14 @@ function CharacterCard({
           // which is the same spoiler the line below carries when an actor
           // exists. Sharp whenever it is a real person.
           style={hideChar && restNameIsChar ? { filter: "blur(4px)" } : undefined}
-          className="block w-full text-left bg-transparent p-0 border-0 cursor-pointer
+          className="aura-tile-name block w-full text-left bg-transparent p-0 border-0 cursor-pointer
                      text-white/85 text-[11.5px] leading-tight mt-1.5 line-clamp-2
-                     hover:text-ln-accent transition-colors
                      focus:outline-none focus-visible:underline"
         >
           {c.actor ?? c.name}
         </button>
       ) : (
-        <p className="text-white/85 text-[11.5px] leading-tight mt-1.5 line-clamp-2"
+        <p className="aura-tile-name text-white/85 text-[11.5px] leading-tight mt-1.5 line-clamp-2"
            style={hideChar && restNameIsChar ? { filter: "blur(4px)" } : undefined}>
           {c.actor ?? c.name}
         </p>
@@ -861,10 +867,9 @@ function OpenableTile({
       onClick={onSearchTitle ? () => onSearchTitle(name) : undefined}
       disabled={!onSearchTitle}
       title={onSearchTitle ? `Search for "${name}"` : undefined}
-      className="min-w-0 text-left group disabled:cursor-default"
+      className="aura-tile min-w-0 text-left group disabled:cursor-default"
     >
-      <div className="relative aspect-[2/3] rounded-lg overflow-hidden bg-white/6 mb-1.5
-                      group-hover:ring-1 group-hover:ring-white/25 transition-shadow">
+      <div className="relative aspect-[2/3] rounded-lg overflow-hidden bg-white/6 mb-1.5">
         {image ? (
           <ImageLoader
             src={shrinkPoster(image, RELATED_POSTER_W)}
@@ -881,10 +886,10 @@ function OpenableTile({
             <span className="w-1.5 h-1.5 rounded-full bg-white/40 aura-poster-retry-dot" />
           </span>
         ) : null}
+        <span aria-hidden data-glass-light="rim" className="aura-card-bezel" />
       </div>
-      <p className="text-white/80 text-[11.5px] leading-tight line-clamp-2
-                    group-hover:text-white transition-colors">{name}</p>
-      <p className="text-white/30 text-[10.5px] mt-0.5">{caption}</p>
+      <p className="aura-tile-name text-white/85 text-[11.5px] leading-tight line-clamp-2">{name}</p>
+      <p className="text-white/60 text-[10.5px] mt-0.5">{caption}</p>
     </button>
   );
 }
@@ -926,11 +931,10 @@ export function TrailersTab({
                   type="button"
                   onClick={() => onPlay?.(t.youtube_id, t.title)}
                   disabled={!onPlay || launching}
-                  className={`text-left min-w-0 group disabled:cursor-default
+                  className={`aura-tile text-left min-w-0 group disabled:cursor-default
                               ${launching ? "disabled:cursor-progress" : ""}`}
                 >
-                  <div className="relative aspect-video rounded-lg overflow-hidden bg-white/6 mb-1.5
-                                  group-hover:ring-1 group-hover:ring-white/25 transition-shadow">
+                  <div className="relative aspect-video rounded-lg overflow-hidden bg-white/6 mb-1.5">
                     {t.thumbnail && (
                       <ImageLoader
                         src={shrinkPoster(t.thumbnail, TRAILER_THUMB_W)}
@@ -951,8 +955,9 @@ export function TrailersTab({
                         </svg>
                       </div>
                     )}
+                    <span aria-hidden data-glass-light="rim" className="aura-card-bezel" />
                   </div>
-                  <p className="text-white/80 text-[11.5px] leading-tight line-clamp-2">
+                  <p className="aura-tile-name text-white/85 text-[11.5px] leading-tight line-clamp-2">
                     {t.title}
                   </p>
                 </button>

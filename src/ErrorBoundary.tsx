@@ -52,8 +52,9 @@ export default class ErrorBoundary extends Component<Props, State> {
     if (this.props.fallback) return this.props.fallback(error, this.reset);
     return (
       <div className="flex-1 flex items-center justify-center p-8">
-        <div className="glass-panel-elevated rounded-2xl px-6 py-5 max-w-[28rem]
-                        border border-red-400/30">
+        {/* The shared glass (menu tier) with the danger hairline through the
+            --lg-ring hook; never the per-theme tinted glass-panel-elevated. */}
+        <div className="aura-float-glass aura-glass-tone-danger rounded-2xl px-6 py-5 max-w-[28rem]">
           <p className="text-red-300/85 text-xs font-semibold tracking-[0.18em] uppercase mb-1.5">
             {this.props.scope ?? "Render error"}
           </p>
@@ -62,8 +63,8 @@ export default class ErrorBoundary extends Component<Props, State> {
           </p>
           <button
             onClick={this.reset}
-            className="mt-4 px-3 py-1.5 rounded-full text-xs font-medium
-                       bg-white/8 hover:bg-white/15 text-white/80 transition-colors"
+            className="aura-glass-flat aura-glass-press mt-4 px-3 py-1.5 rounded-full text-xs font-medium
+                       text-white/80"
           >
             Try again
           </button>

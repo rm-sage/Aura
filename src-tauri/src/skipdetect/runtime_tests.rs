@@ -36,6 +36,13 @@
 //       the provisional window against the final one, and that it never
 //       reaches the final snapshot or the result cache.
 //
+//   skipdetect_runtime_one  the whole job on ONE stream named by a local JSON
+//       file (AURA_SKIPDETECT_ONE: {url, stremio_id, duration, mal_id,
+//       mal_episode, theme_fp_from?}), caches in a fresh temp dir; prints the final windows,
+//       notes and Layer 1 states. No corpus needed: the check for a single
+//       episode a user reported (Secrets of the Silent Witch E01, its opening
+//       song played as the ending).
+//
 // One test here is NOT ignored and needs no stream:
 //   skipdetect_region_graph_fills_pts_gaps  a synthetic local file with a 1 s
 //       PTS hole, decoded through the production region graph: with
@@ -522,7 +529,7 @@ async fn skipdetect_runtime_parity() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs AURA_SKIPBENCH_DIR + AURA_SKIPDETECT_RT_STREAMS (real streams, AnimeThemes GETs)"]
+#[ignore = "needs AURA_SKIPBENCH_DIR + AURA_SKIPDETECT_RT_STREAMS (real streams, AnimeThemes API)"]
 async fn skipdetect_runtime_detect() {
     let root = bench();
     let ff = ffmpeg();
@@ -749,11 +756,11 @@ async fn skipdetect_runtime_detect() {
     assert!(fails.is_empty(), "{} runtime detect failure(s)", fails.len());
 }
 
-/// The Next-Up theme prefetch against the real AnimeThemes API (GET only,
+/// The Next-Up theme prefetch against the real AnimeThemes API (read-only,
 /// paced; no stream involved): the list and the top-ranked theme of each kind
 /// land in a temp cache, and a second prefetch finds them all cached.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "needs network (AnimeThemes GETs) and ffmpeg"]
+#[ignore = "needs network (AnimeThemes API) and ffmpeg"]
 async fn skipdetect_runtime_prefetch() {
     let ff = ffmpeg();
     let dir = std::env::temp_dir().join(format!("aura-skipdetect-prefetch-{}", std::process::id()));
@@ -929,7 +936,7 @@ fn rt_nudge(c: f64) -> Option<f64> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs AURA_PRESCAN_RT_FILE (real streams, AnimeThemes GETs) and ffmpeg"]
+#[ignore = "needs AURA_PRESCAN_RT_FILE (real streams, AnimeThemes API) and ffmpeg"]
 async fn skipdetect_runtime_prescan() {
     use super::cache::{duration_bucket, result_key, RESULT_FILE};
     // A cache clear elsewhere refuses this test's result writes, and the slot
@@ -1198,4 +1205,64 @@ async fn skipdetect_runtime_prescan() {
         println!("[rt-prescan] FAIL {f}");
     }
     assert!(fails.is_empty(), "{} prescan runtime failure(s)", fails.len());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs AURA_SKIPDETECT_ONE (a JSON file naming one real stream)"]
+async fn skipdetect_runtime_one() {
+    let path = std::env::var("AURA_SKIPDETECT_ONE").expect("AURA_SKIPDETECT_ONE not set");
+    let v: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).expect("AURA_SKIPDETECT_ONE is not JSON");
+    let req: Request = serde_json::from_value(serde_json::json!({
+        "url": v["url"],
+        "stremio_id": v["stremio_id"],
+        "media_type": "series",
+        "addon": "runtime-test",
+        "duration": v["duration"],
+        "mal_id": v["mal_id"],
+        "mal_source": "test",
+        "mal_episode": v["mal_episode"],
+        "anime": true,
+    }))
+    .unwrap();
+    let req = req.validate().unwrap();
+    let dir = std::env::temp_dir().join(format!("aura-skipdetect-one-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    // Optional `theme_fp_from`: a data dir whose theme fingerprints are copied
+    // in (read only), for when AnimeThemes' audio host is down.
+    if let Some(from) = v["theme_fp_from"].as_str() {
+        let (src, dst) = (Path::new(from).join("theme-fp"), dir.join("theme-fp"));
+        std::fs::create_dir_all(&dst).unwrap();
+        for e in std::fs::read_dir(&src).unwrap().flatten() {
+            std::fs::copy(e.path(), dst.join(e.file_name())).unwrap();
+        }
+    }
+    let t = Instant::now();
+    let ctx = Ctx {
+        ffmpeg: ffmpeg(),
+        data_dir: Some(dir.clone()),
+        generation: 1,
+        publish: Arc::new(|_: &Snapshot| {}),
+        progress: Arc::new(|_: &super::job::Progress| {}),
+        background: false,
+        pre_probe: None,
+        replay: None,
+        fake_theme_load: None,
+    };
+    let s = job::run(&ctx, &req).await;
+    let win = |w: &Option<super::job::WindowOut>| {
+        w.as_ref().map(|w| format!("[{:.2}, {:.2}] {} {:?} auto={}", w.start, w.end, w.source, w.theme, w.auto_eligible))
+    };
+    println!(
+        "[rt-one] {} in {:.1}s: op {:?} ({:?}) ed {:?} ({:?}) notes {:?} / {:?} media_end {:?}",
+        req.stremio_id,
+        t.elapsed().as_secs_f64(),
+        win(&s.op),
+        s.op_l1,
+        win(&s.ed),
+        s.ed_l1,
+        s.op_note,
+        s.ed_note,
+        s.media_end
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }

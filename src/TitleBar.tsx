@@ -1,7 +1,7 @@
 // Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useEffect, useState, useCallback, useRef } from "react";
+import { memo, useEffect, useState, useCallback, useRef } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { PhysicalPosition } from "@tauri-apps/api/dpi";
 import { invoke } from "@tauri-apps/api/core";
@@ -98,7 +98,7 @@ interface Props {
   opaque?: boolean;
 }
 
-export default function TitleBar({ subtitle, opaque }: Props) {
+function TitleBar({ subtitle, opaque }: Props) {
   const [maximized, setMaximized] = useState(false);
 
   // Windows 10 needs a custom window-drag (see handlePointerDown). Detected
@@ -124,11 +124,17 @@ export default function TitleBar({ subtitle, opaque }: Props) {
   useEffect(() => {
     const win = getCurrentWindow();
     let unlisten: (() => void) | null = null;
+    // The bar unmounts on every fullscreen entry: a cleanup that runs before
+    // onResized resolves must still detach the listener it registers.
+    let alive = true;
     win.isMaximized().then(setMaximized).catch(() => {});
     win.onResized(() => {
       win.isMaximized().then(setMaximized).catch(() => {});
-    }).then((un) => { unlisten = un; });
-    return () => { unlisten?.(); };
+    }).then((un) => {
+      if (alive) unlisten = un;
+      else un();
+    }).catch(() => {});
+    return () => { alive = false; unlisten?.(); };
   }, []);
 
   const minimize = useCallback(() => { getCurrentWindow().minimize(); }, []);
@@ -330,7 +336,7 @@ export default function TitleBar({ subtitle, opaque }: Props) {
 
       {/* Service status chip, left of the spacer, anchored to the start of
           the bar. The worst state across Aura's server, Cloud sync, the
-          Watch Together relay, the installed addons and the monitored debrid
+          Watch Party relay, the installed addons and the monitored debrid
           providers (green check / amber alert / rose X / gray idle). Click
           opens its panel. */}
       <div className="relative flex items-stretch h-full pl-2" data-no-drag>
@@ -359,6 +365,12 @@ export default function TitleBar({ subtitle, opaque }: Props) {
     </div>
   );
 }
+
+// Memoized: App re-renders on every playback-update tick, and the bar stays
+// mounted through windowed playback (landmine 6). Its props are primitives and
+// every child (ServiceStatusChip, DownloadsButton) subscribes to its own store,
+// so a skipped render changes nothing on screen.
+export default memo(TitleBar);
 
 // ---------------------------------------------------------------------------
 // TitleBarButton

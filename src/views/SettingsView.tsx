@@ -17,9 +17,10 @@ import {
   buildExportBlob,
   blobToBase64,
   downloadBlobAsFile,
+  applySettingsImport,
+  importSummaryStatus,
   parseImportInput,
   readImportFile,
-  resolveProviders,
 } from "../settingsTransfer";
 import {
   applyBackupPayload,
@@ -43,20 +44,15 @@ import {
   type AuraSettings,
 } from "../auraSettings";
 import { isHomeSource, isSearchProvider, isStreamProvider } from "../addonElection";
-import { showAppToast } from "../AppToast";
+import { dismissAppToasts, showAppToast } from "../AppToast";
 import { openExternalUrl } from "../externalUrl";
-import { encodeQr } from "../qrCode";
-import {
-  LOOPBACK_ONLY_SIGN_IN,
-  REVOKE_BEFORE_RECONNECT,
-  SCROBBLE_LABELS,
-  knownScrobbleServicesAvailable,
-  scrobbleServicesAvailable,
-  summaryFor,
-  type ScrobbleAuthStatus,
-  type ScrobbleAuthSummary,
-  type ScrobbleService,
-} from "../scrobbleConn";
+
+/** Scope of the confirmations that only mean something on this page
+ *  ("Settings saved", Cloud Sync pull / push / clear, a moved keybinding).
+ *  They fade out as soon as Settings is left; errors stay unscoped so
+ *  they run their full time. */
+const SETTINGS_TOAST_SCOPE = "settings";
+import { SCROBBLE_ROW_DESCRIPTIONS } from "../scrobbleConn";
 import {
   DndContext,
   closestCenter,
@@ -77,6 +73,30 @@ import { CSS } from "@dnd-kit/utilities";
 import auraIconAsset from "../assets/aura-icon.png";
 import SkipConfidenceBadge from "../SkipConfidenceBadge";
 import type { SkipConfidence } from "../skipWindows";
+import {
+  AdvancedMarkContext,
+  AdvancedPill,
+  AdvancedTag,
+  AttachedSettings,
+  SegmentedControl,
+  SettingDropdown,
+  SettingText,
+  SettingToggle,
+  ToggleSwitch,
+} from "../settingsControls";
+import { subtitleLanguageOptions } from "../languages";
+import { patchBackendSettings } from "../backendSettings";
+import { REAL_GLASS_AVAILABLE, realGlassAvailable, setRealGlassEnabled, useRealGlassState } from "../realGlass";
+import { useGlassState } from "../glassStyle";
+import HdrModeSetting from "../HdrModeSetting";
+import { GlassStyleRows } from "../GlassStyleSetting";
+import { AccentColorRow } from "../AccentColorSetting";
+import { AUDIO_ORDER_CHANGED_EVENT } from "../audioPriorityRepair";
+import { HDR_MODE_CHANGED_EVENT, applyStoredHdrMode, hdrModeOf, setHdrMode, setHdrPeakNits } from "../hdrMode";
+import ScrobbleAuthRow from "../ScrobbleAuthRow";
+import { requestRerunOnboarding } from "../onboarding";
+import { sheet } from "../glassSheet";
+import { useListDroplet } from "../glassListDroplet";
 
 /** App version. Sourced from package.json via the `VITE_APP_VERSION`
  *  define in vite.config.ts so a single version bump in package.json
@@ -149,10 +169,15 @@ interface BackendSettings {
   /** Preferred Watch-Trailer quality: "auto" | "720" | "1080" | "1440" | "2160". */
   trailer_quality: string;
   gpu_acceleration: boolean;
+  /** "Real glass over video" (experimental, default off): an mpv shader
+   *  blurs the live video under the player's bar and menus. Machine-local
+   *  (render.json), stripped from the cloud blob in sync.ts, not portable. */
+  real_glass: boolean;
 }
 
 // ---------------------------------------------------------------------------
-// Reusable setting controls
+// Reusable setting controls (the row controls shared with the first-run setup
+// live in settingsControls.tsx)
 // ---------------------------------------------------------------------------
 
 /** Tight per-row matcher used by the Settings search bar. Replaces the
@@ -231,9 +256,6 @@ const NO_IDS: ReadonlySet<string> = new Set();
 const AdvancedViewContext = createContext<AdvancedView>({
   show: true, searching: false, hits: NO_IDS, revealed: NO_IDS,
 });
-/** True inside a unit that is on screen only because of a search or a deep
- *  link, so its rows carry the "Advanced" tag. */
-const AdvancedMarkContext = createContext(false);
 /** The enclosing Section's id, for AdvancedOnly's deep-link check. */
 const SectionIdContext = createContext<string | undefined>(undefined);
 
@@ -264,22 +286,6 @@ function useLatchedUnitState(state: AdvancedUnitState): AdvancedUnitState {
   return state === "absent" && latched ? "hidden" : state;
 }
 
-function AdvancedPill() {
-  return (
-    <span className="ml-2 inline-block align-middle px-1.5 py-0.5 rounded leading-none
-                     text-[9px] font-mono font-medium uppercase tracking-wider
-                     bg-ln-accent/15 text-ln-accent/90 border border-ln-accent/30">
-      Advanced
-    </span>
-  );
-}
-
-/** Goes inline after a row's label: the "Advanced" tag while the row's unit
- *  is on screen only because of a search or a deep link, else nothing. */
-function AdvancedTag() {
-  return useContext(AdvancedMarkContext) ? <AdvancedPill /> : null;
-}
-
 /** Advanced rows inside an ordinary Section (see the block comment above).
  *  The wrapper repeats the Section body's `space-y-5`, so its children space
  *  exactly as they would unwrapped, and a `hidden` wrapper drops out of the
@@ -295,132 +301,6 @@ function AdvancedOnly({ children }: { children: React.ReactNode }) {
       <AdvancedMarkContext.Provider value={state === "marked"}>
         {children}
       </AdvancedMarkContext.Provider>
-    </div>
-  );
-}
-
-/** The pill switch: SettingToggle's control, and the page's own "Show
- *  advanced settings" switch, so the two cannot drift apart. */
-function ToggleSwitch({
-  value, onChange, disabled = false,
-}: {
-  value: boolean;
-  onChange: (v: boolean) => void;
-  disabled?: boolean;
-}) {
-  return (
-    <button
-      onClick={() => { if (!disabled) onChange(!value); }}
-      disabled={disabled}
-      role="switch"
-      aria-checked={value}
-      className={`relative w-10 h-6 rounded-full transition-colors duration-150 flex-shrink-0
-                  disabled:cursor-default
-                  ${value ? "bg-ln-accent/80" : "bg-white/15"}`}
-    >
-      <span
-        className="absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-white
-                   shadow-md transition-transform duration-150"
-        style={{ transform: value ? "translateX(16px)" : "translateX(0)" }}
-      />
-    </button>
-  );
-}
-
-interface DropdownProps {
-  label: string;
-  description: string;
-  value: string | null;
-  options: { value: string; label: string }[];
-  onChange: (value: string | null) => void;
-  required?: boolean;
-  disabled?: boolean;
-  /** Optional badge rendered after the label (e.g., "Managed by AIOMetadata"). */
-  badge?: React.ReactNode;
-}
-
-function SettingDropdown({
-  label, description, value, options, onChange, required, disabled, badge,
-}: DropdownProps) {
-  return (
-    <div
-      className={`space-y-2 ${disabled ? "opacity-40" : ""}`}
-      data-settings-row=""
-      data-settings-label={label}
-      data-settings-description={description}
-    >
-      <div>
-        <div className="flex items-center gap-2">
-          <p className="text-white/75 text-sm font-medium">{label}<AdvancedTag /></p>
-          {badge}
-        </div>
-        <p className="text-white/35 text-xs mt-0.5">{description}</p>
-      </div>
-      <select
-        value={value ?? ""}
-        disabled={disabled}
-        onChange={(e) => onChange(e.target.value || null)}
-        className={`w-full bg-white/5 border border-white/10 rounded-xl px-4 py-2.5
-                   text-sm outline-none focus:border-white/25
-                   transition-colors appearance-none cursor-pointer
-                   ${disabled ? "cursor-not-allowed" : ""}`}
-        style={{
-          color: "var(--text-primary)",
-          backgroundImage: `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='rgba(255,255,255,0.3)'%3E%3Cpath d='M7 10l5 5 5-5z'/%3E%3C/svg%3E")`,
-          backgroundRepeat: "no-repeat",
-          backgroundPosition: "right 14px center",
-          paddingRight: "36px",
-        }}
-      >
-        {!required && <option value="">System default</option>}
-        {options.map((opt) => (
-          <option key={opt.value} value={opt.value}>
-            {opt.label}
-          </option>
-        ))}
-      </select>
-    </div>
-  );
-}
-
-interface ToggleProps {
-  label: string;
-  description: string;
-  value: boolean;
-  onChange: (v: boolean) => void;
-  /** Greys the row out and refuses input - for a toggle whose parent switch is
-   *  off, where flipping it would mean nothing. */
-  disabled?: boolean;
-}
-
-function SettingToggle({ label, description, value, onChange, disabled = false }: ToggleProps) {
-  return (
-    <div
-      className={`flex items-center justify-between gap-4 ${disabled ? "opacity-40" : ""}`}
-      data-settings-row=""
-      data-settings-label={label}
-      data-settings-description={description}
-    >
-      <div className="flex-1 min-w-0">
-        <p className="text-white/75 text-sm font-medium">{label}<AdvancedTag /></p>
-        <p className="text-white/35 text-xs mt-0.5">{description}</p>
-      </div>
-      <ToggleSwitch value={value} onChange={onChange} disabled={disabled} />
-    </div>
-  );
-}
-
-/** Settings that only refine the row directly above them (a parent switch,
- *  dropdown or key), indented under it in one box instead of standing as
- *  peers. Each child keeps its own data-settings-* attributes, so search
- *  finds it like any row. Put a divider between two children; an advanced
- *  child goes in its own <AdvancedOnly> inside the box, and a box whose
- *  children are ALL advanced goes inside one <AdvancedOnly> so no empty box
- *  is left when they hide. */
-function AttachedSettings({ children }: { children: React.ReactNode }) {
-  return (
-    <div className="ml-5 rounded-lg border border-white/8 bg-white/[0.02] px-3 py-2.5 space-y-3">
-      {children}
     </div>
   );
 }
@@ -474,11 +354,6 @@ function SkipModeRow({
   value: string;
   onChange: (v: string) => void;
 }) {
-  const opts: { id: string; label: string; tone: string }[] = [
-    { id: "off",    label: "Off",    tone: "text-white" },
-    { id: "prompt", label: "Prompt", tone: "text-white" },
-    { id: "auto",   label: "Auto",   tone: "text-white" },
-  ];
   return (
     <div
       className="flex items-center justify-between gap-4"
@@ -490,98 +365,21 @@ function SkipModeRow({
         <p className="text-white/75 text-sm font-medium">{label}</p>
         <p className="text-white/35 text-xs mt-0.5">{description}</p>
       </div>
-      <div
-        className="flex-shrink-0 inline-flex rounded-full overflow-hidden
-                   bg-white/5 border border-white/10 p-0.5 gap-0.5"
-      >
-        {opts.map((o) => {
-          const active = value === o.id;
-          return (
-            <button
-              key={o.id}
-              onClick={() => onChange(o.id)}
-              className={`px-3 py-1 rounded-full text-[11.5px] font-medium tracking-wide
-                          transition-colors duration-150
-                          ${active
-                            ? `bg-ln-accent/20 ${o.tone}`
-                            : "text-white/55 hover:text-white/85"}`}
-            >
-              {o.label}
-            </button>
-          );
-        })}
-      </div>
+      <SegmentedControl<string>
+        value={value}
+        options={SKIP_MODE_OPTIONS}
+        onChange={onChange}
+        ariaLabel={label}
+      />
     </div>
   );
 }
 
-interface TextInputProps {
-  label: string;
-  description: string;
-  value: string;
-  placeholder?: string;
-  onChange: (v: string) => void;
-  disabled?: boolean;
-  badge?: React.ReactNode;
-  /** Return "valid" | "invalid" | null (empty value → no indicator). */
-  validate?: (v: string) => "valid" | "invalid" | null;
-  validationHint?: string;
-}
-
-function SettingText({
-  label, description, value, placeholder, onChange, disabled, badge,
-  validate, validationHint,
-}: TextInputProps) {
-  const validState = validate && value.length > 0 ? validate(value) : null;
-  return (
-    <div
-      className={`space-y-2 ${disabled ? "opacity-40" : ""}`}
-      data-settings-row=""
-      data-settings-label={label}
-      data-settings-description={description}
-    >
-      <div className="flex items-center gap-2">
-        <p className="text-white/75 text-sm font-medium">{label}<AdvancedTag /></p>
-        {badge}
-      </div>
-      <p className="text-white/35 text-xs -mt-1">{description}</p>
-      <div className="relative">
-        <input
-          type="text"
-          value={value}
-          placeholder={placeholder}
-          disabled={disabled}
-          onChange={(e) => onChange(e.target.value)}
-          spellCheck={false}
-          className={`w-full bg-white/5 border rounded-xl px-4 py-2.5
-                      text-sm font-mono placeholder:text-white/25 outline-none
-                      transition-colors
-                      ${validate ? "pr-9" : ""}
-                      ${validState === "valid"
-                        ? "border-emerald-400/40 focus:border-emerald-400/60"
-                        : validState === "invalid"
-                        ? "border-red-400/40 focus:border-red-400/60"
-                        : "border-white/10 focus:border-white/25"}
-                      ${disabled ? "cursor-not-allowed" : ""}`}
-          style={{ color: "var(--text-primary)" }}
-        />
-        {validState && (
-          <span
-            aria-hidden
-            className={`absolute right-3 top-1/2 -translate-y-1/2 text-sm font-bold
-                         pointer-events-none select-none
-                         ${validState === "valid" ? "text-emerald-400" : "text-red-400"}`}
-          >
-            {validState === "valid" ? "✓" : "✗"}
-          </span>
-        )}
-      </div>
-      {validState === "invalid" && validationHint && (
-        <p className="text-red-400/70 text-xs">{validationHint}</p>
-      )}
-    </div>
-  );
-}
+const SKIP_MODE_OPTIONS: { value: string; label: string }[] = [
+  { value: "off",    label: "Off" },
+  { value: "prompt", label: "Prompt" },
+  { value: "auto",   label: "Auto" },
+];
 
 // ---------------------------------------------------------------------------
 // SettingSlider - labeled range input with live numeric readout
@@ -598,12 +396,77 @@ function SettingSlider({
   step?: number;
   /** Optional unit suffix (e.g. " px", " %"). Empty by default. */
   suffix?: string;
-  onChange: (v: number) => void;
+  /** Called once per gesture, on release (see below). A returned promise
+   *  holds the drag's value on the thumb until the write settles. */
+  onChange: (v: number) => void | Promise<unknown>;
 }) {
+  // A drag (or a held arrow key) keeps its value HERE and commits once, on
+  // release, key up, blur or the native `change` event. Every tick used to
+  // patch straight through: an update_settings round trip (a settings.json
+  // write), apply_subtitle_style or apply_buffer_settings, a sync stamp, the
+  // whole Settings page re-rendering and its settings-changed listeners
+  // re-reading, dozens of times a second. The thumb and the readout still
+  // follow the pointer on every tick (only this row re-renders), and the
+  // committed value is the same one the last tick wrote before.
+  const [draft, setDraft] = useState<number | null>(null);
+  const draftRef = useRef<number | null>(null);
+  const activeRef = useRef(false);
+  const genRef = useRef(0);
+  const valueRef = useRef(value);
+  valueRef.current = value;
+  const onChangeRef = useRef(onChange);
+  onChangeRef.current = onChange;
+  const inputRef = useRef<HTMLInputElement>(null);
+  // Chromium also fires `change` on every arrow key press: a held key
+  // commits on key up instead.
+  const keyHeldRef = useRef(false);
+  // Commits whose write has not landed yet. While one is out, `value` is
+  // still the value from before it, so "unchanged" cannot be judged against
+  // it: a quick move back to that value would be dropped, then the earlier
+  // write would land and leave the thumb (and the setting) on it.
+  const pendingRef = useRef(0);
+
+  const commitRef = useRef(() => {
+    if (!activeRef.current) return;
+    activeRef.current = false;
+    const v = draftRef.current;
+    const gen = ++genRef.current;
+    const settle = () => {
+      // A newer gesture owns the draft now: leave it alone.
+      if (genRef.current !== gen || activeRef.current) return;
+      draftRef.current = null;
+      setDraft(null);
+    };
+    if (v === null || (pendingRef.current === 0 && v === valueRef.current)) { settle(); return; }
+    // Settled AFTER the write (its new value is already in `value` by then),
+    // so the thumb never flashes back to the old value; a refused write
+    // still lands back on the stored one, as before.
+    pendingRef.current += 1;
+    Promise.resolve(onChangeRef.current(v))
+      .finally(() => { pendingRef.current -= 1; })
+      .then(settle, settle);
+  });
+
+  useEffect(() => {
+    const el = inputRef.current;
+    if (!el) return;
+    // The native `change` fires when a range gesture ends, even when the
+    // pointer is released outside the input.
+    const onNativeChange = () => { if (!keyHeldRef.current) commitRef.current(); };
+    el.addEventListener("change", onNativeChange);
+    return () => {
+      el.removeEventListener("change", onNativeChange);
+      // Leaving mid-gesture still saves the value on the thumb.
+      commitRef.current();
+    };
+  }, []);
+
+  const shown = draft ?? value;
   // Fraction 0..1 for the slider track gradient. The CSS uses `--val`
   // as a percentage and `--val-frac` as a 0..1 number for shadow intensity.
   const span = Math.max(1, max - min);
-  const frac = Math.max(0, Math.min(1, (value - min) / span));
+  const frac = Math.max(0, Math.min(1, (shown - min) / span));
+  const commit = () => commitRef.current();
   return (
     <div
       className="space-y-2"
@@ -614,17 +477,27 @@ function SettingSlider({
       <div className="flex items-baseline justify-between gap-3">
         <p className="text-white/75 text-sm font-medium">{label}<AdvancedTag /></p>
         <span className="text-white/65 text-[12px] font-mono tabular-nums">
-          {value}{suffix ?? ""}
+          {shown}{suffix ?? ""}
         </span>
       </div>
       <p className="text-white/35 text-xs -mt-1">{description}</p>
       <input
+        ref={inputRef}
         type="range"
         min={min}
         max={max}
         step={step}
-        value={value}
-        onChange={(e) => onChange(parseInt(e.target.value, 10))}
+        value={shown}
+        onChange={(e) => {
+          const v = parseInt(e.target.value, 10);
+          activeRef.current = true;
+          draftRef.current = v;
+          setDraft(v);
+        }}
+        onPointerUp={commit}
+        onKeyDown={() => { keyHeldRef.current = true; }}
+        onKeyUp={() => { keyHeldRef.current = false; commit(); }}
+        onBlur={() => { keyHeldRef.current = false; commit(); }}
         className="aura-slider w-full"
         style={{
           ["--val" as never]:      `${(frac * 100).toFixed(2)}%`,
@@ -707,9 +580,8 @@ function SubLangFilterInput({
           }
         }}
         spellCheck={false}
-        className="w-full bg-white/5 border border-white/10 focus:border-white/25
-                   rounded-xl px-4 py-2.5 text-sm font-mono
-                   placeholder:text-white/25 outline-none transition-colors"
+        className="aura-glass-field w-full rounded-xl px-4 py-2.5 text-sm font-mono
+                   placeholder:text-white/25 outline-none"
         style={{ color: "var(--text-primary)" }}
       />
     </div>
@@ -755,12 +627,12 @@ function AudioPriorityInput({
       className="space-y-2"
       data-settings-row=""
       data-settings-label="Audio language priority"
-      data-settings-description="Languages to prefer, in order. original means the title's original language (needs AIOMetadata); codes like en, ja, es match a track's language. English is always the last fallback. Default: original, en."
+      data-settings-description="Languages to prefer, in order. original means the title's original language (needs AIOMetadata, installed on its own or inside AIOStreams); codes like en, ja, es match a track's language. English is always the last fallback. Default: original, en."
     >
       <p className="text-white/75 text-sm font-medium">Audio language priority</p>
       <p className="text-white/35 text-xs -mt-1">
         Languages to prefer, in order. <span className="font-mono text-white/55">original</span> means
-        the title's original language (needs AIOMetadata); codes like en, ja, es match a track's language.
+        the title's original language (needs AIOMetadata, installed on its own or inside AIOStreams); codes like en, ja, es match a track's language.
         English is always the last fallback. Default: <span className="font-mono">original, en</span>.
       </p>
       <input
@@ -773,9 +645,8 @@ function AudioPriorityInput({
           if (e.key === "Enter") (e.currentTarget as HTMLInputElement).blur();
         }}
         spellCheck={false}
-        className="w-full bg-white/5 border border-white/10 focus:border-white/25
-                   rounded-xl px-4 py-2.5 text-sm font-mono
-                   placeholder:text-white/25 outline-none transition-colors"
+        className="aura-glass-field w-full rounded-xl px-4 py-2.5 text-sm font-mono
+                   placeholder:text-white/25 outline-none"
         style={{ color: "var(--text-primary)" }}
       />
     </div>
@@ -800,19 +671,17 @@ function SortableAddonRow({
   const style: React.CSSProperties = {
     transform: CSS.Transform.toString(transform),
     transition,
-    opacity: isDragging ? 0.6 : 1,
-    zIndex: isDragging ? 30 : "auto",
   };
 
+  // A content row, not glass. The dragged row draws a dense face of its
+  // own (.aura-content-row.is-dragging, which also lifts its z-index), so
+  // it stays fully opaque and the rows it passes under never show through.
   return (
     <div
       ref={setNodeRef}
       style={style}
-      className={`flex items-center gap-3 px-3 py-2 rounded-lg
-                  border bg-white/4 hover:bg-white/8 transition-colors
-                  ${isDragging
-                    ? "border-ln-accent/45 bg-ln-accent/15 shadow-[0_8px_24px_-4px_rgba(0,0,0,0.5)]"
-                    : "border-white/10"}`}
+      className={`aura-content-row aura-settings-sort-row flex items-center gap-3 px-3 py-2.5
+                  ${isDragging ? "is-dragging" : ""}`}
     >
       {/* Drag handle - only this element listens for drag activation so the
           "Remove" button stays clickable without grabbing the row. */}
@@ -837,8 +706,7 @@ function SortableAddonRow({
       </div>
       <button
         onClick={onRemove}
-        className="text-white/35 hover:text-white/80 text-xs px-2 py-0.5 rounded
-                   hover:bg-white/8 transition-colors"
+        className="aura-glass-item text-white/35 hover:text-white/80 text-xs px-2 py-0.5 rounded"
       >
         Remove
       </button>
@@ -920,12 +788,12 @@ function HeroCatalogPicker({
       className="space-y-2"
       data-settings-row=""
       data-settings-label="Hero Carousel Source"
-      data-settings-description="Catalog whose items rotate in the Home hero band. Catalogs hidden from Home work too (e.g. AIOMetadata's AI Recommendations or a Trakt list). Default uses your first row; Disable hides the hero."
+      data-settings-description="Catalog whose items rotate in the Home hero band. Catalogs hidden from Home work too (e.g. AIOMetadata's AI Recommendations or an MDBList list). Default uses your first row; Disable hides the hero."
     >
       <p className="text-white/85 text-sm font-medium">Hero Carousel Source</p>
       <p className="text-white/40 text-xs leading-relaxed">
         Catalog whose items rotate in the Home hero band. Catalogs hidden from
-        Home work too (e.g. AIOMetadata's AI Recommendations or a Trakt list).
+        Home work too (e.g. AIOMetadata's AI Recommendations or an MDBList list).
         Default uses your first row; <span className="text-white/65">Disable</span> hides the hero.
       </p>
       <div className="flex flex-wrap gap-2 items-center">
@@ -944,8 +812,8 @@ function HeroCatalogPicker({
             // until a new one is picked, and always re-enables the hero.
             onChange({ disabled: false, catalog: null });
           }}
-          className="bg-white/5 border border-white/10 rounded-lg px-3 py-1.5 text-xs
-                     outline-none focus:border-white/25 transition-colors min-w-[180px]"
+          className="aura-glass-flat aura-glass-select appearance-none cursor-pointer rounded-lg px-3 py-1.5 text-xs
+                     outline-none min-w-[180px]"
           style={{ color: "var(--text-primary)" }}
         >
           <option value={HERO_DISABLE_OPT}>Disable (no hero)</option>
@@ -965,8 +833,8 @@ function HeroCatalogPicker({
                 onChange({ disabled: false, catalog: { addonUrl: selectedUrl, mediaType, catalogId } });
               }
             }}
-            className="bg-white/5 border border-white/10 rounded-lg px-3 py-1.5 text-xs
-                       outline-none focus:border-white/25 transition-colors min-w-[200px]"
+            className="aura-glass-flat aura-glass-select appearance-none cursor-pointer rounded-lg px-3 py-1.5 text-xs
+                     outline-none min-w-[200px]"
             style={{ color: "var(--text-primary)" }}
           >
             <option value="">Pick a catalog</option>
@@ -984,9 +852,8 @@ function HeroCatalogPicker({
           <button
             type="button"
             onClick={() => { setSelectedUrl(null); onChange({ disabled: false, catalog: null }); }}
-            className="px-3 py-1.5 rounded-lg border border-white/15 bg-white/5
-                       text-white/80 text-[11px] font-medium hover:bg-white/10
-                       transition-colors"
+            className="aura-glass-flat aura-glass-press px-3 py-1.5 rounded-lg
+                       text-white/80 text-[11px] font-medium"
           >
             Reset
           </button>
@@ -1057,18 +924,24 @@ function UnifiedHomeSourcesPicker({
         <p className="text-white/30 text-xs italic px-1 py-2">No matching addons installed.</p>
       ) : (
         <div className="space-y-1">
-          <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
-            <SortableContext items={orderedUrls} strategy={verticalListSortingStrategy}>
-              {selectedAddons.map((addon) => (
-                <SortableAddonRow
-                  key={addon.url}
-                  id={addon.url}
-                  addon={addon}
-                  onRemove={() => remove(addon.url)}
-                />
-              ))}
-            </SortableContext>
-          </DndContext>
+          {/* A grouped content list, not glass. DndContext renders no DOM,
+              so each row stays a direct child of the group (separators). */}
+          {selectedAddons.length > 0 && (
+            <div className="aura-content-group">
+              <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
+                <SortableContext items={orderedUrls} strategy={verticalListSortingStrategy}>
+                  {selectedAddons.map((addon) => (
+                    <SortableAddonRow
+                      key={addon.url}
+                      id={addon.url}
+                      addon={addon}
+                      onRemove={() => remove(addon.url)}
+                    />
+                  ))}
+                </SortableContext>
+              </DndContext>
+            </div>
+          )}
 
           {selectedAddons.length === 0 && (
             <p className="text-white/30 text-xs italic px-1 py-2">
@@ -1081,24 +954,25 @@ function UnifiedHomeSourcesPicker({
               <p className="text-white/30 text-[10px] font-semibold tracking-[0.1em] uppercase px-1">
                 Available
               </p>
-              {unselected.map((a) => (
-                <button
-                  key={a.url}
-                  onClick={() => add(a.url)}
-                  className="w-full flex items-center gap-3 px-3 py-2 rounded-lg
-                             hover:bg-white/5 text-left transition-colors"
-                >
-                  <span className="text-white/25 text-xs">＋</span>
-                  <div className="flex-1 min-w-0">
-                    <p className="text-sm font-medium truncate" style={{ color: "var(--text-muted)" }}>
-                      {a.name}
-                    </p>
-                    <p className="text-[10px] text-white/25 font-mono truncate">
-                      {a.url.replace(/^https?:\/\//, "")}
-                    </p>
-                  </div>
-                </button>
-              ))}
+              <div className="aura-content-group">
+                {unselected.map((a) => (
+                  <button
+                    key={a.url}
+                    onClick={() => add(a.url)}
+                    className="aura-content-row w-full flex items-center gap-3 px-3 py-2.5 text-left"
+                  >
+                    <span className="text-white/25 text-xs">＋</span>
+                    <div className="flex-1 min-w-0">
+                      <p className="text-sm font-medium truncate" style={{ color: "var(--text-muted)" }}>
+                        {a.name}
+                      </p>
+                      <p className="text-[10px] text-white/25 font-mono truncate">
+                        {a.url.replace(/^https?:\/\//, "")}
+                      </p>
+                    </div>
+                  </button>
+                ))}
+              </div>
             </div>
           )}
         </div>
@@ -1137,12 +1011,8 @@ interface AuraStats {
 // base64 / paste base64 / pick file).
 // ---------------------------------------------------------------------------
 
-/** update_settings' answers for a patch it will not take (settings.rs), as
- *  opposed to a save that failed: only these are worth retrying per field. */
-function isPatchRejection(e: unknown): boolean {
-  const message = String(e);
-  return message.startsWith("Invalid settings patch") || message.startsWith("Unknown theme");
-}
+const RERUN_SETUP_DESCRIPTION =
+  "Walk through the first-run setup again: theme, playback, addons and tracking. Nothing is reset.";
 
 function BackupRestoreSection({
   backend, addons, onApply, onResetComplete,
@@ -1187,7 +1057,11 @@ function BackupRestoreSection({
     try {
       // Backend wipe via the reset_settings Tauri command (writes a
       // fresh AppSettings::default() to disk and returns the snapshot).
-      await invoke<BackendSettings>("reset_settings");
+      const reset = await invoke<BackendSettings>("reset_settings");
+      // The reset also rewrote this machine's HDR fields (render.json) to
+      // the defaults; push the mode to the player and tell this page and
+      // the bell offer, as every other HDR write does (hdrMode.ts).
+      void applyStoredHdrMode(hdrModeOf(reset as unknown as Record<string, unknown>));
       // Frontend wipe - drop the localStorage-backed AuraSettings so
       // home/meta/stream/search overrides return to manifest-id
       // defaults instead of pointing at whatever the user had pinned.
@@ -1281,95 +1155,14 @@ function BackupRestoreSection({
       return;
     }
     try {
-      // Redirect imported API keys away from settings.json (where
-      // they'd remain readable to anyone with filesystem access) and
-      // into the OS keyring. We mutate a copy of blob.backend so the
-      // backend patch sent to onApply has the key fields stripped.
-      const backendPatch = { ...(blob.backend as Record<string, unknown>) };
-      const importedKeys: [string, string][] = [];
-      for (const name of ["opensubtitles", "tmdb", "introdb"] as const) {
-        const field = `${name}_api_key`;
-        const value = typeof backendPatch[field] === "string"
-          ? backendPatch[field] as string : "";
-        // Strip unconditionally, even when empty: `tmdb_api_key` is not a
-        // BackendSettings field at all, and an unknown key must not ride along
-        // into the settings.json patch.
-        delete backendPatch[field];
-        if (value.trim()) importedKeys.push([name, value.trim()]);
-      }
-
-      // update_settings deserializes the merged object as one unit, so one bad
-      // field rejects the whole patch. Field by field only then: each call
-      // rewrites settings.json. A failed SAVE is not retried, it ends the import.
-      const backendKeys = Object.keys(backendPatch);
-      const rejected: string[] = [];
-      if (backendKeys.length > 0) {
-        try {
-          await onApply(backendPatch as Partial<BackendSettings>);
-        } catch (e) {
-          if (!isPatchRejection(e)) throw e;
-          for (const key of backendKeys) {
-            try {
-              await onApply({ [key]: backendPatch[key] } as Partial<BackendSettings>);
-            } catch (fieldError) {
-              if (!isPatchRejection(fieldError)) throw fieldError;
-              rejected.push(key);
-            }
-          }
-        }
-      }
-
-      // Now write the imported keys to the keyring. Best-effort -
-      // if the keyring fails (Linux without Secret Service), nothing
-      // is left in settings.json either (the user can re-paste the
-      // key manually). Skip empty values so we don't overwrite an
-      // existing keyring entry with nothing.
-      let keysWritten = 0;
-      for (const [name, value] of importedKeys) {
-        await invoke("set_api_key", { name, value }).then(() => { keysWritten += 1; }, () => {});
-      }
-      if (importedKeys.length > 0) {
-        window.dispatchEvent(new CustomEvent("aura:api-keys-changed"));
-      }
-      // Aura-side portable subset. Import is additive: any field
-      // present in the blob overwrites; missing fields keep their
-      // current value. Provider lists go through resolveProviders so
-      // the imported manifest_ids resolve to the importing user's
-      // actual addon URLs (and unresolvable ids drop with a count).
-      const current = loadAuraSettings();
-      const next = { ...current };
-      if (blob.aura) {
-        // blob.aura is already whitelisted to PORTABLE_AURA_FIELDS (and is
-        // addon-URL-independent), so merge every field present. Each value is
-        // re-validated + clamped by readFromStorage() on the next load, so a
-        // malformed imported field can't corrupt state. (Addon-dependent
-        // provider fields arrive separately via resolveProviders below.)
-        Object.assign(next, blob.aura);
-      }
-      const { aura: providerAura, unresolved, ambiguous } = resolveProviders(blob.providers, addons);
-      // Each resolved provider field overlays the current Aura
-      // settings. The resolveProviders return shape uses the same
-      // field names as AuraSettings, so a direct merge applies.
-      Object.assign(next, providerAura);
-      saveAuraSettings(next);
-      // What actually landed, not what the blob held.
-      const fields =
-        backendKeys.length - rejected.length
-        + keysWritten
-        + Object.keys(blob.aura ?? {}).length
-        + Object.keys(providerAura).length;
-      const notes: string[] = [];
-      if (unresolved > 0) {
-        notes.push(`${unresolved} provider id${unresolved === 1 ? "" : "s"} skipped, not installed`);
-      }
-      if (ambiguous > 0) {
-        notes.push(`${ambiguous} provider choice${ambiguous === 1 ? "" : "s"} matched another install of the same addon, check Settings`);
-      }
-      const tail = notes.length > 0 ? ` (${notes.join("; ")})` : "";
-      const imported = `Imported ${fields} setting${fields === 1 ? "" : "s"}`;
-      setStatus(rejected.length > 0
-        ? { kind: "error", message: `${imported}; could not apply: ${rejected.join(", ")}${tail}.` }
-        : { kind: "ok", message: `${imported}${tail}.` });
+      // Keys to the keyring, the backend patch (retried field by field on a
+      // rejection), the Aura merge and the provider ids: all in
+      // applySettingsImport (settingsTransfer.ts, shared with the first-run
+      // setup).
+      const summary = await applySettingsImport(
+        blob, addons, (patch) => onApply(patch as Partial<BackendSettings>),
+      );
+      setStatus(importSummaryStatus(summary));
     } catch (e) {
       setStatus({ kind: "error", message: `Import failed: ${String(e)}` });
     }
@@ -1414,18 +1207,16 @@ function BackupRestoreSection({
           <button
             type="button"
             onClick={downloadFile}
-            className="px-3 py-1.5 rounded-lg border border-white/15 bg-white/5
-                       text-white/80 text-[12px] font-medium tracking-wide
-                       hover:bg-white/10 transition-colors"
+            className="aura-glass-flat aura-glass-press px-3 py-1.5 rounded-lg
+                       text-white/80 text-[12px] font-medium tracking-wide"
           >
             Download as file
           </button>
           <button
             type="button"
             onClick={buildAndShow}
-            className="px-3 py-1.5 rounded-lg border border-white/15 bg-white/5
-                       text-white/80 text-[12px] font-medium tracking-wide
-                       hover:bg-white/10 transition-colors"
+            className="aura-glass-flat aura-glass-press px-3 py-1.5 rounded-lg
+                       text-white/80 text-[12px] font-medium tracking-wide"
           >
             Show as string
           </button>
@@ -1437,9 +1228,8 @@ function BackupRestoreSection({
                   .then(() => setStatus({ kind: "ok", message: "Copied to clipboard." }))
                   .catch(() => setStatus({ kind: "error", message: "Clipboard write failed." }));
               }}
-              className="px-3 py-1.5 rounded-lg border border-ln-accent/40 bg-ln-accent/15
-                         text-ln-accent text-[12px] font-medium tracking-wide
-                         hover:bg-ln-accent/25 transition-colors"
+              className="aura-glass-flat aura-glass-press is-primary px-3 py-1.5 rounded-lg
+                         text-[12px] font-medium tracking-wide"
             >
               Copy
             </button>
@@ -1449,7 +1239,7 @@ function BackupRestoreSection({
           <textarea
             readOnly
             value={exportText}
-            className="w-full h-24 bg-black/40 border border-white/10 rounded-md px-3 py-2
+            className="aura-glass-field w-full h-24 rounded-md px-3 py-2
                        text-[11px] font-mono text-white/70 outline-none
                        resize-none break-all"
             onFocus={(e) => e.currentTarget.select()}
@@ -1466,9 +1256,9 @@ function BackupRestoreSection({
           value={importText}
           onChange={(e) => setImportText(e.target.value)}
           placeholder="Paste an export string here"
-          className="w-full h-24 bg-black/40 border border-white/10 rounded-md px-3 py-2
+          className="aura-glass-field w-full h-24 rounded-md px-3 py-2
                      text-[11px] font-mono text-white/85 outline-none
-                     focus:border-white/25 transition-colors resize-none break-all"
+                     resize-none break-all"
           spellCheck={false}
         />
         <div className="flex gap-2">
@@ -1476,19 +1266,17 @@ function BackupRestoreSection({
             type="button"
             disabled={!importText.trim()}
             onClick={() => applyText(importText)}
-            className="px-3 py-1.5 rounded-lg border border-ln-accent/40 bg-ln-accent/15
-                       text-ln-accent text-[12px] font-medium tracking-wide
-                       hover:bg-ln-accent/25 disabled:opacity-40 disabled:cursor-not-allowed
-                       transition-colors"
+            className="aura-glass-flat aura-glass-press is-primary px-3 py-1.5 rounded-lg
+                       text-[12px] font-medium tracking-wide
+                       disabled:opacity-40 disabled:cursor-not-allowed"
           >
             Apply pasted string
           </button>
           <button
             type="button"
             onClick={() => fileInputRef.current?.click()}
-            className="px-3 py-1.5 rounded-lg border border-white/15 bg-white/5
-                       text-white/80 text-[12px] font-medium tracking-wide
-                       hover:bg-white/10 transition-colors"
+            className="aura-glass-flat aura-glass-press px-3 py-1.5 rounded-lg
+                       text-white/80 text-[12px] font-medium tracking-wide"
           >
             Import from file…
           </button>
@@ -1511,6 +1299,31 @@ function BackupRestoreSection({
           {status.message}
         </p>
       )}
+
+      <div className="h-px bg-white/6" />
+
+      {/* ── Run setup again ──
+          Re-opens the first-run wizard. Every step there reads and writes
+          the live settings, so nothing is reset by opening it. */}
+      <div
+        className="flex items-center justify-between gap-4"
+        data-settings-row=""
+        data-settings-label="Run setup again"
+        data-settings-description={RERUN_SETUP_DESCRIPTION}
+      >
+        <div className="flex-1 min-w-0">
+          <p className="text-white/75 text-sm font-medium">Run setup again</p>
+          <p className="text-white/35 text-xs mt-0.5">{RERUN_SETUP_DESCRIPTION}</p>
+        </div>
+        <button
+          type="button"
+          onClick={() => requestRerunOnboarding()}
+          className="aura-glass-flat aura-glass-press flex-shrink-0 px-3 py-1.5 rounded-lg
+                     text-white/80 text-[12px] font-medium tracking-wide"
+        >
+          Run setup again
+        </button>
+      </div>
 
       <div className="h-px bg-white/6" />
 
@@ -1549,11 +1362,8 @@ function BackupRestoreSection({
             type="button"
             onClick={resetArmed ? confirmReset : armReset}
             className={[
-              "px-3 py-1.5 rounded-lg text-[12px] font-medium tracking-wide",
-              "border transition-colors",
-              resetArmed
-                ? "border-rose-300/60 bg-rose-500/25 text-rose-100 hover:bg-rose-500/35"
-                : "border-rose-400/30 bg-rose-500/10 text-rose-300 hover:bg-rose-500/20",
+              "aura-glass-flat aura-glass-press is-danger px-3 py-1.5 rounded-lg text-[12px] font-medium tracking-wide",
+              resetArmed ? "is-strong" : "",
             ].join(" ")}
           >
             {resetArmed ? "Click again within 5 s to confirm" : "Reset all settings"}
@@ -1750,9 +1560,9 @@ function LocalDataBackupsSubsection() {
         type="button"
         disabled={busy}
         onClick={() => setConfirmRestore(meta)}
-        className="px-2.5 py-1 rounded-md border border-ln-accent/30 bg-ln-accent/10
-                   text-ln-accent text-[11px] font-medium hover:bg-ln-accent/20
-                   disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+        className="aura-glass-flat aura-glass-press is-primary px-2.5 py-1 rounded-md
+                   text-[11px] font-medium
+                   disabled:opacity-40 disabled:cursor-not-allowed"
       >
         Restore
       </button>
@@ -1760,9 +1570,9 @@ function LocalDataBackupsSubsection() {
         type="button"
         disabled={busy}
         onClick={() => setConfirmDelete(meta)}
-        className="px-2.5 py-1 rounded-md border border-rose-400/30 bg-rose-500/10
-                   text-rose-300 text-[11px] font-medium hover:bg-rose-500/20
-                   disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+        className="aura-glass-flat aura-glass-press is-danger px-2.5 py-1 rounded-md
+                   text-[11px] font-medium
+                   disabled:opacity-40 disabled:cursor-not-allowed"
       >
         Delete
       </button>
@@ -1787,10 +1597,9 @@ function LocalDataBackupsSubsection() {
           type="button"
           disabled={busy}
           onClick={onCreate}
-          className="px-3 py-1.5 rounded-lg border border-white/15 bg-white/5
+          className="aura-glass-flat aura-glass-press px-3 py-1.5 rounded-lg
                      text-white/80 text-[12px] font-medium tracking-wide
-                     hover:bg-white/10 disabled:opacity-40 disabled:cursor-not-allowed
-                     transition-colors"
+                     disabled:opacity-40 disabled:cursor-not-allowed"
         >
           Create snapshot now
         </button>
@@ -1893,22 +1702,25 @@ function ConfirmModal({
     return () => window.removeEventListener("keydown", onKey);
   }, [onCancel]);
 
+  // Tone rides the glass hooks (aura-glass-tone-*, glass-settings.css): a
+  // ring-* utility on a glass surface would be overridden by its box-shadow.
   const accent = tone === "danger"
-    ? { ring: "ring-rose-400/40", btn: "border-rose-300/60 bg-rose-500/30 text-rose-50 hover:bg-rose-500/45", icon: "text-rose-300" }
-    : { ring: "ring-amber-400/40", btn: "border-amber-300/60 bg-amber-500/30 text-amber-50 hover:bg-amber-500/45", icon: "text-amber-300" };
+    ? { ring: "aura-glass-tone-danger", btn: "is-danger is-strong", icon: "text-rose-300" }
+    : { ring: "aura-glass-tone-warning", btn: "is-warning is-strong", icon: "text-amber-300" };
 
   const node = (
     <div
-      className="fixed inset-0 z-[10000] flex items-center justify-center p-6 bg-black/60 backdrop-blur-sm
-                 animate-[fade-in_120ms_ease-out]"
+      className="fixed inset-0 z-[10000] flex items-center justify-center p-6"
       onClick={onCancel}
     >
+      {/* Dim + blur on a sibling layer: on the wrapper it would blind the
+          card's own glass (an ancestor backdrop-filter is a backdrop root). */}
+      <div aria-hidden className="aura-modal-backdrop-in absolute inset-0 bg-black/60 backdrop-blur-sm" />
       <div
         role="dialog"
         aria-modal="true"
         onClick={(e) => e.stopPropagation()}
-        className={`max-w-[400px] w-full rounded-2xl bg-zinc-900/95 border border-white/15 ${accent.ring}
-                    shadow-glass-edge ring-1 p-6 space-y-4`}
+        className={`aura-float-glass aura-modal-card-in relative max-w-[400px] w-full rounded-2xl ${accent.ring} p-6 space-y-4`}
       >
         <div className="flex items-start gap-3">
           <span className={`flex-shrink-0 mt-0.5 text-2xl leading-none ${accent.icon}`} aria-hidden>
@@ -1923,8 +1735,8 @@ function ConfirmModal({
           <button
             type="button"
             onClick={onCancel}
-            className="px-4 py-1.5 rounded-lg border border-white/15 bg-white/5
-                       text-white/80 text-[12px] font-medium hover:bg-white/10 transition-colors"
+            className="aura-glass-flat aura-glass-press px-4 py-1.5 rounded-lg
+                       text-white/80 text-[12px] font-medium"
           >
             Cancel
           </button>
@@ -1932,7 +1744,7 @@ function ConfirmModal({
             type="button"
             onClick={onConfirm}
             autoFocus
-            className={`px-4 py-1.5 rounded-lg border text-[12px] font-medium transition-colors ${accent.btn}`}
+            className={`aura-glass-flat aura-glass-press ${accent.btn} px-4 py-1.5 rounded-lg text-[12px] font-medium`}
           >
             {confirmLabel}
           </button>
@@ -1946,6 +1758,40 @@ function ConfirmModal({
 /** Lead-time row for the Next-Up CTA. Rendered as a labelled number
  *  field with chip-style presets (off / 30 / 60 / 90 / 120 s) so the
  *  common cases are one click away while still allowing custom values. */
+/** "Real glass over video": the switch, plus an honest note when this GPU
+ *  could not run the shader (the engine's vo-passes check, glass.rs). The
+ *  status is re-asked whenever the switch or the engine's glass state moves.
+ *  On a High Contrast theme the shader never draws (realGlass.ts), so the
+ *  switch can be turned off there but not on. */
+function RealGlassRow({ value, onChange }: { value: boolean; onChange: (v: boolean) => void }) {
+  const glass = useRealGlassState();
+  const floor = useGlassState().contrastFloor;
+  const [available, setAvailable] = useState(true);
+  useEffect(() => {
+    let alive = true;
+    void realGlassAvailable().then((a) => { if (alive) setAvailable(a); });
+    return () => { alive = false; };
+  }, [value, glass]);
+  let description =
+    "Experimental. Blurs the actual video behind the player's control bar and open menus so the picture "
+    + "shows through like glass; bright scenes are toned down under the controls to keep them readable. "
+    + "Each time the controls appear or hide it may cause a small hitch on HDR video with motion smoothing on. "
+    + "Black bars around the picture keep the normal tint. Stays on this device.";
+  if (floor) description += " Not used on the High Contrast themes, which keep the solid player background.";
+  if (value && !available) {
+    description += " Not available on this system: the graphics card could not run the glass effect, so the player keeps its normal look.";
+  }
+  return (
+    <SettingToggle
+      label="Real glass over video"
+      description={description}
+      value={value}
+      onChange={onChange}
+      disabled={floor && !value}
+    />
+  );
+}
+
 function HdrPeakNitsRow({
   value, onChange,
 }: { value: number; onChange: (v: number) => void }) {
@@ -1959,36 +1805,23 @@ function HdrPeakNitsRow({
       className="space-y-2"
       data-settings-row=""
       data-settings-label="HDR display peak (nits)"
-      data-settings-description="Passthrough only: the peak brightness HDR is tone-mapped to. Leave on Auto unless highlights look blown out (common on OLEDs in DisplayHDR True Black mode; try 400-465)."
+      data-settings-description="The peak brightness HDR is tone-mapped to in Send HDR (passthrough) mode. Leave on Auto unless highlights look blown out (common on OLEDs in DisplayHDR True Black mode; try 400-465)."
     >
       <div>
         <p className="text-white/75 text-sm font-medium">HDR display peak (nits)</p>
         <p className="text-white/35 text-xs mt-0.5">
-          The peak brightness HDR is tone-mapped to in Passthrough. Leave on
-          Auto unless highlights look blown out (common on OLEDs in DisplayHDR
-          True Black mode; try 400-465).
+          The peak brightness HDR is tone-mapped to in Send HDR (passthrough)
+          mode. Leave on Auto unless highlights look blown out (common on OLEDs
+          in DisplayHDR True Black mode; try 400-465).
         </p>
       </div>
       <div className="flex items-center gap-2 flex-wrap">
-        {PRESETS.map((p) => {
-          const active = clamped === p;
-          const label = p === 0 ? "Auto" : `${p}`;
-          return (
-            <button
-              key={p}
-              type="button"
-              onClick={() => onChange(p)}
-              className={[
-                "px-3 py-1 rounded-full text-[12px] font-medium border transition-colors",
-                active
-                  ? "bg-ln-accent/20 text-ln-accent border-ln-accent/40"
-                  : "bg-white/5 text-white/65 border-white/10 hover:bg-white/10",
-              ].join(" ")}
-            >
-              {label}
-            </button>
-          );
-        })}
+        <SegmentedControl<string>
+          value={String(clamped)}
+          options={PRESETS.map((p) => ({ value: String(p), label: p === 0 ? "Auto" : `${p}` }))}
+          onChange={(v) => onChange(Number(v))}
+          ariaLabel="HDR display peak presets"
+        />
         <div className="flex items-center gap-2 ml-1 text-[12px]">
           <input
             type="number"
@@ -1999,8 +1832,8 @@ function HdrPeakNitsRow({
               const n = Number(e.target.value);
               if (Number.isFinite(n)) onChange(Math.max(0, Math.min(10000, Math.round(n))));
             }}
-            className="w-20 bg-white/5 border border-white/10 rounded-lg px-2 py-1
-                       text-white/85 outline-none focus:border-white/25 transition-colors
+            className="aura-glass-field w-20 rounded-lg px-2 py-1
+                       text-white/85 outline-none
                        text-center tabular-nums"
           />
           <span className="text-white/40">nits (0 = auto)</span>
@@ -2032,25 +1865,12 @@ function NextUpLeadTimeRow({
         </p>
       </div>
       <div className="flex items-center gap-2 flex-wrap">
-        {PRESETS.map((p) => {
-          const active = clamped === p;
-          const label = p === 0 ? "Off" : `${p}s`;
-          return (
-            <button
-              key={p}
-              type="button"
-              onClick={() => onChange(p)}
-              className={[
-                "px-3 py-1 rounded-full text-[12px] font-medium border transition-colors",
-                active
-                  ? "bg-ln-accent/20 text-ln-accent border-ln-accent/40"
-                  : "bg-white/5 text-white/65 border-white/10 hover:bg-white/10",
-              ].join(" ")}
-            >
-              {label}
-            </button>
-          );
-        })}
+        <SegmentedControl<string>
+          value={String(clamped)}
+          options={PRESETS.map((p) => ({ value: String(p), label: p === 0 ? "Off" : `${p}s` }))}
+          onChange={(v) => onChange(Number(v))}
+          ariaLabel="Next-Up lead time presets"
+        />
         <div className="flex items-center gap-2 ml-1 text-[12px]">
           <input
             type="number"
@@ -2061,8 +1881,8 @@ function NextUpLeadTimeRow({
               const n = Number(e.target.value);
               if (Number.isFinite(n)) onChange(Math.max(0, Math.min(300, Math.round(n))));
             }}
-            className="w-16 bg-white/5 border border-white/10 rounded-lg px-2 py-1
-                       text-white/85 outline-none focus:border-white/25 transition-colors
+            className="aura-glass-field w-16 rounded-lg px-2 py-1
+                       text-white/85 outline-none
                        text-center tabular-nums"
           />
           <span className="text-white/40">seconds</span>
@@ -2101,24 +1921,12 @@ function AutoAdvanceDelayRow({
         </p>
       </div>
       <div className="flex items-center gap-2 flex-wrap">
-        {PRESETS.map((p) => {
-          const active = clamped === p;
-          return (
-            <button
-              key={p}
-              type="button"
-              onClick={() => onChange(p)}
-              className={[
-                "px-3 py-1 rounded-full text-[12px] font-medium border transition-colors",
-                active
-                  ? "bg-ln-accent/20 text-ln-accent border-ln-accent/40"
-                  : "bg-white/5 text-white/65 border-white/10 hover:bg-white/10",
-              ].join(" ")}
-            >
-              {p}s
-            </button>
-          );
-        })}
+        <SegmentedControl<string>
+          value={String(clamped)}
+          options={PRESETS.map((p) => ({ value: String(p), label: `${p}s` }))}
+          onChange={(v) => onChange(Number(v))}
+          ariaLabel="Auto-advance delay presets"
+        />
         <div className="flex items-center gap-2 ml-1 text-[12px]">
           <input
             type="number"
@@ -2129,8 +1937,8 @@ function AutoAdvanceDelayRow({
               const n = Number(e.target.value);
               if (Number.isFinite(n)) onChange(Math.max(5, Math.min(30, Math.round(n))));
             }}
-            className="w-16 bg-white/5 border border-white/10 rounded-lg px-2 py-1
-                       text-white/85 outline-none focus:border-white/25 transition-colors
+            className="aura-glass-field w-16 rounded-lg px-2 py-1
+                       text-white/85 outline-none
                        text-center tabular-nums"
           />
           <span className="text-white/40">seconds</span>
@@ -2244,9 +2052,8 @@ function KeyringApiKeyInput({
           }}
           spellCheck={false}
           autoComplete="off"
-          className={`w-full bg-white/5 border border-white/10 rounded-xl px-4 py-2.5 pr-20
+          className={`aura-glass-field w-full rounded-xl px-4 py-2.5 pr-20
                       text-sm font-mono placeholder:text-white/25 outline-none
-                      focus:border-white/25 transition-colors
                       ${!loaded ? "opacity-50" : ""}`}
           style={{ color: "var(--text-primary)" }}
         />
@@ -2254,12 +2061,11 @@ function KeyringApiKeyInput({
           type="button"
           onClick={() => setRevealed((r) => !r)}
           disabled={value.length === 0}
-          className="absolute right-2 top-1/2 -translate-y-1/2
+          className="aura-glass-flat absolute right-2 top-1/2 -translate-y-1/2
                      px-2 py-1 rounded-md text-[10.5px] font-medium tracking-wide
-                     bg-white/5 text-white/55 border border-white/10
-                     hover:bg-white/10 hover:text-white
-                     disabled:opacity-30 disabled:hover:bg-white/5
-                     transition-colors"
+                     text-white/55
+                     hover:text-white
+                     disabled:opacity-30"
         >
           {revealed ? "Hide" : "Show"}
         </button>
@@ -2361,7 +2167,7 @@ function CloudSyncSection({ authKey }: { authKey: string | null }) {
     try {
       const { syncPullAll } = await import("../sync");
       await syncPullAll();
-      showAppToast("Cloud Sync pulled successfully", { duration: 2500 });
+      showAppToast("Cloud Sync pulled successfully", { duration: 2500, scope: SETTINGS_TOAST_SCOPE });
       await refresh();
     } catch (e) {
       showAppToast(`Pull failed: ${String(e)}`, { duration: 4000 });
@@ -2379,7 +2185,7 @@ function CloudSyncSection({ authKey }: { authKey: string | null }) {
       // cast at the boundary since we already validated against the
       // server's response (which only returns canonical names).
       await syncPushNow(ns as Parameters<typeof syncPushNow>[0]);
-      showAppToast(`Pushed ${NAMESPACE_LABEL[ns] ?? ns}`, { duration: 2000 });
+      showAppToast(`Pushed ${NAMESPACE_LABEL[ns] ?? ns}`, { duration: 2000, scope: SETTINGS_TOAST_SCOPE });
       await refresh();
     } catch (e) {
       showAppToast(`Push failed: ${String(e)}`, { duration: 4000 });
@@ -2395,7 +2201,7 @@ function CloudSyncSection({ authKey }: { authKey: string | null }) {
     try {
       const { syncPurge } = await import("../sync");
       await syncPurge();
-      showAppToast("Cloud Sync data cleared", { duration: 2500 });
+      showAppToast("Cloud Sync data cleared", { duration: 2500, scope: SETTINGS_TOAST_SCOPE });
       await refresh();
     } catch (e) {
       showAppToast(`Purge failed: ${String(e)}`, { duration: 4000 });
@@ -2423,9 +2229,8 @@ function CloudSyncSection({ authKey }: { authKey: string | null }) {
           <button
             type="button"
             onClick={() => window.dispatchEvent(new CustomEvent("aura:show-login"))}
-            className="mt-1 px-3 py-1.5 rounded-lg border border-ln-accent/45 bg-ln-accent/15
-                       text-ln-accent text-[12px] font-semibold tracking-wide
-                       hover:bg-ln-accent/25 transition-colors"
+            className="aura-glass-flat aura-glass-press is-primary mt-1 px-3 py-1.5 rounded-lg
+                       text-[12px] font-semibold tracking-wide"
           >
             Sign in to Stremio
           </button>
@@ -2451,8 +2256,8 @@ function CloudSyncSection({ authKey }: { authKey: string | null }) {
               <button
                 type="button"
                 onClick={() => void refresh()}
-                className="px-3 py-1.5 rounded-md border border-white/15 bg-white/5 text-white/75
-                           hover:bg-white/10 transition-colors text-[11px] font-medium"
+                className="aura-glass-flat aura-glass-press px-3 py-1.5 rounded-md text-white/75
+                           text-[11px] font-medium"
               >
                 Retry
               </button>
@@ -2531,11 +2336,10 @@ function CloudSyncSection({ authKey }: { authKey: string | null }) {
                     type="button"
                     disabled={busyAction !== null}
                     onClick={() => void handlePushNamespace(ns.name)}
-                    className="px-2 py-1 rounded-md text-[10.5px] font-medium tracking-wide
-                               bg-white/5 text-white/65 border border-white/10
-                               hover:bg-white/10 hover:text-white
-                               disabled:opacity-40 disabled:cursor-not-allowed
-                               transition-colors"
+                    className="aura-glass-flat aura-glass-press px-2 py-1 rounded-md text-[10.5px] font-medium tracking-wide
+                               text-white/65
+                               hover:text-white
+                               disabled:opacity-40 disabled:cursor-not-allowed"
                   >
                     {busyAction === "push" ? "…" : "Push"}
                   </button>
@@ -2551,9 +2355,8 @@ function CloudSyncSection({ authKey }: { authKey: string | null }) {
             type="button"
             disabled={busyAction !== null}
             onClick={() => void handlePullNow()}
-            className="px-3 py-1.5 rounded-lg border border-ln-accent/40 bg-ln-accent/15
-                       text-ln-accent text-[11.5px] font-semibold tracking-wide
-                       hover:bg-ln-accent/25 transition-colors
+            className="aura-glass-flat aura-glass-press is-primary px-3 py-1.5 rounded-lg
+                       text-[11.5px] font-semibold tracking-wide
                        disabled:opacity-50 disabled:cursor-progress"
           >
             {busyAction === "pull" ? "Pulling…" : "Pull now"}
@@ -2562,11 +2365,9 @@ function CloudSyncSection({ authKey }: { authKey: string | null }) {
             type="button"
             disabled={busyAction !== null || status.namespaces.length === 0}
             onClick={() => setPurgeConfirm(true)}
-            className="px-3 py-1.5 rounded-lg border border-rose-400/35 bg-rose-500/10
-                       text-rose-300/95 text-[11.5px] font-medium tracking-wide
-                       hover:bg-rose-500/20 hover:border-rose-400/50
-                       disabled:opacity-40 disabled:cursor-not-allowed
-                       transition-colors"
+            className="aura-glass-flat aura-glass-press is-danger px-3 py-1.5 rounded-lg
+                       text-[11.5px] font-medium tracking-wide
+                       disabled:opacity-40 disabled:cursor-not-allowed"
           >
             Clear cloud sync data
           </button>
@@ -2579,9 +2380,13 @@ function CloudSyncSection({ authKey }: { authKey: string | null }) {
 
         {/* Purge confirm modal */}
         {purgeConfirm && (
-          <div className="fixed inset-0 z-[200] flex items-center justify-center bg-black/60 backdrop-blur-sm">
-            <div className="max-w-[400px] mx-4 rounded-2xl bg-black/90 border border-white/12 p-5 space-y-3
-                            shadow-[0_18px_42px_-12px_rgba(0,0,0,0.75)]">
+          <div className="fixed inset-0 z-[200] flex items-center justify-center">
+            <div aria-hidden className="aura-modal-backdrop-in absolute inset-0 bg-black/60 backdrop-blur-sm" />
+            <div
+              role="dialog"
+              aria-modal="true"
+              className="aura-float-glass aura-modal-card-in relative max-w-[400px] mx-4 rounded-2xl p-5 space-y-3"
+            >
               <h3 className="text-white/95 text-sm font-semibold tracking-wide">Clear cloud sync data?</h3>
               <p className="text-white/55 text-xs leading-relaxed">
                 Permanently deletes everything synced to Aura Cloud. This device keeps its settings, queue and marks, and other devices get this device's copy on their next sync.
@@ -2590,18 +2395,16 @@ function CloudSyncSection({ authKey }: { authKey: string | null }) {
                 <button
                   type="button"
                   onClick={() => setPurgeConfirm(false)}
-                  className="px-3 py-1.5 rounded-lg border border-white/15 bg-white/5
-                             text-white/75 text-[11px] font-medium hover:bg-white/10
-                             transition-colors"
+                  className="aura-glass-flat aura-glass-press px-3 py-1.5 rounded-lg
+                             text-white/75 text-[11px] font-medium"
                 >
                   Cancel
                 </button>
                 <button
                   type="button"
                   onClick={() => void handlePurge()}
-                  className="px-3 py-1.5 rounded-lg border border-rose-400/45 bg-rose-500/20
-                             text-rose-200 text-[11px] font-semibold hover:bg-rose-500/30
-                             transition-colors"
+                  className="aura-glass-flat aura-glass-press is-danger px-3 py-1.5 rounded-lg
+                             text-[11px] font-semibold"
                 >
                   Clear data
                 </button>
@@ -2638,489 +2441,8 @@ function formatAgo(diffMs: number): string {
   return `${yr}y ago`;
 }
 
-// ---------------------------------------------------------------------------
-// Debug Panel - engine + mpv diagnostics + off-focus drop-rate test.
-//
-// Surfaced as a modal overlay opened from a button in the About section
-// rather than a Settings section. It's a diagnostic tool, not a setting,
-// and the modal pattern means the test runner can load a synthetic test
-// pattern + manage its own playback lifecycle without the user needing
-// to set up a stream and navigate back to Settings to run the test.
-// ---------------------------------------------------------------------------
-
-interface DebugEngineSnapshot {
-  engine: {
-    mpv_active: boolean;
-    mpv_running: boolean;
-    present_mode: string | null;
-  };
-  window: {
-    available: boolean;
-    hwnd_hex?: string;
-    is_foreground?: boolean;
-    is_visible?: boolean;
-    is_iconic?: boolean;
-    is_cloaked?: boolean;
-    cloak_reason?: number;
-    reason?: string;
-  };
-  mpv: {
-    video_codec?: string | null;
-    video_format?: string | null;
-    video_w?: number | null;
-    video_h?: number | null;
-    fps?: number | null;
-    estimated_vf_fps?: number | null;
-    display_fps?: number | null;
-    hwdec_current?: string | null;
-    audio_codec?: string | null;
-    pixelformat?: string | null;
-    primaries?: string | null;
-    gamma?: string | null;
-    hdr_detected?: boolean;
-    hdr_kind?: string | null;
-    dv_profile?: number | null;
-    dv_detected?: boolean;
-    frame_drop_count?: number | null;
-    decoder_frame_drop_count?: number | null;
-    vo_delayed_frame_count?: number | null;
-    paused?: boolean;
-    time_pos?: number | null;
-    duration?: number | null;
-    volume?: number | null;
-    speed?: number | null;
-  } | null;
-}
-
-interface DropTestResult {
-  duration_secs: number;
-  initial_mode: string | null;
-  final_mode: string | null;
-  start_drop_count_vo: number;
-  end_drop_count_vo: number;
-  delta_vo: number;
-  rate_vo: number;
-  start_drop_count_dec: number;
-  end_drop_count_dec: number;
-  delta_dec: number;
-  rate_dec: number;
-  verdict: "clean" | "minor" | "drops";
-}
-
-function DebugOverlay({ open, onClose }: { open: boolean; onClose: () => void }) {
-  const [snap, setSnap] = useState<DebugEngineSnapshot | null>(null);
-  const [snapError, setSnapError] = useState<string | null>(null);
-  const [running, setRunning] = useState(false);
-  const [duration, setDuration] = useState<number>(15);
-  const [result, setResult] = useState<DropTestResult | null>(null);
-  const [testError, setTestError] = useState<string | null>(null);
-  const [copied, setCopied] = useState(false);
-  const [loadingPattern, setLoadingPattern] = useState(false);
-
-  // Live 1 Hz polling of the engine snapshot. Only polls while the
-  // overlay is open - closing the overlay tears down the interval.
-  useEffect(() => {
-    if (!open) return;
-    let cancelled = false;
-    const tick = () => {
-      invoke<DebugEngineSnapshot>("debug_engine_state")
-        .then((s) => {
-          if (cancelled) return;
-          setSnap(s);
-          setSnapError(null);
-        })
-        .catch((e) => {
-          if (cancelled) return;
-          setSnapError(String(e));
-        });
-    };
-    tick();
-    const h = setInterval(tick, 1000);
-    return () => {
-      cancelled = true;
-      clearInterval(h);
-    };
-  }, [open]);
-
-  // Esc closes the overlay; backdrop click closes too (the click
-  // handler on the wrapper div). Both routes share the same path so
-  // playback can keep running if it was loaded by the test.
-  useEffect(() => {
-    if (!open) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape" && !running) {
-        e.stopPropagation();
-        onClose();
-      }
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [open, running, onClose]);
-
-  const loadPattern = useCallback(async () => {
-    setLoadingPattern(true);
-    setTestError(null);
-    try {
-      // Stop whatever's currently playing first. mpv's loadfile-replace
-      // already swaps files, but the user reported repeated loads
-      // appearing to "stack and brighten" - likely a render-context
-      // state quirk on rapid re-load. An explicit stop in between is
-      // free insurance and makes each Load click idempotent.
-      try { await invoke("debug_stop_playback"); } catch {}
-      await invoke("debug_load_test_pattern");
-    } catch (e) {
-      setTestError(`Load test pattern failed: ${String(e)}`);
-    } finally {
-      setLoadingPattern(false);
-    }
-  }, []);
-
-  const stopPlayback = useCallback(async () => {
-    setTestError(null);
-    try {
-      await invoke("debug_stop_playback");
-    } catch (e) {
-      setTestError(`Stop playback failed: ${String(e)}`);
-    }
-  }, []);
-
-  const runTest = useCallback(async () => {
-    setRunning(true);
-    setResult(null);
-    setTestError(null);
-    try {
-      // If nothing is currently playing, auto-load the synthetic test
-      // pattern so the user doesn't have to set up a stream first.
-      // Detection: paused === undefined means no file loaded;
-      // paused === true/false means a file is loaded (even if paused).
-      const needsPattern = snap?.mpv?.paused === undefined ||
-        snap?.mpv?.paused === null;
-      if (needsPattern) {
-        await invoke("debug_load_test_pattern");
-        // Give mpv a moment to start decoding the pattern before
-        // sampling drop counters.
-        await new Promise((r) => setTimeout(r, 800));
-      }
-      const r = await invoke<DropTestResult>("debug_drop_test", {
-        durationSecs: duration,
-      });
-      setResult(r);
-    } catch (e) {
-      setTestError(String(e));
-    } finally {
-      setRunning(false);
-    }
-  }, [duration, snap]);
-
-  const copyDump = useCallback(async () => {
-    const blob = JSON.stringify(
-      {
-        timestamp: new Date().toISOString(),
-        aura_version: APP_VERSION,
-        engine_snapshot: snap,
-        last_drop_test: result,
-      },
-      null,
-      2,
-    );
-    try {
-      await navigator.clipboard.writeText(blob);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
-    } catch {
-      // Clipboard unavailable - fall back to a download? Skip for now;
-      // user can still screenshot the panel.
-    }
-  }, [snap, result]);
-
-  if (!open) return null;
-
-  return (
-    <div
-      className="fixed inset-0 z-[9000] flex items-center justify-center
-                 bg-black/65 backdrop-blur-md
-                 animate-[settings-fade-in_140ms_ease-out]"
-      onClick={() => { if (!running) onClose(); }}
-    >
-      <div
-        className="w-[min(720px,calc(100vw-48px))]
-                   max-h-[calc(100vh-48px)] overflow-y-auto
-                   bg-[#0d1117]/96 border border-white/15 rounded-2xl
-                   shadow-glass-edge px-6 py-5 space-y-5"
-        onClick={(e) => e.stopPropagation()}
-      >
-        <div className="flex items-center justify-between">
-          <h2 className="text-white/95 text-[15px] font-semibold tracking-wide">
-            Debug Panel
-          </h2>
-          <button
-            type="button"
-            onClick={() => { if (!running) onClose(); }}
-            disabled={running}
-            className="text-white/45 hover:text-white/85 text-[13px]
-                       disabled:opacity-30 disabled:cursor-default
-                       transition-colors"
-            aria-label="Close"
-          >
-            ✕
-          </button>
-        </div>
-
-        <p className="text-white/55 text-xs leading-relaxed">
-          Live playback engine state, refreshed every second, plus a timed frame-drop test. If nothing is playing, the test loads a built-in test pattern.
-        </p>
-
-      {/* Engine + window */}
-      <div>
-        <p className="text-white/40 text-[10.5px] font-mono uppercase tracking-[0.18em] mb-2">
-          Engine + window
-        </p>
-        <div className="grid grid-cols-2 gap-x-6 gap-y-1.5 text-[12.5px]">
-          <DebugRow label="Engine active" value={fmtBool(snap?.engine.mpv_active)} />
-          <DebugRow label="Engine running" value={fmtBool(snap?.engine.mpv_running)} />
-          <DebugRow label="Present mode" value={snap?.engine.present_mode ?? "-"} />
-          <DebugRow label="HWND" value={snap?.window.hwnd_hex ?? "-"} />
-          <DebugRow label="Foreground" value={fmtBool(snap?.window.is_foreground)} />
-          <DebugRow label="Visible (WS_VISIBLE)" value={fmtBool(snap?.window.is_visible)} />
-          <DebugRow label="Minimised (IsIconic)" value={fmtBool(snap?.window.is_iconic)} />
-          <DebugRow label="Cloaked (DWMWA_CLOAKED)" value={fmtBool(snap?.window.is_cloaked)} />
-        </div>
-      </div>
-
-      <div className="h-px bg-white/6" />
-
-      {/* Video decode */}
-      <div>
-        <p className="text-white/40 text-[10.5px] font-mono uppercase tracking-[0.18em] mb-2">
-          Video decode (mpv)
-        </p>
-        {snap?.engine.mpv_running ? (
-          <div className="grid grid-cols-2 gap-x-6 gap-y-1.5 text-[12.5px]">
-            <DebugRow label="Codec" value={snap?.mpv?.video_codec ?? "-"} />
-            <DebugRow
-              label="Resolution"
-              value={
-                snap?.mpv?.video_w && snap?.mpv?.video_h
-                  ? `${snap.mpv.video_w}×${snap.mpv.video_h}`
-                  : "-"
-              }
-            />
-            <DebugRow label="Source FPS" value={fmtFps(snap?.mpv?.fps)} />
-            <DebugRow label="Display FPS" value={fmtFps(snap?.mpv?.display_fps)} />
-            <DebugRow label="Hardware decode" value={snap?.mpv?.hwdec_current ?? "-"} />
-            <DebugRow label="Pixel format" value={snap?.mpv?.pixelformat ?? "-"} />
-            <DebugRow label="Primaries" value={snap?.mpv?.primaries ?? "-"} />
-            <DebugRow label="Gamma / transfer" value={snap?.mpv?.gamma ?? "-"} />
-            <DebugRow
-              label="HDR"
-              value={
-                snap?.mpv?.hdr_kind ??
-                (snap?.mpv?.hdr_detected ? "detected" : "-")
-              }
-            />
-            <DebugRow
-              label="Dolby Vision"
-              value={
-                snap?.mpv?.dv_detected
-                  ? `profile ${snap.mpv.dv_profile ?? "?"}`
-                  : "not detected"
-              }
-            />
-            <DebugRow label="Audio codec" value={snap?.mpv?.audio_codec ?? "-"} />
-            <DebugRow
-              label="Paused"
-              value={
-                snap?.mpv?.paused === undefined
-                  ? "-"
-                  : snap.mpv?.paused
-                    ? "yes"
-                    : "no"
-              }
-            />
-          </div>
-        ) : (
-          <p className="text-white/45 text-[12.5px] italic">
-            Playback engine not running (not yet initialised).
-          </p>
-        )}
-      </div>
-
-      <div className="h-px bg-white/6" />
-
-      {/* Drop counters (live) - cumulative since playback started.
-          The drop-test result below shows the DELTA across the test
-          window, which is the more meaningful figure for "did this
-          mode change cause drops?". */}
-      <div>
-        <p className="text-white/40 text-[10.5px] font-mono uppercase tracking-[0.18em] mb-2">
-          Drop counters (live - cumulative since playback start)
-        </p>
-        <div className="grid grid-cols-2 gap-x-6 gap-y-1.5 text-[12.5px]">
-          <DebugRow
-            label="VO drops"
-            value={fmtCount(snap?.mpv?.frame_drop_count ?? null)}
-          />
-          <DebugRow
-            label="Decoder drops"
-            value={fmtCount(snap?.mpv?.decoder_frame_drop_count ?? null)}
-          />
-          <DebugRow
-            label="VO delayed frames"
-            value={fmtCount(snap?.mpv?.vo_delayed_frame_count ?? null)}
-          />
-        </div>
-      </div>
-
-      <div className="h-px bg-white/6" />
-
-      {/* Drop test */}
-      <div>
-        <p className="text-white/40 text-[10.5px] font-mono uppercase tracking-[0.18em] mb-2">
-          Off-focus drop test
-        </p>
-        <p className="text-white/55 text-[12px] leading-relaxed">
-          Click <span className="text-white/80">Run test</span>, then leave Aura in the state you want to measure (alt-tabbed away, minimised, on another monitor) until the timer ends. Shows drops, drop rate and present mode at start and end.
-        </p>
-        <div className="mt-3 flex items-center gap-3 flex-wrap">
-          <label className="text-white/55 text-[12px]">Duration</label>
-          <select
-            className="bg-white/5 border border-white/12 rounded-md px-2 py-1 text-[12.5px] text-white/90"
-            value={duration}
-            onChange={(e) => setDuration(Number(e.target.value))}
-            disabled={running}
-          >
-            <option value={5}>5 s</option>
-            <option value={10}>10 s</option>
-            <option value={15}>15 s</option>
-            <option value={30}>30 s</option>
-            <option value={60}>60 s</option>
-          </select>
-          <button
-            type="button"
-            onClick={runTest}
-            disabled={running || !snap?.engine.mpv_running}
-            className="px-3 py-1 rounded-md bg-ln-accent/20 text-ln-accent
-                       hover:bg-ln-accent/30 active:bg-ln-accent/40
-                       border border-ln-accent/40
-                       text-[12.5px] font-semibold tracking-wide
-                       disabled:opacity-50 disabled:cursor-default
-                       transition-colors"
-          >
-            {running ? `Running… (${duration}s)` : "Run test"}
-          </button>
-          <button
-            type="button"
-            onClick={loadPattern}
-            disabled={running || loadingPattern || !snap?.engine.mpv_running}
-            className="px-3 py-1 rounded-md bg-white/6 hover:bg-white/10 active:bg-white/14
-                       border border-white/15 text-white/80
-                       text-[12px]
-                       disabled:opacity-50 disabled:cursor-default
-                       transition-colors"
-            title="Load the SMPTE-bars test pattern without running the drop test"
-          >
-            {loadingPattern ? "Loading…" : "Load test pattern"}
-          </button>
-          <button
-            type="button"
-            onClick={stopPlayback}
-            disabled={running || !snap?.engine.mpv_running}
-            className="px-3 py-1 rounded-md bg-white/6 hover:bg-white/10 active:bg-white/14
-                       border border-white/15 text-white/80
-                       text-[12px]
-                       disabled:opacity-50 disabled:cursor-default
-                       transition-colors"
-            title="Unload whatever is currently playing in the engine"
-          >
-            Stop playback
-          </button>
-        </div>
-
-        {testError && (
-          <p className="mt-2 text-rose-300/85 text-[12px]">{testError}</p>
-        )}
-        {result && (
-          <div className="mt-3 grid grid-cols-2 gap-x-6 gap-y-1.5 text-[12.5px] bg-black/20 border border-white/8 rounded-lg px-3 py-3">
-            <DebugRow
-              label="Duration"
-              value={`${result.duration_secs.toFixed(2)} s`}
-            />
-            <DebugRow
-              label="Verdict"
-              value={
-                result.verdict === "clean"
-                  ? "✓ Clean"
-                  : result.verdict === "minor"
-                    ? "~ Minor"
-                    : "✗ Drops"
-              }
-            />
-            <DebugRow label="Mode at start" value={result.initial_mode ?? "-"} />
-            <DebugRow label="Mode at end" value={result.final_mode ?? "-"} />
-            <DebugRow
-              label="VO drops"
-              value={`${result.delta_vo} (${result.rate_vo.toFixed(2)} /s)`}
-            />
-            <DebugRow
-              label="Decoder drops"
-              value={`${result.delta_dec} (${result.rate_dec.toFixed(2)} /s)`}
-            />
-          </div>
-        )}
-      </div>
-
-      <div className="h-px bg-white/6" />
-
-      <div className="flex items-center justify-between">
-        <p className="text-white/45 text-[11.5px]">
-          {snapError ? (
-            <span className="text-rose-300/75">Snapshot error: {snapError}</span>
-          ) : (
-            "Snapshot polls every second."
-          )}
-        </p>
-        <button
-          type="button"
-          onClick={copyDump}
-          className="px-3 py-1 rounded-md bg-white/8 hover:bg-white/12 active:bg-white/16
-                     border border-white/15 text-white/80 text-[12px]
-                     transition-colors"
-        >
-          {copied ? "Copied" : "Copy diagnostic dump"}
-        </button>
-      </div>
-      </div>{/* /panel */}
-    </div>
-  );
-}
-
-function DebugRow({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="flex items-baseline justify-between gap-2">
-      <span className="text-white/55 truncate">{label}</span>
-      <span className="text-white/85 font-mono tabular-nums truncate text-right">
-        {value}
-      </span>
-    </div>
-  );
-}
-
-function fmtBool(b: boolean | undefined): string {
-  if (b === undefined) return "-";
-  return b ? "yes" : "no";
-}
-function fmtCount(n: number | null | undefined): string {
-  if (n === null || n === undefined) return "-";
-  return n.toLocaleString();
-}
-function fmtFps(n: number | null | undefined): string {
-  if (n === null || n === undefined) return "-";
-  return `${n.toFixed(3)} fps`;
-}
-
 function AboutSection({ addonCount }: { addonCount: number }) {
   const [stats, setStats] = useState<AuraStats | null>(null);
-  const [debugOpen, setDebugOpen] = useState(false);
   const [changelogOpen, setChangelogOpen] = useState(false);
   useEffect(() => {
     invoke<AuraStats>("get_stats").then(setStats).catch(() => {});
@@ -3144,8 +2466,7 @@ function AboutSection({ addonCount }: { addonCount: number }) {
             <button
               type="button"
               onClick={() => setChangelogOpen(true)}
-              className="px-1.5 py-0.5 rounded text-[10.5px] font-sans tracking-normal text-ln-accent/90
-                         border border-ln-accent/25 bg-ln-accent/10 hover:bg-ln-accent/20 transition-colors"
+              className="aura-glass-flat is-primary px-1.5 py-0.5 rounded text-[10.5px] font-sans tracking-normal"
             >
               Changelog
             </button>
@@ -3177,30 +2498,6 @@ function AboutSection({ addonCount }: { addonCount: number }) {
           />
         </div>
       </div>
-
-      <div className="h-px bg-white/6" />
-
-      {/* Debug panel - a one-button entry point to the diagnostic
-          overlay. Lives under About (not in the TOC) because it's a
-          tool, not a setting. The overlay manages its own playback
-          test lifecycle so the user doesn't need to set up a stream
-          to run the drop-rate test. */}
-      <div className="flex items-center justify-between gap-3">
-        <p className="text-white/55 text-[12px] leading-relaxed">
-          Engine + mpv diagnostics and an off-focus drop-rate test
-          with a built-in test pattern.
-        </p>
-        <button
-          type="button"
-          onClick={() => setDebugOpen(true)}
-          className="shrink-0 px-3 py-1 rounded-md bg-white/8 hover:bg-white/12 active:bg-white/16
-                     border border-white/15 text-white/85 text-[12.5px]
-                     transition-colors"
-        >
-          Open Debug Panel
-        </button>
-      </div>
-      <DebugOverlay open={debugOpen} onClose={() => setDebugOpen(false)} />
 
       <div className="h-px bg-white/6" />
 
@@ -3302,9 +2599,7 @@ function CheckForUpdatesButton() {
     }
   })();
 
-  const tone = state === "available"
-    ? "border-ln-accent/60 bg-ln-accent/15 text-ln-accent hover:bg-ln-accent/25"
-    : "border-white/15 bg-white/5 text-white/80 hover:bg-white/10";
+  const tone = state === "available" ? "is-primary" : "text-white/80";
 
   return (
     <button
@@ -3312,9 +2607,8 @@ function CheckForUpdatesButton() {
       onClick={onClick}
       disabled={state === "checking"}
       className={[
-        "flex-shrink-0 px-3 py-1.5 rounded-lg",
+        "aura-glass-flat aura-glass-press flex-shrink-0 px-3 py-1.5 rounded-lg",
         "text-[12px] font-medium tracking-wide",
-        "border transition-colors duration-150",
         "disabled:opacity-60 disabled:cursor-default",
         tone,
       ].join(" ")}
@@ -3377,15 +2671,9 @@ function SettingsSearchInput({
       <div
         className={
           compact
-            ? `relative flex items-center w-full rounded-lg border
-               transition-[background-color,border-color] duration-200 ease-out
-               ${active ? "bg-white/8 border-white/20" : "bg-white/4 border-white/12 hover:bg-white/6"}`
-            : `relative flex items-center
-               rounded-full border
-               transition-[width,background-color,border-color] duration-200 ease-out
-               ${active
-                 ? "bg-white/8 border-white/20 w-[320px]"
-                 : "bg-white/4 border-white/12 w-[220px] hover:bg-white/6"}`
+            ? "aura-glass-field aura-settings-search relative flex items-center w-full rounded-lg"
+            : `aura-glass-field aura-settings-search aura-glass-morph-w relative flex items-center rounded-full
+               ${active ? "w-[320px]" : "w-[220px]"}`
         }
       >
         <svg
@@ -3429,11 +2717,9 @@ function SettingsSearchInput({
             type="button"
             aria-label="Clear search"
             onClick={() => { onChange(""); ref.current?.focus(); }}
-            className="absolute right-2 w-5 h-5 rounded-full
+            className="aura-glass-item absolute right-2 w-5 h-5 rounded-full
                        flex items-center justify-center
-                       text-white/45 hover:text-white/85
-                       hover:bg-white/10
-                       transition-colors duration-150"
+                       text-white/45 hover:text-white/85"
           >
             <svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
               <path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" />
@@ -3460,11 +2746,9 @@ function SettingsSearchInput({
                 aria-label="Previous match"
                 title="Previous match (Shift+Enter)"
                 onClick={() => onStepMatch(-1)}
-                className="w-6 h-6 rounded-md
+                className="aura-glass-flat aura-glass-press w-6 h-6 rounded-md
                            flex items-center justify-center
-                           text-white/55 hover:text-white/95
-                           bg-white/5 hover:bg-white/12 border border-white/10
-                           transition-colors"
+                           text-white/55 hover:text-white/95"
               >
                 <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
                   <path d="M14 7l-5 5 5 5V7z" />
@@ -3475,11 +2759,9 @@ function SettingsSearchInput({
                 aria-label="Next match"
                 title="Next match (Enter)"
                 onClick={() => onStepMatch(1)}
-                className="w-6 h-6 rounded-md
+                className="aura-glass-flat aura-glass-press w-6 h-6 rounded-md
                            flex items-center justify-center
-                           text-white/55 hover:text-white/95
-                           bg-white/5 hover:bg-white/12 border border-white/10
-                           transition-colors"
+                           text-white/55 hover:text-white/95"
               >
                 <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
                   <path d="M10 17l5-5-5-5v10z" />
@@ -3519,7 +2801,7 @@ function Section({ id, title, children }: { id?: string; title: string; children
           {title}
           {state === "marked" && <AdvancedPill />}
         </h2>
-        <div className="space-y-5 bg-white/3 border border-white/8 rounded-2xl px-5 py-5">
+        <div {...sheet("space-y-5 rounded-[20px] px-5 py-5")}>
           {children}
         </div>
       </section>
@@ -3746,6 +3028,9 @@ interface SettingsTocProps {
 }
 
 function SettingsToc({ scrollRoot, groups, advanced, search, pin }: SettingsTocProps) {
+  // The TOC is a glass sheet (round 11): its rows are sheet rows under ONE
+  // sliding hover droplet (Liquid; Frosted rows keep a hover fill).
+  const tocDroplet = useListDroplet<HTMLDivElement>(".aura-sheet-row");
   // Always-expanded layout - the collapsing UX added complexity that the
   // user found more annoying than helpful. Every leaf is visible at once.
   const [activeId, setActiveId] = useState<string>(groups[0]?.sections[0]?.id ?? "");
@@ -3924,15 +3209,20 @@ function SettingsToc({ scrollRoot, groups, advanced, search, pin }: SettingsTocP
   }, [scrollRoot, groups]);
 
   return (
-    <nav className="flex flex-col max-h-[calc(100vh-6rem)] text-[13px] leading-snug select-none">
+    <nav className="flex flex-col max-h-[calc(100vh-6rem-22px)] text-[13px] leading-snug select-none">
       {/* The contents list scrolls within the viewport-capped nav so a long TOC
           (or a high display scale) can't push the pinned search footer below
           the screen edge. */}
-      <div className="flex-1 min-h-0 overflow-y-auto aura-scroll space-y-4 pr-1">
-      <p className="text-white/35 text-[10.5px] font-mono uppercase tracking-[0.2em]">
+      {/* overflow-x hidden (aura-toc-scroll, glass-pages.css): with only
+          overflow-y set, x computes to auto, and the hover droplet's grow
+          spring overshoots the list's width for a few frames, which flashed
+          a horizontal scrollbar under the list. */}
+      <div className="aura-toc-scroll relative flex-1 min-h-0 overflow-y-auto aura-scroll flex flex-col gap-3" {...tocDroplet.listProps}>
+      <span ref={tocDroplet.ref} aria-hidden className="aura-glass-hl aura-sheet-hl" />
+      <p className="px-2.5 pt-1 text-white/55 text-[10.5px] font-mono uppercase tracking-[0.2em]">
         Contents
       </p>
-      <ul className="space-y-2.5">
+      <ul className="space-y-2">
         {groups.map((g) => {
           const isActiveGroup = g.sections.some((s) => s.id === activeId);
           // Flatten when the group has exactly one sub-section AND its
@@ -3944,23 +3234,26 @@ function SettingsToc({ scrollRoot, groups, advanced, search, pin }: SettingsTocP
               <button
                 type="button"
                 onClick={() => scrollToSection(g.sections[0].id)}
-                className={`w-full text-left py-1
-                            transition-colors
-                            ${isActiveGroup ? "text-white/95" : "text-white/55 hover:text-white/85"}`}
+                aria-current={flat && isActiveGroup ? "location" : undefined}
+                data-glass-light={flat && isActiveGroup ? "rim" : undefined}
+                className={`aura-sheet-row w-full text-left px-2.5 py-1.5
+                            ${flat && isActiveGroup ? "is-selected" : isActiveGroup ? "text-white/95" : "text-white/65 hover:text-white/90"}`}
               >
                 <span className="font-medium">{g.label}</span>
               </button>
               {!flat && g.sections.length > 0 && (
-                <ul className="ml-1 mt-1 space-y-1 border-l border-white/8 pl-3">
+                <ul className="mt-0.5 space-y-0.5">
                   {g.sections.map((s) => (
                     <li key={s.id}>
                       <button
                         type="button"
                         onClick={() => scrollToSection(s.id)}
-                        className={`w-full text-left py-1 transition-colors
+                        aria-current={s.id === activeId ? "location" : undefined}
+                        data-glass-light={s.id === activeId ? "rim" : undefined}
+                        className={`aura-sheet-row is-leaf w-full text-left pl-6 pr-2.5 py-1.5
                                     ${s.id === activeId
-                                      ? "text-ln-accent"
-                                      : "text-white/45 hover:text-white/75"}`}
+                                      ? "is-selected"
+                                      : "text-white/60 hover:text-white/85"}`}
                       >
                         {s.label}
                       </button>
@@ -3984,8 +3277,8 @@ function SettingsToc({ scrollRoot, groups, advanced, search, pin }: SettingsTocP
       </div>{/* /scroll region - search footer below stays pinned + visible */}
 
       {search && (
-        <div className="pt-3 mt-4 border-t border-white/8 space-y-2 flex-shrink-0">
-          <p className="text-white/35 text-[10.5px] font-mono uppercase tracking-[0.2em]">
+        <div className="pt-3 mt-3 border-t border-white/[0.09] space-y-2 flex-shrink-0 px-1">
+          <p className="px-1.5 text-white/55 text-[10.5px] font-mono uppercase tracking-[0.2em]">
             Search
           </p>
           <SettingsSearchInput
@@ -4086,14 +3379,8 @@ function KeybindRow({ action, label, description, code, onChange, lostTo }: Keyb
       data-settings-row=""
       data-settings-label={label}
       data-settings-description={description}
-      className={`w-full flex items-center justify-between gap-4 px-3 py-2.5 rounded-lg
-                  text-left transition-colors
-                  ${capturing
-                    ? "bg-ln-accent/15 border border-ln-accent/40"
-                    : lost
-                      ? "aura-keybind-lost border border-rose-400/55"
-                      : "hover:bg-white/5 border border-white/8"
-                  }`}
+      className={`w-full flex items-center justify-between gap-4 px-3 py-2.5 text-left aura-content-row
+                  ${capturing ? "is-capturing" : lost ? "aura-keybind-lost" : ""}`}
     >
       <div className="flex-1 min-w-0">
         <p className="text-white/75 text-sm font-medium">{label}</p>
@@ -4165,15 +3452,12 @@ const MOUSE_BTN_LABELS: Record<number, string> = {
  *  rejected - left selects/navigates, right is the card context menu.
  *  Esc cancels capture. Mirrors KeybindRow's capture UX. */
 function MouseBindRow({
-  label, description, button, onChange, bare = false,
+  label, description, button, onChange,
 }: {
   label: string;
   description: string;
   button: number;
   onChange: (next: 1 | 3 | 4) => void;
-  /** Inside an AttachedSettings box: no border of its own, so it does not
-   *  read as a box inside a box. */
-  bare?: boolean;
 }) {
   const [capturing, setCapturing] = useState(false);
 
@@ -4208,12 +3492,8 @@ function MouseBindRow({
       data-settings-row=""
       data-settings-label={label}
       data-settings-description={description}
-      className={`w-full flex items-center justify-between gap-4 px-3 py-2.5 rounded-lg
-                  text-left transition-colors
-                  ${capturing
-                    ? "bg-ln-accent/15 border border-ln-accent/40"
-                    : bare ? "hover:bg-white/5 border border-transparent" : "hover:bg-white/5 border border-white/8"
-                  }`}
+      className={`w-full flex items-center justify-between gap-4 px-3 py-2.5 text-left aura-content-row
+                  ${capturing ? "is-capturing" : ""}`}
     >
       <div className="flex-1 min-w-0">
         <p className="text-white/75 text-sm font-medium">{label}</p>
@@ -4234,789 +3514,6 @@ function MouseBindRow({
 }
 
 // ---------------------------------------------------------------------------
-// ScrobbleAuthRow - one row in the Scrobbling section (Trakt, AniList, Simkl).
-// Shows connection state ("Not connected" or "Connected as <user>"), a
-// Connect button that opens the OAuth authorize URL in the user's
-// default browser, and a Disconnect button when authenticated. The
-// connection state is read on mount + whenever `aura:scrobble-auth-
-// changed` fires (the deep-link handler in App.tsx dispatches it
-// after persisting a token, the Disconnect handler dispatches it
-// after clearing one).
-//
-// `scope` is the first 12 chars of the Stremio auth_key (or "guest"),
-// matching the keyring layout in scrobble_auth.rs. Sharing a scope
-// across components keeps the displayed status in sync with the
-// stored token regardless of which Stremio account is signed in.
-//
-// A service this BUILD cannot sign in to (`scrobble_services_available`
-// leaves it out: Simkl until its client_id is filled in) renders muted with
-// no Connect button, rather than a button that can only fail.
-// ---------------------------------------------------------------------------
-
-/** Which services sign in with OAuth device flow (RFC 8628). Every other one
- *  takes the authorize-URL path (browser + loopback, popup fallback). A Record
- *  rather than `service === "trakt"`, so a new service has to choose. */
-const USES_DEVICE_FLOW: Record<ScrobbleService, boolean> = {
-  trakt: true,
-  anilist: false,
-  simkl: false,
-};
-
-/** The row's line for a lapsed token. Simkl's "expired" is its renewal
- *  deadline passing (180 days with no silent refresh), not its 7-day access
- *  token, which renews itself. */
-const EXPIRED_COPY: Record<ScrobbleService, string> = {
-  trakt: "Trakt sign-in expired. Click Reconnect.",
-  anilist: "AniList sign-in expired (AniList cannot renew it automatically). Click Reconnect.",
-  simkl: "Simkl sign-in lapsed after months without a scrobble. Click Reconnect.",
-};
-
-/** The row's line for a token inside its provider's stale window. */
-const STALE_COPY: Record<ScrobbleService, string> = {
-  trakt: "Token expires soon. Aura renews it automatically on the next scrobble; reconnect only if it lapses first.",
-  anilist: "AniList token expires within a week. Reconnect to extend (no automatic renewal).",
-  simkl: "Simkl will ask you to sign in again within a week. Finishing anything with scrobbling on renews it.",
-};
-
-/** Format a Unix-seconds expiry into a "Mon DD, YYYY · HH:MM" string in
- *  the user's locale + timezone. Returns `null` if the timestamp is
- *  outside any sane range (NaN, 0, etc.) so the caller can fall back
- *  to "No expiry reported". */
-function formatExpiryAbsolute(expiresAt: number | null): string | null {
-  if (expiresAt == null) return null;
-  const date = new Date(expiresAt * 1000);
-  if (Number.isNaN(date.getTime()) || date.getTime() <= 0) return null;
-  return date.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
-}
-
-/** Pick the coarsest reasonable unit so the relative qualifier reads
- *  naturally ("in 23 days" rather than "in 1987200 seconds"). Uses
- *  `Intl.RelativeTimeFormat` with `numeric: "always"` so the output is
- *  always quantitative ("1 day ago", never "yesterday") - matches the
- *  precision the task asked for. */
-function formatExpiryRelative(diffMs: number): string {
-  const rtf = new Intl.RelativeTimeFormat(undefined, { numeric: "always" });
-  const sec = Math.round(diffMs / 1000);
-  if (Math.abs(sec) < 60)  return rtf.format(sec, "second");
-  const min = Math.round(diffMs / 60_000);
-  if (Math.abs(min) < 60)  return rtf.format(min, "minute");
-  const hr  = Math.round(diffMs / 3_600_000);
-  if (Math.abs(hr)  < 24)  return rtf.format(hr,  "hour");
-  const day = Math.round(diffMs / 86_400_000);
-  if (Math.abs(day) < 30)  return rtf.format(day, "day");
-  const mon = Math.round(diffMs / (86_400_000 * 30));
-  if (Math.abs(mon) < 12)  return rtf.format(mon, "month");
-  const yr  = Math.round(diffMs / (86_400_000 * 365));
-  return rtf.format(yr, "year");
-}
-
-/** Tick period matching the unit `formatExpiryRelative` will actually print for
- *  this diff, so the row never shows a value staler than the unit it displays.
- *  Same rule as releaseCountdown.ts::showsSeconds: cadence follows RENDERED
- *  precision, never a fixed guess. A flat 60 s used to leave the seconds branch
- *  (|diff| < 60 s, symmetric around expiry) frozen, so a token that had already
- *  lapsed could still read "in 42 seconds". Each tier is a 2x oversample of the
- *  unit above it. */
-function expiryTickMs(diffMs: number): number {
-  const abs = Math.abs(diffMs);
-  if (abs < 60_000)    return 1_000;   // rendered in seconds
-  if (abs < 3_600_000) return 30_000;  // rendered in minutes
-  return 60_000;                       // hours or coarser
-}
-
-function ScrobbleAuthRow({
-  service, authKey, description,
-}: {
-  service: ScrobbleService;
-  authKey: string | null;
-  description: string;
-}) {
-  const scope = authKey ? authKey.slice(0, 12) : "guest";
-  const label = SCROBBLE_LABELS[service];
-  // Trakt supports OAuth 2.0 device flow (RFC 8628), which sidesteps
-  // the browser → custom-URL-scheme → OS handler chain that broke on
-  // Firefox + Aura's dev build. AniList doesn't expose device-flow
-  // endpoints, so it stays on the legacy authorize-URL + deep-link
-  // path until upstream changes.
-  const useDeviceFlow = USES_DEVICE_FLOW[service];
-
-  const [status, setStatus] = useState<ScrobbleAuthSummary | null>(null);
-  const [busy, setBusy] = useState(false);
-  // Can this build sign in to the service at all? Asked once per process (see
-  // scrobbleConn.ts); null until the answer arrives, which reads as available.
-  const [available, setAvailable] = useState<boolean | null>(() => {
-    const known = knownScrobbleServicesAvailable();
-    return known ? known.has(service) : null;
-  });
-  useEffect(() => {
-    let live = true;
-    void scrobbleServicesAvailable().then((set) => {
-      if (live) setAvailable(set.has(service));
-    });
-    return () => { live = false; };
-  }, [service]);
-  // Read through a ref so the answer arriving does not re-create `refresh`
-  // and re-run the mount fetch below for every row.
-  const unavailableRef = useRef(false);
-  unavailableRef.current = available === false;
-  // Auth-code (deep-link) waiting state - AniList and Simkl.
-  const [pending, setPending] = useState(false);
-  const timeoutRef = useRef<number | null>(null);
-  // Tick driving the "expires in N days" relative qualifier. Without it the
-  // Settings page could sit open for hours showing a stale "in 23 days" line
-  // that should read "in 22 days". Only runs when an expiring token is
-  // connected: guests and non-expiring tokens (AniList implicit grant) skip it.
-  //
-  // The PERIOD follows what formatExpiryRelative will print (see expiryTickMs)
-  // rather than being pinned at 60 s, and because it is recomputed from
-  // `tickNow` it sharpens on its own as the token approaches expiry.
-  const [tickNow, setTickNow] = useState(() => Date.now());
-  const expiresAtMs = status?.expires_at != null ? status.expires_at * 1000 : null;
-  const tickMs = expiresAtMs == null ? null : expiryTickMs(expiresAtMs - tickNow);
-  useEffect(() => {
-    if (tickMs == null) return;
-    const id = window.setInterval(() => setTickNow(Date.now()), tickMs);
-    return () => window.clearInterval(id);
-  }, [tickMs]);
-
-  // Device-flow state. When set, the row renders the user_code +
-  // verification URL + Cancel button, and a poll loop runs until the
-  // proxy returns Authorized (clears) / Expired / Denied / Error.
-  interface DeviceFlowState {
-    user_code:        string;
-    verification_url: string;
-    device_code:      string;
-    /** Wall-clock ms when the device_code expires. */
-    expires_at:       number;
-    /** Polling interval in ms (start at server-suggested, may grow on slow_down). */
-    interval_ms:      number;
-  }
-  const [deviceFlow, setDeviceFlow] = useState<DeviceFlowState | null>(null);
-
-  const clearWaiting = useCallback(() => {
-    setPending(false);
-    if (timeoutRef.current !== null) {
-      window.clearTimeout(timeoutRef.current);
-      timeoutRef.current = null;
-    }
-    sessionStorage.removeItem(`aura:oauth:pending:${service}`);
-  }, [service]);
-
-  const refresh = useCallback(() => {
-    // Nothing to show for a service this build cannot use, so no keyring read.
-    if (unavailableRef.current) return;
-    invoke<ScrobbleAuthStatus>("get_scrobble_auth_status", { scope })
-      .then((s) => setStatus(summaryFor(s, service)))
-      .catch(() => {
-        // Deliberately does NOT clear `status`. This now also runs on a 60 s
-        // poll, and a transient IPC hiccup must not flash "not connected" over
-        // a live account once a minute. A genuine disconnect is not an error:
-        // it arrives as a SUCCESSFUL response with no summary for this
-        // service, handled by the `then` branch above. On the very first
-        // fetch `status` is already null, so leaving it alone matches the old
-        // behaviour exactly.
-      });
-  }, [scope, service]);
-
-  useEffect(() => {
-    refresh();
-    // Deep-link arrival (AniList path): App.tsx persists the token,
-    // then dispatches this event. Device-flow polling dispatches the
-    // same event after a successful poll.
-    const onChanged = (e: Event) => {
-      refresh();
-      // Another provider's disconnect-before-reconnect names itself in
-      // `detail`, and must not cancel THIS row's sign-in in flight (its
-      // scope stash or its device flow). Untagged events clear every row.
-      const from = (e as CustomEvent<{ service?: ScrobbleService } | null>).detail?.service;
-      if (from && from !== service) return;
-      clearWaiting();
-      setDeviceFlow(null);
-    };
-    window.addEventListener("aura:scrobble-auth-changed", onChanged);
-    return () => {
-      window.removeEventListener("aura:scrobble-auth-changed", onChanged);
-      if (timeoutRef.current !== null) {
-        window.clearTimeout(timeoutRef.current);
-        timeoutRef.current = null;
-      }
-    };
-  }, [refresh, clearWaiting]);
-
-  // `expired` and `stale` are computed SERVER-side at fetch time, so with only
-  // the mount fetch and the auth-changed listener above they were frozen for the
-  // whole session: a Settings page left open across the expiry moment kept
-  // showing the green "Connected" badge over a dead token while the line beneath
-  // it counted negative. Re-query on a slow cadence so the badge flips on its
-  // own. Paused while minimized with a catch-up on restore, matching the Cloud
-  // Sync section.
-  useIdleGatedInterval(() => refresh(), 60_000, { runOnResume: true });
-
-  // Device-flow poll loop. Runs while `deviceFlow` is set, polls the
-  // proxy at the server-suggested interval, dispatches scrobble-auth-
-  // changed on success (which clears `deviceFlow` via the listener
-  // above). Honours `slow_down` by adding 5 s to the interval.
-  useEffect(() => {
-    if (!deviceFlow) return;
-    let cancelled = false;
-    let intervalMs = deviceFlow.interval_ms;
-    let timer: number | null = null;
-
-    const tick = async () => {
-      if (cancelled) return;
-      if (Date.now() >= deviceFlow.expires_at) {
-        setDeviceFlow(null);
-        showAppToast(
-          `${label} authorization timed out. The code expired before you finished. Try again.`,
-          { duration: 6000 },
-        );
-        return;
-      }
-      try {
-        const resp = await invoke<{ status: string; username?: string | null; message?: string }>(
-          "scrobble_oauth_device_poll",
-          { service, scope, deviceCode: deviceFlow.device_code },
-        );
-        if (cancelled) return;
-        switch (resp.status) {
-          case "authorized":
-            window.dispatchEvent(new CustomEvent("aura:scrobble-auth-changed"));
-            showAppToast(
-              `Connected to ${label}${resp.username ? ` as ${resp.username}` : ""}`,
-              { duration: 4000 },
-            );
-            return;
-          case "pending":
-            break;
-          case "slow_down":
-            intervalMs = Math.min(intervalMs + 5000, 30000);
-            break;
-          case "expired":
-            setDeviceFlow(null);
-            showAppToast(
-              `${label} code expired before authorization completed. Try again.`,
-              { duration: 5000 },
-            );
-            return;
-          case "denied":
-            setDeviceFlow(null);
-            showAppToast(`${label} authorization was denied.`, { duration: 5000 });
-            return;
-          case "error":
-          default:
-            setDeviceFlow(null);
-            showAppToast(
-              `${label} auth failed: ${resp.message || resp.status}`,
-              { duration: 6000 },
-            );
-            return;
-        }
-      } catch (e) {
-        // Network blip: don't kill the flow, just keep polling on
-        // schedule. The expires_at gate will end the loop if we never
-        // reach the proxy again.
-        console.warn(`[scrobble] device poll failed:`, e);
-      }
-      if (!cancelled) {
-        timer = window.setTimeout(tick, intervalMs);
-      }
-    };
-
-    timer = window.setTimeout(tick, deviceFlow.interval_ms);
-    return () => {
-      cancelled = true;
-      if (timer !== null) window.clearTimeout(timer);
-    };
-  }, [deviceFlow, service, scope, label]);
-
-  // AniList and Simkl have no device flow, so nothing polls on their behalf:
-  // if the user closes the browser tab without authorizing, the row would sit
-  // on "Connecting…" forever. Two minutes, then reset. Shared by the browser
-  // and in-app paths so both behave identically. It is also the only way out
-  // of a DECLINED Simkl consent, which sends nothing back to Aura at all
-  // (Simkl's "You declined" page is the whole answer).
-  const armBrowserTimeout = useCallback(() => {
-    if (timeoutRef.current !== null) window.clearTimeout(timeoutRef.current);
-    timeoutRef.current = window.setTimeout(() => {
-      timeoutRef.current = null;
-      setPending(false);
-      // Only the waiting UI times out. The sign-in itself stays redeemable in
-      // Rust for 15 minutes (NONCE_TTL in oauth_callback.rs, for AniList's
-      // proxy nonce and Simkl's PKCE state alike), so an approval can still
-      // land after this and deliver a token: the scope stash stays for it,
-      // or App.tsx would file that token under "guest" instead of the
-      // signed-in account. Cancel, the token's arrival and the next Connect
-      // still clear or replace it.
-      showAppToast(
-        `${label} authorization didn't complete. Try again.`,
-        { duration: 6000 },
-      );
-    }, 120_000);
-  }, [service, label]);
-
-  // ── Fallback: sign in inside Aura ────────────────────────────────────
-  // The in-app popup webview, which was the default before the browser
-  // handoff. It still works when the browser path can't run at all: no
-  // default browser registered, `openUrl` refused, or port 11471 squatted
-  // by an orphaned process so the loopback callback has nowhere to land.
-  // The tradeoff is that its cookie jar drops session cookies at app exit,
-  // so the user usually has to type their password again - which is the
-  // whole reason it is no longer the default.
-  const connectInApp = useCallback(async () => {
-    try {
-      const { openOAuthPopup } = await import("../SourcePopup");
-      if (useDeviceFlow) {
-        // Device flow is already in progress; the popup is just another
-        // surface for entering the code. Polling is unaffected by where
-        // the user types it, so there is nothing else to re-arm.
-        if (!deviceFlow) return;
-        openOAuthPopup(deviceFlow.verification_url, `Connect to ${label}`, {
-          userCode: deviceFlow.user_code,
-        });
-        return;
-      }
-      sessionStorage.setItem(`aura:oauth:pending:${service}`, scope);
-      // `loopback: false` keeps the legacy terminal hop at
-      // `aura://oauth/<svc>`, which the popup's own on_navigation
-      // interceptor catches and re-emits as a `deep-link`. Requesting the
-      // loopback URL here would work too, but routing it through the
-      // interceptor keeps the popup's trust check (prior host must be the
-      // proxy) on the path it was written for.
-      //
-      // A loopback-only provider (Simkl) has no such hop: the popup simply
-      // follows its redirect to the loopback listener, which exchanges the
-      // code and emits the deep-link itself, so there is nothing to intercept.
-      const url = await invoke<string>("scrobble_oauth_authorize_url", {
-        service, loopback: false,
-      });
-      openOAuthPopup(url, `Connect to ${label}`, LOOPBACK_ONLY_SIGN_IN[service] ? {} : {
-        interceptPrefix: `aura://oauth/${service}`,
-      });
-      setPending(true);
-      armBrowserTimeout();
-    } catch (e) {
-      sessionStorage.removeItem(`aura:oauth:pending:${service}`);
-      showAppToast(`Couldn't start ${label} auth: ${String(e)}`, { duration: 5000 });
-    }
-  }, [useDeviceFlow, deviceFlow, service, scope, label, armBrowserTimeout]);
-
-  const connect = useCallback(async () => {
-    if (busy || pending || deviceFlow) return;
-    setBusy(true);
-    try {
-      // Reconnecting over a stored token (the Expired row's Reconnect): Simkl
-      // disconnects first, which revokes the old grant, so the new sign-in
-      // does not leave a second live one behind (see REVOKE_BEFORE_RECONNECT).
-      // Best effort: a failed revoke must not block the sign-in. Before the
-      // scope stash below, because the auth-changed event clears it. The
-      // event names this service, so another row's sign-in in flight keeps
-      // its own stash.
-      if (status && REVOKE_BEFORE_RECONNECT[service]) {
-        try {
-          await invoke("clear_scrobble_auth_token", { service, scope });
-          window.dispatchEvent(new CustomEvent("aura:scrobble-auth-changed", { detail: { service } }));
-        } catch (e) {
-          console.warn(`[scrobble-auth] ${label} disconnect before reconnect failed:`, e);
-        }
-      }
-      // Both providers now start in the user's DEFAULT BROWSER, which is
-      // what RFC 8252 ("OAuth 2.0 for Native Apps") recommends for native
-      // clients - not for purity, but because the system browser already
-      // holds the user's Trakt / AniList session. Re-authorizing becomes
-      // one click on "Authorize" instead of retyping a password into a
-      // webview whose cookie jar drops session cookies when Aura exits.
-      //
-      // The reason this wasn't always the case: browsers refuse to
-      // AUTO-redirect into a foreign protocol handler, so the proxy's old
-      // terminal `aura://oauth/<svc>` hop died silently (Firefox being the
-      // canonical case). Two different mechanisms avoid that hop now:
-      //   • Trakt   - device flow (RFC 8628). No redirect at all; the Rust
-      //               poll loop detects authorization on its own, from
-      //               whichever device the user approved on.
-      //   • AniList - loopback redirect (RFC 8252 §7.3). The proxy lands on
-      //               http://127.0.0.1:11471/oauth/callback, which is plain
-      //               HTTP and so is never blocked; oauth_callback.rs
-      //               nonce-checks it and re-emits the usual `deep-link`.
-      // `connectInApp` below is the fallback when either path can't run.
-      if (useDeviceFlow) {
-        // Trakt: device-flow path. No deep-link involvement; we poll.
-        const begin = await invoke<{
-          user_code:        string;
-          verification_url: string;
-          device_code:      string;
-          expires_in:       number;
-          interval:         number;
-        }>("scrobble_oauth_device_begin", { service });
-        setDeviceFlow({
-          user_code:        begin.user_code,
-          verification_url: begin.verification_url,
-          device_code:      begin.device_code,
-          expires_at:       Date.now() + begin.expires_in * 1000,
-          interval_ms:      Math.max(2000, begin.interval * 1000),
-        });
-        // Hand the activation page to the user's browser, where they are
-        // most likely already signed in to Trakt. The panel below keeps
-        // the code (and a QR for approving on a phone) on screen, and the
-        // Rust poll loop clears it the moment Trakt reports Authorized -
-        // regardless of which device did the approving.
-        openExternalUrl(begin.verification_url);
-      } else {
-        // AniList: authorization-code flow finishing at the loopback
-        // listener. The scope stash is what App.tsx's `deep-link` handler
-        // reads back to know which Stremio account to write the token
-        // under, so it must be set BEFORE the browser can come back.
-        sessionStorage.setItem(`aura:oauth:pending:${service}`, scope);
-        // `loopback: true` makes the Rust side mint a single-use nonce and
-        // point the proxy at 127.0.0.1. It errors (rather than silently
-        // downgrading) if the bridge never bound its port, because opening
-        // a browser tab that has nowhere to return to is exactly the kind
-        // of silent dead end the silent-failure audit set out to remove -
-        // so fall back to the in-app popup and tell the user why.
-        let url: string;
-        try {
-          url = await invoke<string>("scrobble_oauth_authorize_url", {
-            service, loopback: true,
-          });
-        } catch (loopbackErr) {
-          // Simkl can only ever land on the loopback listener, so the popup
-          // would fail the same way: report the reason instead.
-          if (LOOPBACK_ONLY_SIGN_IN[service]) throw loopbackErr;
-          console.warn("[scrobble-auth] loopback unavailable:", loopbackErr);
-          showAppToast(
-            "Opening sign-in inside Aura (the local callback port is unavailable).",
-            { duration: 5000 },
-          );
-          await connectInApp();
-          return;
-        }
-        openExternalUrl(url);
-        setPending(true);
-        armBrowserTimeout();
-      }
-    } catch (e) {
-      sessionStorage.removeItem(`aura:oauth:pending:${service}`);
-      showAppToast(`Couldn't start ${label} auth: ${String(e)}`, { duration: 5000 });
-    } finally {
-      setBusy(false);
-    }
-  }, [
-    busy, pending, deviceFlow, service, scope, useDeviceFlow, label, status,
-    connectInApp, armBrowserTimeout,
-  ]);
-
-  const cancelPending = useCallback(() => {
-    clearWaiting();
-    setDeviceFlow(null);
-  }, [clearWaiting]);
-
-  // QR for the Trakt activation page, so the code can be approved on a
-  // phone that is already signed in to Trakt. Memoised on the URL string
-  // (not the object) so the 60s expiry tick and poll-driven re-renders
-  // don't re-run the encoder.
-  //
-  // NOTE: this encodes the plain verification_url, so the code still has
-  // to be typed on the phone. RFC 8628 §3.2 defines an optional
-  // `verification_uri_complete` that embeds the code and would turn the
-  // scan into one-tap approval; Trakt does not return one today. If the
-  // proxy ever starts forwarding it, prefer it here.
-  const deviceQr = useMemo(
-    () => (deviceFlow ? encodeQr(deviceFlow.verification_url) : null),
-    [deviceFlow?.verification_url],
-  );
-
-  const copyUserCode = useCallback(async () => {
-    if (!deviceFlow) return;
-    try {
-      await navigator.clipboard.writeText(deviceFlow.user_code);
-      showAppToast("Code copied", { duration: 2000 });
-    } catch {
-      // Clipboard API may be blocked; non-fatal - code is still
-      // visible on screen for the user to type manually.
-    }
-  }, [deviceFlow]);
-
-  // Re-open the activation page in the user's browser, for when they closed
-  // the tab. Polling in the background is indifferent to where (or on which
-  // device) the code is finally entered, so there is no state to re-arm.
-  // `openExternalUrl` reports its own failures via toast and never throws,
-  // so there is deliberately no try/catch here.
-  const reopenVerification = useCallback(() => {
-    if (!deviceFlow) return;
-    openExternalUrl(deviceFlow.verification_url);
-  }, [deviceFlow]);
-
-  const disconnect = useCallback(async () => {
-    if (busy) return;
-    setBusy(true);
-    try {
-      await invoke("clear_scrobble_auth_token", { service, scope });
-      window.dispatchEvent(new CustomEvent("aura:scrobble-auth-changed"));
-    } catch (e) {
-      showAppToast(`Disconnect failed: ${String(e)}`, { duration: 5000 });
-    } finally {
-      setBusy(false);
-    }
-  }, [busy, service, scope]);
-
-  const connected = !!status;
-
-  // Not in this build: muted, no Connect, one line saying so. Checked here,
-  // after every hook, so the hook order never depends on the answer.
-  if (available === false) {
-    return (
-      <div className="min-w-0">
-        <p className="text-white/45 text-sm font-medium">{label}</p>
-        <p className="text-white/35 text-xs leading-relaxed">Not set up in this build yet.</p>
-      </div>
-    );
-  }
-
-  return (
-    <div className="space-y-2">
-      <div className="flex items-start justify-between gap-3">
-        <div className="flex-1 min-w-0">
-          <p className="text-white/85 text-sm font-medium">{label}</p>
-          <p className="text-white/55 text-xs leading-relaxed">{description}</p>
-        </div>
-        <div className="flex-shrink-0 flex flex-col items-end gap-1.5">
-          {deviceFlow ? (
-            <>
-              <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px]
-                                font-semibold uppercase tracking-wider
-                                bg-amber-500/15 text-amber-200 border border-amber-400/30">
-                <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse" />
-                Awaiting authorization
-              </span>
-              <button
-                type="button"
-                onClick={cancelPending}
-                className="px-3 py-1 rounded-lg border border-white/15 bg-white/5
-                           text-white/75 text-[11px] font-medium tracking-wide
-                           hover:bg-white/10 hover:text-white
-                           transition-colors"
-              >
-                Cancel
-              </button>
-            </>
-          ) : pending ? (
-            <>
-              <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px]
-                                font-semibold uppercase tracking-wider
-                                bg-amber-500/15 text-amber-200 border border-amber-400/30">
-                <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse" />
-                Waiting for authorization…
-              </span>
-              <button
-                type="button"
-                onClick={cancelPending}
-                className="px-3 py-1 rounded-lg border border-white/15 bg-white/5
-                           text-white/75 text-[11px] font-medium tracking-wide
-                           hover:bg-white/10 hover:text-white
-                           transition-colors"
-              >
-                Cancel
-              </button>
-            </>
-          ) : connected && status?.expired ? (
-            <>
-              <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px]
-                                font-semibold uppercase tracking-wider
-                                bg-rose-500/15 text-rose-300 border border-rose-400/30">
-                <span className="w-1.5 h-1.5 rounded-full bg-rose-400" />
-                {status?.username ? `Expired · ${status.username}` : "Expired"}
-              </span>
-              {/* Absolute + relative expiry timestamp for the expired
-                  branch. Useful diagnostic ("why am I being asked to
-                  reconnect now?") and grounds the rose badge in a
-                  concrete date. */}
-              {(() => {
-                const absolute = formatExpiryAbsolute(status?.expires_at ?? null);
-                if (!absolute || status?.expires_at == null) return null;
-                const relative = formatExpiryRelative(status.expires_at * 1000 - tickNow);
-                return (
-                  <div className="text-[10px] leading-tight text-right text-rose-300/80">
-                    <div>Expired {absolute}</div>
-                    <div className="text-rose-300/60">{relative}</div>
-                  </div>
-                );
-              })()}
-              <button
-                type="button"
-                onClick={connect}
-                disabled={busy}
-                className="px-3 py-1 rounded-lg border border-ln-accent/35 bg-ln-accent/15
-                           text-ln-accent text-[11px] font-medium tracking-wide
-                           hover:bg-ln-accent/25 hover:border-ln-accent/55
-                           transition-colors disabled:opacity-50"
-              >
-                Reconnect
-              </button>
-            </>
-          ) : connected ? (
-            <>
-              <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px]
-                                font-semibold uppercase tracking-wider
-                                bg-emerald-500/15 text-emerald-300 border border-emerald-400/30">
-                <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
-                {status?.username ? `Connected · ${status.username}` : "Connected"}
-              </span>
-              {/* Live expiry readout. Amber when the token enters the
-                  provider-specific stale window (7d AniList / 24h Trakt)
-                  so the user notices before it lapses; neutral otherwise.
-                  Renders "No expiry reported" for providers that issue
-                  non-expiring tokens (AniList Implicit Grant, etc.) so
-                  the absence of a date is explained rather than hidden. */}
-              {(() => {
-                if (status?.expires_at == null) {
-                  return (
-                    <div className="text-[10px] leading-tight text-right text-white/35">
-                      No expiry reported
-                    </div>
-                  );
-                }
-                const absolute = formatExpiryAbsolute(status.expires_at);
-                if (!absolute) return null;
-                const relative = formatExpiryRelative(status.expires_at * 1000 - tickNow);
-                const tone = status.stale
-                  ? { primary: "text-amber-300/90", secondary: "text-amber-300/70" }
-                  : { primary: "text-white/55",     secondary: "text-white/35"     };
-                return (
-                  <div className={`text-[10px] leading-tight text-right ${tone.primary}`}>
-                    <div>Expires {absolute}</div>
-                    <div className={tone.secondary}>{relative}</div>
-                  </div>
-                );
-              })()}
-              <button
-                type="button"
-                onClick={disconnect}
-                disabled={busy}
-                className="px-3 py-1 rounded-lg border border-white/15 bg-white/5
-                           text-white/75 text-[11px] font-medium tracking-wide
-                           hover:bg-rose-500/15 hover:text-rose-200 hover:border-rose-300/40
-                           transition-colors disabled:opacity-50"
-              >
-                Disconnect
-              </button>
-            </>
-          ) : (
-            <button
-              type="button"
-              onClick={connect}
-              disabled={busy}
-              className="px-3 py-1 rounded-lg border border-ln-accent/35 bg-ln-accent/15
-                         text-ln-accent text-[11px] font-medium tracking-wide
-                         hover:bg-ln-accent/25 hover:border-ln-accent/55
-                         transition-colors disabled:opacity-50"
-            >
-              Connect {label}
-            </button>
-          )}
-        </div>
-      </div>
-      {deviceFlow && (
-        <div className="mt-2 rounded-lg border border-amber-400/25 bg-amber-500/[0.06]
-                        p-3 flex flex-col sm:flex-row sm:items-center gap-3">
-          <div className="flex-1 min-w-0">
-            <p className="text-white/70 text-[11px] leading-snug mb-1">
-              Enter this code on the Trakt page in your browser, or scan the QR to approve on your phone. Aura connects once you click Allow.
-            </p>
-            <div className="flex items-center gap-2">
-              <code className="font-mono tracking-[0.25em] text-[15px]
-                               text-amber-200 bg-black/30 rounded px-2.5 py-1
-                               border border-amber-400/20 select-all">
-                {deviceFlow.user_code}
-              </code>
-              <button
-                type="button"
-                onClick={copyUserCode}
-                className="px-2.5 py-1 rounded-md border border-white/15 bg-white/5
-                           text-white/75 text-[10.5px] font-medium tracking-wide
-                           hover:bg-white/10 hover:text-white transition-colors"
-              >
-                Copy
-              </button>
-              <button
-                type="button"
-                onClick={reopenVerification}
-                className="px-2.5 py-1 rounded-md border border-white/15 bg-white/5
-                           text-white/75 text-[10.5px] font-medium tracking-wide
-                           hover:bg-white/10 hover:text-white transition-colors"
-              >
-                Reopen in browser
-              </button>
-            </div>
-            <p className="text-white/40 text-[10.5px] mt-1.5 truncate">
-              {deviceFlow.verification_url}
-            </p>
-            {/* Escape hatch. Only worth surfacing while a flow is actually
-                in progress - as a permanent control it would invite users
-                into the worse path (the popup's cookie jar drops session
-                cookies at app exit, so it asks for a password every time). */}
-            <button
-              type="button"
-              onClick={connectInApp}
-              className="mt-1.5 text-white/40 hover:text-white/70 text-[10.5px]
-                         underline underline-offset-2 transition-colors"
-            >
-              Browser didn't open? Sign in inside Aura instead
-            </button>
-          </div>
-          {/* White plate regardless of theme - scanners need the quiet zone
-              and the light/dark polarity to be right. */}
-          {deviceQr && (
-            <div className="shrink-0 self-center rounded-md bg-white p-1.5">
-              <svg
-                viewBox={`0 0 ${deviceQr.size} ${deviceQr.size}`}
-                width={104}
-                height={104}
-                role="img"
-                aria-label={`QR code for ${deviceFlow.verification_url}`}
-                shapeRendering="crispEdges"
-              >
-                <path d={deviceQr.path} fill="#000" />
-              </svg>
-              <p className="text-black/55 text-[9px] text-center mt-1 leading-none">
-                Scan to approve
-              </p>
-            </div>
-          )}
-        </div>
-      )}
-      {/* AniList / Simkl waiting state. Device flow gives Trakt a code to
-          display; an authorization-code flow has nothing to show, so without
-          this the row just sat on a disabled button with no explanation of
-          what the user was supposed to do next in the browser. */}
-      {pending && !deviceFlow && (
-        <div className="mt-2 rounded-lg border border-ln-accent/25 bg-ln-accent/[0.06] p-3">
-          <p className="text-white/70 text-[11px] leading-snug">
-            Finish signing in to {label} in your browser. Aura connects as soon as you approve.
-          </p>
-          <button
-            type="button"
-            onClick={connectInApp}
-            className="mt-1.5 text-white/40 hover:text-white/70 text-[10.5px]
-                       underline underline-offset-2 transition-colors"
-          >
-            Browser didn't open? Sign in inside Aura instead
-          </button>
-        </div>
-      )}
-      {status?.expired && !pending && !deviceFlow && (
-        <p className="text-rose-400/90 text-xs">
-          {EXPIRED_COPY[service]}
-        </p>
-      )}
-      {status?.stale && !status?.expired && !pending && !deviceFlow && (
-        <p className="text-amber-400/80 text-xs">
-          {STALE_COPY[service]}
-        </p>
-      )}
-    </div>
-  );
-}
-
-// ---------------------------------------------------------------------------
 // SettingsView
 // ---------------------------------------------------------------------------
 
@@ -5024,18 +3521,6 @@ interface Props {
   addons: AddonEntry[];
   session: UserSession | null;
 }
-
-const LANG_OPTIONS = [
-  { value: "en", label: "English" },
-  { value: "ja", label: "Japanese" },
-  { value: "es", label: "Spanish" },
-  { value: "fr", label: "French" },
-  { value: "de", label: "German" },
-  { value: "it", label: "Italian" },
-  { value: "pt", label: "Portuguese" },
-  { value: "ko", label: "Korean" },
-  { value: "zh", label: "Chinese" },
-];
 
 interface CrashReportingConfig {
   consent: boolean | null;
@@ -5074,13 +3559,17 @@ export default function SettingsView({ addons, session }: Props) {
   const queueSavedToast = useCallback(() => {
     if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
     toastTimerRef.current = setTimeout(() => {
-      showAppToast("Settings saved");
+      showAppToast("Settings saved", { scope: SETTINGS_TOAST_SCOPE });
       toastTimerRef.current = null;
     }, TOAST_QUIET_MS);
   }, []);
   useEffect(() => {
     return () => {
+      // Leaving Settings: drop a save still debouncing (unchanged) and fade
+      // this page's confirmations out quickly, so a "Settings saved" pill
+      // does not sit over the next page's search bar for seconds.
       if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+      dismissAppToasts(SETTINGS_TOAST_SCOPE);
     };
   }, []);
 
@@ -5207,54 +3696,19 @@ export default function SettingsView({ addons, session }: Props) {
 
   // Patch a backend setting and round-trip through update_settings. Rejects when
   // the patch is refused or cannot be saved: the import reports that. The live
-  // controls go through patchBackend below.
+  // controls go through patchBackend below. The write, the diff and every event
+  // are patchBackendSettings' (backendSettings.ts, shared with the first-run
+  // setup); this keeps the page's copy and its "Saved" toast.
   const applyBackendPatch = useCallback(async (patch: Partial<BackendSettings>) => {
-    const updated = await invoke<BackendSettings>("update_settings", { patch });
-    // Against the state BEFORE the write (`updated` already holds the patch), by
-    // value (arrays): a patch that changed nothing must not stamp and push over
-    // another device's edit.
-    const before = backendRef.current as unknown as Record<string, unknown> | null;
-    const after = updated as unknown as Record<string, unknown>;
-    const changedKeys = Object.keys(patch).filter(
-      (k) => !before || JSON.stringify(before[k]) !== JSON.stringify(after[k]),
+    // Diffed against the page's copy as it stands once the write lands (read
+    // after the await, so an overlapping earlier patch is already in it).
+    const updated = await patchBackendSettings<BackendSettings>(
+      patch as Record<string, unknown>,
+      () => backendRef.current as unknown as Record<string, unknown> | null,
     );
     backendRef.current = updated;
     setBackend(updated);
     queueSavedToast();
-    // Live-apply subtitle styling - when the user adjusts size/colour/etc.
-    // we want the change to show up immediately in the active player
-    // without waiting for the next stream load.
-    if (Object.keys(patch).some((k) => k.startsWith("subtitle_"))) {
-      invoke("apply_subtitle_style").catch(() => {});
-    }
-    // The title bar's close button changes behaviour with this one setting
-    // (a click hides to tray, so it grows a hold-to-quit affordance), and it
-    // reads the value itself rather than taking a prop. Nudge it so the
-    // toggle applies immediately instead of on next launch.
-    //
-    // Deliberately narrow: `aura:settings-changed` also drives an AuraSkip
-    // re-stamp and a sync-chip refresh, so firing it on EVERY backend patch
-    // would cause pointless churn on unrelated settings.
-    if ("minimize_to_tray_on_close" in patch) {
-      window.dispatchEvent(new Event("aura:settings-changed"));
-    }
-    // The scrobble toggles get their own signal for the same reason the
-    // above is narrow. `scrobbleConn` caches both of them in a module-level
-    // snapshot that resolves once per session, and without this the cached
-    // answer never changed: turning scrobbling off and then skipping a
-    // filler run still pushed plays to Trakt / AniList.
-    if ("scrobble_enabled" in patch || "auto_scrobble_enabled" in patch) {
-      window.dispatchEvent(new Event("aura:scrobble-settings-changed"));
-    }
-    // The player's chord labels read the map themselves.
-    if ("keybindings" in patch) {
-      window.dispatchEvent(new CustomEvent("aura:keybindings-changed"));
-    }
-    // The narrow signal for every backend edit, with the keys it touched: sync
-    // stamps and pushes on it, App and ThemeEngine re-read only for theirs.
-    window.dispatchEvent(new CustomEvent("aura:backend-settings-changed", {
-      detail: { keys: changedKeys },
-    }));
   }, [queueSavedToast]);
 
   const patchBackend = useCallback(async (patch: Partial<BackendSettings>) => {
@@ -5264,6 +3718,44 @@ export default function SettingsView({ addons, session }: Props) {
       // ignore - UI keeps its optimistic state
     }
   }, [applyBackendPatch]);
+
+  // An HDR write (hdrMode.ts: the backend patch plus the player apply). Kept
+  // like applyBackendPatch: the page's copy follows, with its "Saved" toast.
+  const applyHdrWrite = useCallback(async (write: () => Promise<BackendSettings>) => {
+    try {
+      const updated = await write();
+      backendRef.current = updated;
+      setBackend(updated);
+      queueSavedToast();
+    } catch {
+      // ignore - the row keeps showing the stored value
+    }
+  }, [queueSavedToast]);
+
+  // An HDR mode written from elsewhere (the bell's "Turn on", the Off
+  // migration, the setup wizard), or the audio order written by its one-time
+  // repair or the bell's Undo: re-read so this page never shows, diffs
+  // against, or (on the next edit of that list) writes back the old value.
+  useEffect(() => {
+    const reread = () => {
+      invoke<BackendSettings>("get_settings").then(setBackend).catch(() => {});
+    };
+    window.addEventListener(HDR_MODE_CHANGED_EVENT, reread);
+    window.addEventListener(AUDIO_ORDER_CHANGED_EVENT, reread);
+    return () => {
+      window.removeEventListener(HDR_MODE_CHANGED_EVENT, reread);
+      window.removeEventListener(AUDIO_ORDER_CHANGED_EVENT, reread);
+    };
+  }, []);
+
+  // False once this page is leaving. React runs a removed tree's effect
+  // cleanups parent first, so a slider committing from its own cleanup
+  // (SettingSlider) sees it already false.
+  const pageLiveRef = useRef(false);
+  useEffect(() => {
+    pageLiveRef.current = true;
+    return () => { pageLiveRef.current = false; };
+  }, []);
 
   const setLocal = (patch: Partial<AuraSettings>) =>
     setAura((prev) => ({ ...prev, ...patch }));
@@ -5303,7 +3795,7 @@ export default function SettingsView({ addons, session }: Props) {
 
   // Consume the section anchor set by App's aura:open-settings handler
   // (window.location.hash). Without this, deep-linking to a Settings
-  // section (Trakt re-auth notification, scrobble onboarding, the title
+  // section (a scrobble re-auth notification, scrobble onboarding, the title
   // bar's ServiceStatusChip) switched the view but never scrolled.
   useEffect(() => {
     if (!scrollEl) return;
@@ -5521,7 +4013,7 @@ export default function SettingsView({ addons, session }: Props) {
               footer. The nav's own internal scroll (below) still absorbs
               any TOC growth, so this only has to clear the chrome. */}
           <aside
-            className="sticky top-6 self-start overflow-y-auto"
+            {...sheet("aura-toc-scroll sticky top-6 self-start overflow-y-auto rounded-[20px] p-[10px]")}
             style={{ maxHeight: "calc(100vh - 6rem)" }}
           >
             <SettingsToc
@@ -5550,10 +4042,9 @@ export default function SettingsView({ addons, session }: Props) {
           {searchQuery.trim() && matchCount === 0 && (
             <div
               role="status"
-              className="text-center px-4 py-10 rounded-2xl
-                         bg-white/3 border border-white/8
+              {...sheet(`text-center px-4 py-10 rounded-[20px]
                          text-white/55 text-sm
-                         animate-[settings-fade-in_180ms_ease-out]"
+                         animate-[settings-fade-in_180ms_ease-out]`)}
             >
               <p className="text-white/85 text-base mb-1">No settings match
                 <span className="font-mono text-ln-accent ml-2">"{searchQuery.trim()}"</span>
@@ -5762,7 +4253,6 @@ export default function SettingsView({ addons, session }: Props) {
                 <MouseBindRow
                   label="Meta panel button"
                   description="The button that opens and closes the panel (Middle, Back or Forward). Click the chip, then press that button; Esc cancels."
-                  bare
                   button={aura.metaPanelBindButton}
                   onChange={(b) => setLocal({ metaPanelBindButton: b })}
                 />
@@ -5781,13 +4271,13 @@ export default function SettingsView({ addons, session }: Props) {
 
           {/* ── Open Links ────────────────────────────────────────────────
               The right-click "Open in…" external-source links (IMDb /
-              MyAnimeList / Trakt / …). Default opens them in Aura's
+              MyAnimeList and more). Default opens them in Aura's
               in-app popup webview; this switches to the user's default
               system browser. */}
           <Section id="sec-open-links" title="Open Links">
             <SettingToggle
               label="Open external links in my browser"
-              description="Opens the right-click “Open in…” links (IMDb, MyAnimeList, Trakt and more) in your default browser instead of Aura's in-app popup."
+              description="Opens the right-click “Open in…” links (IMDb, MyAnimeList and more) in your default browser instead of Aura's in-app popup."
               value={aura.openLinksExternally}
               onChange={(v) => setLocal({ openLinksExternally: v })}
             />
@@ -5801,44 +4291,28 @@ export default function SettingsView({ addons, session }: Props) {
               peak nits stay visible by decision. */}
           {backend && (
             <Section id="sec-video-audio" title="Video & Audio">
-              <SettingDropdown
-                label="HDR mode"
-                description={
-                  // Keep this short - the user reading this is debugging
-                  // playback colour, not learning colour science.
-                  "How to handle HDR video. Tone-map (recommended) converts it to SDR for a normal monitor. Passthrough sends HDR to an HDR display (turn HDR on in Windows first) and adds a peak-brightness (nits) setting for clipped highlights. Off skips HDR processing. Changes apply fully from the next playback."
-                }
-                value={(() => {
-                  const m = (backend.hdr_mode ?? "").trim().toLowerCase();
-                  if (m === "off" || m === "passthrough" || m === "sdr") return m;
-                  // Migrate legacy boolean: hdr_enabled true → "sdr", false → "off".
-                  return backend.hdr_enabled ? "sdr" : "off";
-                })()}
-                required
-                options={[
-                  { value: "sdr",         label: "Tone-map HDR → SDR (recommended)" },
-                  { value: "passthrough", label: "Passthrough (HDR display)" },
-                  { value: "off",         label: "Off (no HDR processing)" },
-                ]}
-                onChange={async (raw) => {
-                  const mode = raw === "off" || raw === "passthrough" || raw === "sdr"
-                    ? raw
-                    : "sdr";
-                  await patchBackend({ hdr_mode: mode, hdr_enabled: mode !== "off" });
-                  invoke("apply_hdr_settings", { mode }).catch(() => {});
+              {/* HDR mode and peak nits are machine-local (render.json,
+                  stripped from sync and export): they describe this
+                  display. Both write through hdrMode.ts, which also
+                  applies the change to the player. */}
+              <HdrModeSetting
+                value={hdrModeOf(backend as unknown as Record<string, unknown>)}
+                onChange={(mode) => {
+                  void applyHdrWrite(() => setHdrMode<BackendSettings>(mode, {
+                    before: () => backendRef.current as unknown as Record<string, unknown> | null,
+                    byUser: true,
+                  }));
                 }}
               />
-              {(backend.hdr_mode ?? "").trim().toLowerCase() === "passthrough" && (
+              {hdrModeOf(backend as unknown as Record<string, unknown>) === "passthrough" && (
                 <AttachedSettings>
                   <HdrPeakNitsRow
                     value={backend.hdr_target_peak_nits ?? 0}
-                    onChange={async (v) => {
-                      await patchBackend({ hdr_target_peak_nits: v });
-                      // Re-push the passthrough option set so the new
-                      // target-peak applies to the running instance
-                      // immediately (apply_hdr_settings re-reads the
-                      // freshly-saved snapshot for the peak value).
-                      invoke("apply_hdr_settings", { mode: "passthrough" }).catch(() => {});
+                    onChange={(v) => {
+                      void applyHdrWrite(() => setHdrPeakNits<BackendSettings>(
+                        v,
+                        () => backendRef.current as unknown as Record<string, unknown> | null,
+                      ));
                     }}
                   />
                 </AttachedSettings>
@@ -5852,7 +4326,13 @@ export default function SettingsView({ addons, session }: Props) {
                 max={60}
                 step={1}
                 suffix=" s"
-                onChange={(v) => setLocal({ seekStepSeconds: v })}
+                onChange={(v) => {
+                  // A gesture still open when Settings closes commits from the
+                  // slider's unmount, where setLocal no longer reaches the
+                  // save effect: write storage directly then.
+                  if (pageLiveRef.current) setLocal({ seekStepSeconds: v });
+                  else saveAuraSettings({ ...loadAuraSettings(), seekStepSeconds: v });
+                }}
               />
               <div className="h-px bg-white/6" />
               <NextUpLeadTimeRow
@@ -5893,7 +4373,7 @@ export default function SettingsView({ addons, session }: Props) {
                     emit nothing for it and the filter becomes a no-op. */}
                 <SettingDropdown
                   label="Auto-skip filler / recap during autoplay"
-                  description="When the next episode is filler or recap, autoplay skips to the next canon episode instead, marking the episodes in between as Skipped. Needs AIOMetadata's filler and recap flags."
+                  description="When the next episode is filler or recap, autoplay skips to the next canon episode instead, marking the episodes in between as Skipped. Needs AIOMetadata's filler and recap flags (AIOMetadata installed on its own or inside AIOStreams)."
                   value={aura.nextUpSkipFillerRecap}
                   required
                   options={[
@@ -5968,8 +4448,10 @@ export default function SettingsView({ addons, session }: Props) {
                   suffix=" s"
                   onChange={(v) => {
                     const ra = Math.max(5, Math.round(v * 0.67));
-                    patchBackend({ cache_secs: v, demuxer_readahead_secs: ra });
+                    const saved = patchBackend({ cache_secs: v, demuxer_readahead_secs: ra });
                     invoke("apply_buffer_settings", { cacheSecs: v, readaheadSecs: ra, maxMib: backend.demuxer_max_mib ?? 768 }).catch(() => {});
+                    // Returned so the slider holds its value until the write lands.
+                    return saved;
                   }}
                 />
                 <AttachedSettings>
@@ -5981,8 +4463,9 @@ export default function SettingsView({ addons, session }: Props) {
                     max={2048}
                     suffix=" MiB"
                     onChange={(v) => {
-                      patchBackend({ demuxer_max_mib: v });
+                      const saved = patchBackend({ demuxer_max_mib: v });
                       invoke("apply_buffer_settings", { cacheSecs: backend.cache_secs ?? 180, readaheadSecs: backend.demuxer_readahead_secs ?? 120, maxMib: v }).catch(() => {});
+                      return saved;
                     }}
                   />
                 </AttachedSettings>
@@ -6005,7 +4488,7 @@ export default function SettingsView({ addons, session }: Props) {
                       value={backend.screenshot_dir ?? ""}
                       placeholder="Default: Pictures\Aura"
                       onChange={(e) => patchBackend({ screenshot_dir: e.target.value })}
-                      className="flex-1 min-w-0 bg-white/[0.06] border border-white/10 rounded-lg px-3 py-2 text-[13px] text-white/85 placeholder:text-white/30 focus:outline-none focus:border-ln-accent/50"
+                      className="aura-glass-field flex-1 min-w-0 rounded-lg px-3 py-2 text-[13px] text-white/85 placeholder:text-white/30 focus:outline-none"
                     />
                     <button
                       type="button"
@@ -6013,7 +4496,7 @@ export default function SettingsView({ addons, session }: Props) {
                         const picked = await invoke<string | null>("pick_folder").catch(() => null);
                         if (picked) patchBackend({ screenshot_dir: picked });
                       }}
-                      className="flex-shrink-0 px-3 py-2 rounded-lg text-[13px] text-white/85 bg-white/[0.08] hover:bg-white/[0.14] border border-white/10 transition-colors"
+                      className="aura-glass-flat aura-glass-press flex-shrink-0 px-3 py-2 rounded-lg text-[13px] text-white/85"
                     >
                       Browse
                     </button>
@@ -6021,7 +4504,7 @@ export default function SettingsView({ addons, session }: Props) {
                       <button
                         type="button"
                         onClick={() => patchBackend({ screenshot_dir: "" })}
-                        className="flex-shrink-0 px-3 py-2 rounded-lg text-[13px] text-white/55 hover:text-white hover:bg-white/[0.08] transition-colors"
+                        className="aura-glass-item flex-shrink-0 px-3 py-2 rounded-lg text-[13px] text-white/55 hover:text-white"
                       >
                         Reset
                       </button>
@@ -6109,9 +4592,9 @@ export default function SettingsView({ addons, session }: Props) {
             <Section id="sec-subtitle-defaults" title="Subtitles · Defaults">
               <SettingDropdown
                 label="Subtitle language"
-                description="Loaded automatically when subtitles are available. Applied to all titles; per-title overrides cover the rare exception."
+                description="Loaded automatically when subtitles are available. Off starts titles with no subtitles, forced ones included, unless you picked a language for that title in the player. You can still turn them on from the player's Subtitles menu."
                 value={backend.subtitle_language}
-                options={LANG_OPTIONS}
+                options={subtitleLanguageOptions(backend.subtitle_language)}
                 required
                 onChange={(v) => v && patchBackend({ subtitle_language: v })}
               />
@@ -6273,7 +4756,7 @@ export default function SettingsView({ addons, session }: Props) {
               <p className="text-white/40 text-xs">
                 Click a row, then press a key to bind it. Press Escape to cancel. A key already in use moves to the new row, and the old row is left unbound.
               </p>
-              <div className="space-y-1">
+              <div className="aura-content-group">
                 {KEYBIND_ACTIONS.map((a) => (
                   <Fragment key={a.id}>
                   <KeybindRow
@@ -6298,7 +4781,7 @@ export default function SettingsView({ addons, session }: Props) {
                       for (const { label } of moved) {
                         showAppToast(
                           `${prettyBinding(next)} moved from ${label} to ${a.label}. ${label} is now unbound.`,
-                          { duration: 5000 },
+                          { duration: 5000, scope: SETTINGS_TOAST_SCOPE },
                         );
                       }
                     }}
@@ -6306,14 +4789,18 @@ export default function SettingsView({ addons, session }: Props) {
                   {/* The hold option belongs to this key, so it sits under
                       its row rather than among the Next Up settings. */}
                   {a.id === "play-next-episode" && (
-                    <AttachedSettings>
-                      <SettingToggle
-                        label="Hold to skip filler / recap"
-                        description="When the Next Up card offers to skip filler or recap, hold this key for 2 seconds to skip (the card shows where it will land). Off, one press skips. With automatic scrobbling on, episodes you skip are sent to your scrobbling services as watched."
-                        value={aura.nextUpHoldToSkip}
-                        onChange={(v) => setLocal({ nextUpHoldToSkip: v })}
-                      />
-                    </AttachedSettings>
+                    // Inside the grouped list: a little air so the box does
+                    // not touch the rows (the next row's hairline follows it).
+                    <div className="pt-0.5 pb-1.5 pr-1">
+                      <AttachedSettings>
+                        <SettingToggle
+                          label="Hold to skip filler / recap"
+                          description="When the Next Up card offers to skip filler or recap, hold this key for 2 seconds to skip (the card shows where it will land). Off, one press skips. With automatic scrobbling on, episodes you skip are sent to your scrobbling services as watched."
+                          value={aura.nextUpHoldToSkip}
+                          onChange={(v) => setLocal({ nextUpHoldToSkip: v })}
+                        />
+                      </AttachedSettings>
+                    </div>
                   )}
                   </Fragment>
                 ))}
@@ -6333,6 +4820,49 @@ export default function SettingsView({ addons, session }: Props) {
               required
               onChange={(v) => v && setTheme(v as ThemeId)}
             />
+            {/* Custom accent for the CURRENT theme (src/AccentColorSetting.tsx,
+                drawn by src/themeAccent.ts). AuraSettings.themeAccents, so
+                portable (PORTABLE_AURA_FIELDS) and cloud-synced; the picker
+                previews through CSS variables and commits on release. */}
+            <AccentColorRow
+              theme={theme}
+              value={aura.themeAccents[theme] ?? null}
+              onChange={(hex) => setAura((prev) => {
+                const next = { ...prev.themeAccents };
+                if (hex) next[theme] = hex;
+                else delete next[theme];
+                return { ...prev, themeAccents: next };
+              })}
+            />
+            {/* Material style + Cursor glow (src/glassStyle.ts). AuraSettings
+                fields, so portable (PORTABLE_AURA_FIELDS) and cloud-synced like
+                the theme; Clear (stored "liquid")'s GPU fallback is decided per
+                machine. */}
+            <GlassStyleRows
+              glassStyle={aura.glassStyle}
+              cursorGlow={aura.glassCursorGlow}
+              onGlassStyle={(v) => setLocal({ glassStyle: v })}
+              onCursorGlow={(v) => setLocal({ glassCursorGlow: v })}
+              // Edge highlights / Surface glow / Glow size under Cursor glow:
+              // AuraSettings.glassGlowTune, portable and synced like the glow.
+              glowTune={aura.glassGlowTune}
+              onGlowTune={(t) => setLocal({ glassGlowTune: t })}
+            />
+            {/* Real glass over video: machine-local (render.json; stripped in
+                sync.ts, never in settingsTransfer), so it needs the backend
+                read. The Theme section itself is not gated on `backend`.
+                Shelved behind REAL_GLASS_AVAILABLE (realGlass.ts): hidden, so
+                it is also out of Settings search (rows are found in the DOM). */}
+            {backend && REAL_GLASS_AVAILABLE && (
+              <RealGlassRow
+                value={backend.real_glass === true}
+                onChange={(v) => {
+                  // The engine checks the stored setting before loading the
+                  // shader, so it is told only after the write lands.
+                  void patchBackend({ real_glass: v }).then(() => setRealGlassEnabled(v));
+                }}
+              />
+            )}
             <div className="h-px bg-white/6" />
             {/* Reduced motion - disables Aura's decorative infinite-loop
                 animations (title bar sweep, ambient backdrop drift,
@@ -6394,7 +4924,7 @@ export default function SettingsView({ addons, session }: Props) {
                     value={backend.download_dir ?? ""}
                     placeholder="Not set yet"
                     readOnly
-                    className="flex-1 min-w-0 bg-white/[0.06] border border-white/10 rounded-lg px-3 py-2 text-[13px] text-white/85 placeholder:text-white/30 focus:outline-none focus:border-ln-accent/50"
+                    className="aura-glass-field flex-1 min-w-0 rounded-lg px-3 py-2 text-[13px] text-white/85 placeholder:text-white/30 focus:outline-none"
                   />
                   <button
                     type="button"
@@ -6412,7 +4942,7 @@ export default function SettingsView({ addons, session }: Props) {
                         showAppToast(e instanceof Error ? e.message : String(e), { tone: "danger" });
                       }
                     }}
-                    className="flex-shrink-0 px-3 py-2 rounded-lg text-[13px] text-white/85 bg-white/[0.08] hover:bg-white/[0.14] border border-white/10 transition-colors"
+                    className="aura-glass-flat aura-glass-press flex-shrink-0 px-3 py-2 rounded-lg text-[13px] text-white/85"
                   >
                     Browse
                   </button>
@@ -6420,7 +4950,7 @@ export default function SettingsView({ addons, session }: Props) {
                     <button
                       type="button"
                       onClick={() => patchBackend({ download_dir: "" })}
-                      className="flex-shrink-0 px-3 py-2 rounded-lg text-[13px] text-white/55 hover:text-white hover:bg-white/[0.08] transition-colors"
+                      className="aura-glass-item flex-shrink-0 px-3 py-2 rounded-lg text-[13px] text-white/55 hover:text-white"
                     >
                       Clear
                     </button>
@@ -6482,14 +5012,14 @@ export default function SettingsView({ addons, session }: Props) {
             </Section>
           )}
 
-          {/* Scrobbling - direct Trakt + AniList + Simkl OAuth.
+          {/* Scrobbling - direct AniList + Simkl OAuth.
               Replaces the AIOMetadata-addon scrobble path with a
               direct connection to each provider. Tokens are stored in
               the OS keyring per Stremio account so signing out and
               back in keeps the connection. Connect opens the user's
-              default browser; the VPS proxy at aura.animasec.dev
-              completes the OAuth dance and deep-links the token back
-              into Aura (Simkl needs no proxy: it redirects straight to
+              default browser; for AniList the VPS proxy at
+              aura.animasec.dev completes the OAuth dance and deep-links
+              the token back into Aura (Simkl needs no proxy: it redirects straight to
               the loopback listener, which does the exchange itself).
               The ScrobbleAuthRows (Simkl included) add no AppSettings /
               AuraSettings field: the connections live in the keyring, per
@@ -6499,21 +5029,15 @@ export default function SettingsView({ addons, session }: Props) {
           {backend && (
             <Section id="sec-scrobble" title="Scrobbling">
               <ScrobbleAuthRow
-                service="trakt"
-                authKey={session?.auth_key ?? null}
-                description="Adds movies and episodes to your Trakt history once you finish them (80% through, with at least 5 minutes watched). Nothing is sent while you watch, except an episode you mark Skipped, which is sent right away."
-              />
-              <div className="h-px bg-white/6" />
-              <ScrobbleAuthRow
                 service="anilist"
                 authKey={session?.auth_key ?? null}
-                description="Updates your AniList list as you finish anime episodes. Works alongside Trakt: an anime episode with an IMDb id goes to both."
+                description={SCROBBLE_ROW_DESCRIPTIONS.anilist}
               />
               <div className="h-px bg-white/6" />
               <ScrobbleAuthRow
                 service="simkl"
                 authKey={session?.auth_key ?? null}
-                description="Adds what you finish to your Simkl history, once per item (an episode marked Skipped is sent right away). Works alongside the others: anime also goes to AniList, movies and series to Trakt."
+                description={SCROBBLE_ROW_DESCRIPTIONS.simkl}
               />
               <div className="h-px bg-white/6" />
               <SettingToggle
@@ -6592,7 +5116,7 @@ export default function SettingsView({ addons, session }: Props) {
             <Section id="sec-crash-reporting" title="Crash Reporting">
               <SettingToggle
                 label="Send crash reports"
-                description="Sends anonymised error reports (stack trace, console warnings and errors, OS and app version) to the developer's Sentry, plus a masked UI replay with network metadata (text masked, media blocked) for sessions with an error and about 1 in 10 others. Account details, IP and location are removed; the error text is not, so it can hold what the failing code was handling. Applies after a restart."
+                description="Sends anonymised error reports (stack trace, console warnings and errors, OS and app version, a random install id) to the developer's Sentry, plus a masked UI replay with network metadata (text masked, media blocked) for sessions with an error and about 1 in 10 others. Account details, IP and location are removed; the error text is not, so it can hold what the failing code was handling. Applies after a restart."
                 value={crashConfig.consent === true}
                 onChange={(v) => patchCrashConfig({ consent: v })}
               />
@@ -6687,11 +5211,6 @@ export default function SettingsView({ addons, session }: Props) {
             />
           )}
 
-          {/* About - also hosts the Debug Panel button (overlay
-              modal). Debug surfaced via About-button instead of its
-              own page section because it's a diagnostic tool, not a
-              setting; the modal also manages its own playback test
-              lifecycle so the user doesn't need a stream loaded. */}
           <AboutSection addonCount={addons.length} />
           </div>{/* /content column */}
 

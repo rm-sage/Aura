@@ -17,6 +17,7 @@ import type { AddonEntry, LibraryItem, MetaDetail, MetaPreview } from "../types"
 import { loadAuraSettings, saveAuraSettings } from "../auraSettings";
 import { getMetaDetailFallback } from "../metaCache";
 import { PAGE_CONTENT_MAX_W } from "../pageLayout";
+import { SegmentedControl } from "../settingsControls";
 import { ContinueWatchingCard } from "../CinemaRows";
 import { useEpisodesBehind } from "../LibraryContext";
 import { libraryItemSeriesId } from "../libraryNormalize";
@@ -29,6 +30,7 @@ import {
   airingNextMs, airingLastAiredMs, airWindow, episodesBehind,
   type AirWindow,
 } from "../airing";
+import { sheet } from "../glassSheet";
 
 interface Props {
   library: LibraryItem[];
@@ -262,8 +264,8 @@ export default function AiringView({ library, addons, onSelectMeta }: Props) {
           {/* Header */}
           <div className="flex items-end justify-between gap-4 flex-wrap">
             <div>
-              <h1 className="aura-row-title text-3xl font-semibold tracking-tight">Airing</h1>
-              <p className="text-white/35 text-sm mt-1">
+              <h1 data-glass-light="text" className="aura-row-title text-3xl font-semibold tracking-tight">Airing</h1>
+              <p className="text-white/55 text-sm mt-1">
                 {loading && total === 0
                   ? "Finding what's currently airing…"
                   : `${total} currently airing series in your library.`}
@@ -271,50 +273,33 @@ export default function AiringView({ library, addons, onSelectMeta }: Props) {
             </div>
             {total > 0 && (
               <div className="flex items-center gap-2 flex-wrap">
-                {/* Group-by segmented control */}
-                <div className="flex items-center rounded-full bg-white/5 border border-white/10 p-0.5">
-                  {GROUP_OPTIONS.map((g) => (
-                    <button
-                      key={g.id}
-                      onClick={() => setGroup(g.id)}
-                      className={`px-3 py-1 rounded-full text-xs font-medium transition-colors
-                                  ${groupBy === g.id ? "bg-ln-accent/20 text-ln-accent" : "text-white/55 hover:text-white/85"}`}
-                    >
-                      {g.label}
-                    </button>
-                  ))}
-                </div>
+                {/* Group-by: the shared glass segmented control. */}
+                <SegmentedControl<GroupBy>
+                  value={groupBy}
+                  onChange={setGroup}
+                  ariaLabel="Group airing shows"
+                  options={GROUP_OPTIONS.map((g) => ({ value: g.id, label: g.label }))}
+                />
                 {/* Sort dropdown */}
                 <select
                   value={sort}
                   onChange={(e) => setSortMode(e.target.value as SortMode)}
-                  className="px-3 py-1.5 rounded-full text-xs font-medium bg-white/5 border border-white/10
-                             text-white/75 hover:text-white/90 focus:outline-none focus-visible:ring-2 focus-visible:ring-ln-accent/60"
+                  className="aura-glass-flat aura-glass-select pl-3 py-1.5 rounded-full text-xs font-medium
+                             text-white/75 hover:text-white/90 appearance-none cursor-pointer
+                             focus:outline-none focus-visible:ring-2 focus-visible:ring-ln-accent/60"
                   aria-label="Sort airing shows"
                 >
                   {SORT_OPTIONS.map((o) => (
                     <option key={o.id} value={o.id} className="bg-zinc-900">{o.label}</option>
                   ))}
                 </select>
-                {/* Tile-size segmented control */}
-                <div
-                  className="flex items-center rounded-full bg-white/5 border border-white/10 p-0.5"
-                  role="group"
-                  aria-label="Tile size"
-                >
-                  {TILE_SIZE_OPTIONS.map((t) => (
-                    <button
-                      key={t.id}
-                      onClick={() => setTileSizeMode(t.id)}
-                      aria-pressed={tileSize === t.id}
-                      title={`${t.label} tiles`}
-                      className={`px-3 py-1 rounded-full text-xs font-medium transition-colors
-                                  ${tileSize === t.id ? "bg-ln-accent/20 text-ln-accent" : "text-white/55 hover:text-white/85"}`}
-                    >
-                      {t.label}
-                    </button>
-                  ))}
-                </div>
+                {/* Tile size: the shared glass segmented control. */}
+                <SegmentedControl<TileSize>
+                  value={tileSize}
+                  onChange={setTileSizeMode}
+                  ariaLabel="Tile size"
+                  options={TILE_SIZE_OPTIONS.map((t) => ({ value: t.id, label: t.label, title: `${t.label} tiles` }))}
+                />
               </div>
             )}
           </div>
@@ -328,10 +313,10 @@ export default function AiringView({ library, addons, onSelectMeta }: Props) {
 
           {/* Empty state */}
           {!loading && total === 0 ? (
-            <div className="glass-panel rounded-2xl px-6 py-10 text-center">
+            <div {...sheet("rounded-[20px] px-6 py-10 text-center")}>
               <p className="text-white/65 text-sm">
                 {signalsOff
-                  ? "Nothing in your library looks airing right now. Aura detects airing shows best from the shared release feed — sign in and keep it enabled (Settings > Scrobbling) to also catch returning and between-season shows."
+                  ? "Nothing in your library looks airing right now. Aura detects airing shows best from the shared release feed. Sign in and keep it enabled (Settings > Scrobbling) to also catch returning and between-season shows."
                   : "Nothing in your library is airing right now. Series with an upcoming or recently scheduled episode show up here."}
               </p>
             </div>
@@ -340,13 +325,13 @@ export default function AiringView({ library, addons, onSelectMeta }: Props) {
               {sections.map((section) => (
                 <div key={section.key} className="space-y-3">
                   {section.label && (
-                    <h2 className="aura-row-title text-lg font-semibold tracking-tight text-white/85">
+                    <h2 data-glass-light="text" className="aura-row-title text-lg font-semibold tracking-tight text-white/85">
                       {section.label}
                       <span className="ml-2 text-white/35 text-xs font-normal tabular-nums">{section.items.length}</span>
                     </h2>
                   )}
                   <div
-                    className="grid gap-4"
+                    className="grid gap-4 aura-airing-grid"
                     style={{ gridTemplateColumns: `repeat(auto-fill, minmax(${TILE_SIZES[tileSize]}, 1fr))` }}
                   >
                     {section.items.map((item) => (

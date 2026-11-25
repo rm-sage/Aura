@@ -1,0 +1,369 @@
+/* Aura - (c) 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice. */
+/* SPDX-License-Identifier: AGPL-3.0-or-later */
+
+/* DETAIL PAGE glass (round 11 cohesion pass): the info panel, the episodes /
+   streams panel, the HUD tab bar, episode and stream content rows, and the
+   faux-frost scopes for badges on art inside the Detail panels. Loaded from
+   main.tsx after App.css, unlayered, so a rule here wins over App.css
+   `@layer components` without editing it. frontend-ui.md "The Detail page". */
+
+/* ---- The two large panels (R1: the notifications-sheet recipe) -------- */
+/* `#aura-hud-panel` (DetailHud) and the episodes / streams panel
+   (DetailView UnifiedPanel): plain `.aura-float-glass` (the Liquid menu tier:
+   one uniform body, tone map, idle rim and the cursor light as a panel;
+   Frosted in Matte) with `data-liquid="off"` (CSS face only: both are
+   far over MAX_AREA and two side-by-side panels must match). Nothing here
+   sets their background, border, box-shadow or backdrop-filter. */
+.aura-detail-panel {
+  border-radius: 20px;
+}
+/* The HUD panel's scroller sits INSIDE the glass (a mask on the glass itself
+   would fade its face too): scrolled, the content fades out under the top
+   edge over 12 px (`data-scrolled`, set only when the state flips; a 12 px
+   ramp is far too short to band). */
+.aura-detail-scroll[data-scrolled] {
+  -webkit-mask-image: linear-gradient(to bottom, transparent, #000 12px);
+  mask-image: linear-gradient(to bottom, transparent, #000 12px);
+}
+
+/* Legibility on the menu face (lighter than the old 0.80 baked surface):
+   dim text inside either panel is floored in TWO tiers so the panels keep a
+   hierarchy (one 0.58 value flattened meta, tags and ranges into one grey):
+   /30 to /40 at white 0.56 (just over the notifications sheet's 0.55 floor,
+   4.5:1 or more over a white poster), /45 and /50 at 0.64. `:where` keeps
+   the utility's own specificity, so a hover:/group-hover: colour still
+   wins. Decorative separators (/20, /25) keep their own value. */
+.aura-detail-panel :where(.text-white\/30, .text-white\/35, .text-white\/40) {
+  color: rgb(255 255 255 / 0.56);
+}
+.aura-detail-panel :where(.text-white\/45, .text-white\/50) {
+  color: rgb(255 255 255 / 0.64);
+}
+
+/* ---- Panel header (DetailView PanelHeader) ---------------------------- */
+.aura-detail-head {
+  box-shadow: inset 0 -1px 0 rgb(255 255 255 / 0.09);
+}
+/* The accent bar: the accent MARK (a dark custom accent still reads on the
+   glass), no outer glow (the Liquid selection rule: no glow anywhere). */
+.aura-detail-headbar {
+  background: var(--ln-accent-mark);
+}
+/* A mono count chip, like the notifications sheet's "N new" but neutral:
+   a faint white wash, no border. */
+.aura-detail-count {
+  display: inline-flex;
+  align-items: center;
+  flex: none;
+  height: 20px;
+  padding: 0 8px;
+  border-radius: 999px;
+  font-size: 10.5px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: rgb(255 255 255 / 0.66);
+  background: rgb(255 255 255 / 0.06);
+  white-space: nowrap;
+}
+/* The episode count chip: the same chip in the accent mark's colours (it is
+   the one accent figure in the header). */
+.aura-detail-count.is-accent {
+  color: var(--ln-accent-mark-text);
+  background: color-mix(in srgb, var(--ln-accent-mark) 14%, transparent);
+}
+/* Small header icon buttons (Refresh, the format cog): transparent until
+   hovered, white 0.62 idle (0.55 sat under 4.5:1 on a light key art). */
+.aura-detail-iconbtn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 999px;
+  color: rgb(255 255 255 / 0.66);
+  transition: background-color 150ms ease, color 150ms ease;
+}
+.aura-detail-iconbtn:hover:not(:disabled) { color: #fff; background-color: rgb(255 255 255 / 0.08); }
+.aura-detail-iconbtn:disabled { opacity: 0.4; cursor: default; }
+.aura-detail-iconbtn:focus-visible { outline: 1px solid rgb(255 255 255 / 0.36); outline-offset: 0; }
+
+/* ---- HUD tab bar (DetailHud) ------------------------------------------ */
+/* ONE A control (`.aura-float-glass.aura-glass-control`, one backdrop pass,
+   one lens) holding transparent tab buttons and ONE sliding inner pill, the
+   rail pattern. It never lifts on hover (the tabs carry the hover). */
+/* It wraps onto a second line in a narrow column (seven anime tabs need
+   about 630 px; the column is about 420 px at 900 x 600), never scrolls
+   sideways with a hidden scrollbar (the last tabs would just vanish). */
+.aura-hud-tabbar {
+  position: relative;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px;
+  align-self: flex-start;
+  max-width: 100%;
+  padding: 4px;
+  border-radius: 14px;
+}
+html[data-glass] .aura-hud-tabbar.aura-glass-control:hover { --lg-lift: 0; }
+/* Liquid: the A face, but DENSER than the rail's 0.30. The bar sits on the
+   key art, which can be white: at 0.30 its labels measured 2.6 to 3.0:1 over
+   a white poster. At the menu tier's density (0.58) they keep 4.5:1, and the
+   bar reads as the same material as the panel under it. It is CSS face only
+   (`data-liquid="off"` in DetailHud): the lens bakes the :root tokens, so a
+   per-element tint would not reach it. */
+html[data-glass="liquid"] .aura-hud-tabbar {
+  --lg-ctl-tint-top: 0.58;
+  --lg-ctl-tint-bottom: 0.58;
+}
+.aura-hud-tabbtn {
+  position: relative;
+  z-index: 1;
+  flex: none;
+  height: 28px;
+  padding: 0 12px;
+  border: 0;
+  border-radius: 10px;
+  background: none;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  white-space: nowrap;
+  color: rgb(255 255 255 / 0.76);
+  text-shadow: 0 1px 2px rgb(0 0 0 / 0.55);
+  cursor: pointer;
+  transition: color 150ms ease;
+}
+.aura-hud-tabbtn:hover { color: rgb(255 255 255 / 0.92); }
+.aura-hud-tabbtn:focus-visible { outline: 1px solid rgb(255 255 255 / 0.4); outline-offset: -1px; }
+/* Selected: the rail's lit label. Frosted the accent (on-glass), Liquid
+   accent 34% into white. */
+.aura-hud-tabbtn[aria-selected="true"] { color: var(--ln-accent-mark-text); }
+html[data-glass="liquid"] .aura-hud-tabbtn[aria-selected="true"] {
+  color: color-mix(in srgb, rgb(var(--ln-accent-rgb)) 34%, white);
+}
+/* The inner pill (`data-glass-light="rim"`): the rail pill. animateSpan
+   writes translate + width; DetailHud writes top / height (the selected
+   tab's line). */
+.aura-hud-tabpill {
+  position: absolute;
+  left: 0;
+  top: 4px;
+  height: 28px;
+  width: 0;
+  z-index: 0;
+  border-radius: 10px;
+  pointer-events: none;
+  background:
+    var(--lg-rim-layer),
+    linear-gradient(135deg,
+      rgb(var(--ln-accent-rgb) / 0.22) 0%,
+      rgb(var(--ln-accent-rgb) / 0.14) 50%,
+      rgb(var(--ln-accent-rgb) / 0.07) 100%);
+  box-shadow: inset 0 0 0 1px rgb(var(--ln-accent-rgb) / 0.35);
+  opacity: 0;
+  transition: translate 380ms cubic-bezier(0.34, 1.56, 0.64, 1), width 380ms cubic-bezier(0.34, 1.56, 0.64, 1), opacity 160ms ease-out;
+}
+.aura-hud-tabpill.is-on { opacity: 1; }
+html[data-glass="liquid"] .aura-hud-tabpill {
+  isolation: isolate;
+  background: var(--lg-rim-layer), rgb(255 255 255 / 0.075);
+  --lg-idle-tl: 0.30;
+  --lg-idle-mid: 0.04;
+  --lg-idle-br: 0.16;
+  box-shadow:
+    inset 0 0 12px rgb(255 255 255 / 0),
+    0 2px 8px rgb(0 0 0 / 0.28);
+  /* The springs move it in JS (animateSpan): no translate / width transition. */
+  transition: opacity 160ms ease-out;
+}
+html[data-reduced-motion="true"] .aura-hud-tabpill { transition-duration: 1ms !important; }
+html:is([data-theme="contrast"], [data-theme="contrast-azure"]) .aura-hud-tabpill {
+  box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.35);
+}
+
+/* ---- Content rows (R3) ------------------------------------------------- */
+/* Episode rows (`.aura-ep-row` in `.aura-ep-item` wrappers) and stream rows
+   (`.aura-stream-row`): CONTENT on the panel, never glass, with ONE shared
+   Liquid hover droplet per list (useListDroplet). Frosted keeps a faint
+   per-row hover fill. A hairline sits between rows and hides next to a
+   hovered or focused one. Rows are positioned, so they paint over the
+   droplet (an earlier sibling). */
+.aura-glass-hl.aura-detail-hl {
+  /* left / right inline: each list's own side padding, so the droplet
+     covers the row box exactly. */
+  border-radius: 12px;
+}
+.aura-ep-row,
+.aura-stream-row {
+  position: relative;
+  border-radius: 12px;
+  transition: background-color 150ms ease, color 150ms ease;
+}
+html:not([data-glass="liquid"]) :is(.aura-ep-row, .aura-stream-row):hover:not(.is-selected) {
+  background-color: rgb(255 255 255 / 0.06);
+}
+:is(.aura-ep-row, .aura-stream-row):focus-visible { outline: 1px solid rgb(255 255 255 / 0.32); outline-offset: -1px; }
+
+/* Hairlines. Episode rows sit 6 px apart in wrappers, so the line rides the
+   middle of the gap; stream rows are adjacent buttons 4 px apart. */
+.aura-ep-item + .aura-ep-item > .aura-ep-row::before,
+.aura-stream-row + .aura-stream-row::before {
+  content: "";
+  position: absolute;
+  left: 12px;
+  right: 12px;
+  height: 1px;
+  background: rgb(255 255 255 / 0.06);
+  pointer-events: none;
+  transition: opacity 150ms ease;
+}
+.aura-ep-item + .aura-ep-item > .aura-ep-row::before { top: -3.5px; }
+.aura-stream-row + .aura-stream-row::before { top: -2.5px; }
+.aura-ep-item:is(:hover, :focus-within) > .aura-ep-row::before,
+.aura-ep-item:is(:hover, :focus-within) + .aura-ep-item > .aura-ep-row::before,
+.aura-ep-item.is-sel + .aura-ep-item > .aura-ep-row::before,
+.aura-ep-row.is-selected::before,
+.aura-stream-row:is(:hover, :focus-visible, .is-selected)::before,
+.aura-stream-row:is(:hover, :focus-visible, .is-selected) + .aura-stream-row::before { opacity: 0; }
+
+/* Selected (the active episode, the party's stream pick): the rail's pill
+   face. Liquid a faint raised white with the pill's idle rim (the row
+   carries data-glass-light="rim" while selected), NO accent fill, ring or
+   glow; Frosted the style A accent wash and inset hairline. */
+:is(.aura-ep-row, .aura-stream-row).is-selected {
+  background: var(--lg-rim-layer), linear-gradient(rgb(var(--ln-accent-rgb) / 0.12), rgb(var(--ln-accent-rgb) / 0.12));
+  box-shadow: inset 0 0 0 1px rgb(var(--ln-accent-rgb) / 0.30);
+}
+html[data-glass="liquid"] :is(.aura-ep-row, .aura-stream-row).is-selected {
+  background: var(--lg-rim-layer), linear-gradient(rgb(255 255 255 / 0.075), rgb(255 255 255 / 0.075));
+  box-shadow: inset 0 0 12px rgb(255 255 255 / 0), 0 2px 8px rgb(0 0 0 / 0.28);
+  --lg-idle-tl: 0.30;
+  --lg-idle-mid: 0.04;
+  --lg-idle-br: 0.16;
+}
+html:is([data-theme="contrast"], [data-theme="contrast-azure"]) :is(.aura-ep-row, .aura-stream-row).is-selected {
+  box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.35);
+}
+/* The selected row's lit label (the rail's). */
+.aura-ep-row.is-selected .aura-ep-num { color: var(--ln-accent-mark-text); }
+html[data-glass="liquid"] .aura-ep-row.is-selected .aura-ep-num {
+  color: color-mix(in srgb, rgb(var(--ln-accent-rgb)) 34%, white);
+}
+
+/* Landed on from a notification deep link: one accent wash that fades out
+   (the notifications sheet's landing), never a persistent ring. */
+.aura-ep-row.is-target::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  background: color-mix(in srgb, var(--ln-accent-mark) 14%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--ln-accent-mark) 22%, transparent);
+  animation: aura-ep-target 1600ms ease-out 200ms both;
+}
+@keyframes aura-ep-target {
+  from { opacity: 1; }
+  to   { opacity: 0; }
+}
+html[data-reduced-motion="true"] .aura-ep-row.is-target::after { animation-duration: 1ms; animation-delay: 1200ms; }
+
+/* Episode thumbnails: a static hairline, NOT a cursor-lit bezel (the list is
+   not virtualized: about 1100 rows on One Piece, and every
+   [data-glass-light] is a light-registry candidate). */
+/* (An inset shadow on the box itself would paint under the image, so the
+   hairline is an overlay.) */
+.aura-ep-thumb::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  border-radius: inherit;
+  box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.08);
+  pointer-events: none;
+}
+
+/* Stream rows: early releases keep their meaning without a card. Verified:
+   a 3 px emerald bar on the left and a faint emerald wash; unverified: a
+   dashed amber left edge and a fainter amber wash. */
+.aura-stream-row.is-early-ok {
+  background-color: rgb(16 185 129 / 0.06);
+  background-image: linear-gradient(rgb(52 211 153 / 0.75), rgb(52 211 153 / 0.75));
+  background-size: 3px 100%;
+  background-repeat: no-repeat;
+}
+.aura-stream-row.is-early-maybe {
+  background-color: rgb(245 158 11 / 0.04);
+  background-image: repeating-linear-gradient(to bottom, rgb(251 191 36 / 0.7) 0 6px, transparent 6px 10px);
+  background-size: 3px 100%;
+  background-repeat: no-repeat;
+}
+html:not([data-glass="liquid"]) .aura-stream-row.is-early-ok:hover { background-color: rgb(16 185 129 / 0.11); }
+html:not([data-glass="liquid"]) .aura-stream-row.is-early-maybe:hover { background-color: rgb(245 158 11 / 0.08); }
+/* The quality summary: a borderless inner well. */
+.aura-stream-quality {
+  border-radius: 10px;
+  background: rgb(255 255 255 / 0.045);
+}
+/* "Party pick": the accent MARK with its dark ink (a dark custom accent's
+   raw fill vanished on the glass). */
+.aura-party-pick {
+  background: var(--ln-accent-mark);
+  color: rgb(var(--ln-accent-mark-ink-rgb));
+}
+/* Provider group headers: mono caps, like the sheet's day groups. */
+.aura-stream-group {
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: rgb(255 255 255 / 0.6);
+}
+
+/* ---- Art tiles in the HUD tabs (R4) ------------------------------------ */
+/* Cast, characters, related, trailers: the art box carries the card bezel
+   (`.aura-card-bezel`, a rim-only cursor-light surface) instead of a 1px
+   border, and the hovered tile's name takes the chrome's selection colour.
+   Text never scales. */
+.aura-tile-name { transition: color 200ms ease; }
+.aura-tile:hover .aura-tile-name,
+.aura-tile:focus-within .aura-tile-name {
+  color: color-mix(in srgb, rgb(var(--ln-accent-rgb)) 34%, white);
+}
+html[data-aura-scrolling] .aura-tile:hover .aura-tile-name { color: rgb(255 255 255 / 0.85); transition: none; }
+
+/* Badges on art inside the panels and the arc grid: the frost LOOK but
+   FAUX (no backdrop pass): inside a glass panel a real one would sample only
+   the panel (Backdrop Root), and there can be 60 of them. The gpu-off
+   recipe of glass-cards.css. */
+:is(.aura-detail-panel, .aura-arc-grid) .aura-frost {
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+  background: var(--lg-rim-layer), rgb(26 29 38 / 0.66);
+  border-color: rgb(255 255 255 / 0.13);
+  box-shadow: inset 0 0 8px rgb(255 255 255 / 0.03);
+}
+
+/* ---- Hero strip chips (D9) --------------------------------------------- */
+/* The Anime / type chips on the key art: REAL frost (two or three, bounded),
+   7 px corners. Anime keeps its pink label with a faint pink inset edge. */
+.aura-hero-chip {
+  border-radius: 7px;
+}
+.aura-hero-chip.is-anime {
+  box-shadow: inset 0 0 0 1px rgb(244 114 182 / 0.18);
+}
+.aura-hero-chip.is-theaters {
+  box-shadow: inset 0 0 0 1px rgb(251 191 36 / 0.22);
+}
+
+/* ---- Notice badges (D8) ------------------------------------------------ */
+/* AIOStreams notice badges on the key art: real frost (0 to 4), the kind's
+   colour on the glyph and count only. */
+.aura-notice-badge.is-error   { color: rgb(252 165 165); }  /* red-300 */
+.aura-notice-badge.is-warning { color: rgb(165 180 252); }  /* indigo-300 */
+.aura-notice-badge.is-info    { color: rgb(125 211 252); }  /* sky-300 */
+.aura-notice-badge.is-stats   { color: rgb(255 255 255 / 0.85); }
+.aura-notice-badge:focus-visible { outline: 1px solid rgb(255 255 255 / 0.5); outline-offset: 1px; }

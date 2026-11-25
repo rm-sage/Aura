@@ -4,6 +4,7 @@
 import { createContext, useContext, useEffect, useRef, useState, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { ThemeId, AppSettings } from "./types";
+import { applyThemeAccent } from "./themeAccent";
 
 // ---------------------------------------------------------------------------
 // ThemeEngine
@@ -12,20 +13,22 @@ import type { ThemeId, AppSettings } from "./types";
 // CSS can scope tokens by theme without per-component logic. Persists the
 // choice via the Rust `set_theme` command on each change.
 //
-// Themes (canonical list — keep in sync with App.css `:root[data-theme=...]`
+// Themes (canonical list: keep in sync with App.css `:root[data-theme=...]`
 // blocks and `ThemeId` in `types.ts`):
-//   • mica     — Windows 11 native translucent material (default)
-//   • glass    — high-translucency frosted, custom CSS only
-//   • midnight — pure black, OLED-optimised, no vibrancy
-//   • ember    — warm amber on charcoal
-//   • forest   — emerald accent on slate
-//   • rose     — soft rose on plum-grey
-//   • amethyst — violet on indigo-black
-//   • ocean    — teal accent on midnight blue
-//   • solar    — golden sunburst on warm dark
-//   • crimson  — ruby-red accent on dark
-//   • contrast — high-contrast: pure black + vivid yellow accent
-//   • contrast-azure — high-contrast: pure black + vivid cyan accent
+//   • mica:     Windows 11 native translucent material (default)
+//   • glass:    shown as "Haze · Heavy Blur" (the id stays "glass": stored
+//               settings and App.css key on it). The most see-through theme:
+//               heavy blur and vivid colour, custom CSS only
+//   • midnight: pure black, OLED-optimised, no vibrancy
+//   • ember:    warm amber on charcoal
+//   • forest:   emerald accent on slate
+//   • rose:     soft rose on plum-grey
+//   • amethyst: violet on indigo-black
+//   • ocean:    teal accent on midnight blue
+//   • solar:    golden sunburst on warm dark
+//   • crimson:  ruby-red accent on dark
+//   • contrast: high-contrast: pure black + vivid yellow accent
+//   • contrast-azure: high-contrast: pure black + vivid cyan accent
 // ---------------------------------------------------------------------------
 
 interface ThemeContext {
@@ -44,7 +47,7 @@ export const useTheme = () => useContext(Ctx);
 
 export const THEME_LABELS: Record<ThemeId, string> = {
   mica:     "Mica · Windows 11",
-  glass:    "Glass · High Translucency",
+  glass:    "Haze · Heavy Blur",
   midnight: "Midnight · OLED Black",
   ember:    "Ember · Warm Amber",
   forest:   "Forest · Emerald Slate",
@@ -59,7 +62,7 @@ export const THEME_LABELS: Record<ThemeId, string> = {
 
 export const THEME_DESCRIPTIONS: Record<ThemeId, string> = {
   mica:     "Leverages the native Windows 11 translucent backdrop.",
-  glass:    "Custom high-blur frosted layers, more vivid translucency.",
+  glass:    "The most see-through theme: heavy blur and vivid colour behind every panel, sky-blue accent.",
   midnight: "Pure black, high contrast, made for OLED displays.",
   ember:    "Warm amber accent on charcoal, a cosy late-evening palette.",
   forest:   "Emerald accent on deep slate, calm and natural.",
@@ -70,6 +73,27 @@ export const THEME_DESCRIPTIONS: Record<ThemeId, string> = {
   crimson:  "Ruby-red accent on a deep dark base, bold and warm.",
   contrast: "Maximum legibility: pure black, white text, vivid gold accent.",
   "contrast-azure": "Maximum legibility: pure black, white text, vivid cyan accent.",
+};
+
+/** A swatch per theme for pickers that preview it: `accent` is the theme's
+ *  --ln-accent-rgb triplet ("r g b", use as `rgb(${accent})`), `base` its
+ *  --aura-splash-bg. Mirrors the `[data-theme]` blocks in App.css; change
+ *  both together. `accent` is the theme's OWN accent (a user's custom accent,
+ *  AuraSettings.themeAccents, is not reflected here): the accent picker shows
+ *  it as "Theme default" and measures contrast against `base`. */
+export const THEME_SWATCHES: Record<ThemeId, { accent: string; base: string }> = {
+  mica:     { accent: "91 164 255",  base: "#08101a" },
+  glass:    { accent: "79 195 247",  base: "#0a0c12" },
+  midnight: { accent: "59 158 255",  base: "#000000" },
+  ember:    { accent: "255 159 69",  base: "#100c08" },
+  forest:   { accent: "52 211 153",  base: "#0a1310" },
+  rose:     { accent: "244 114 182", base: "#110a0e" },
+  amethyst: { accent: "167 139 250", base: "#0c0a14" },
+  ocean:    { accent: "34 211 238",  base: "#08101a" },
+  solar:    { accent: "255 176 32",  base: "#120e08" },
+  crimson:  { accent: "255 77 94",   base: "#140809" },
+  contrast: { accent: "255 224 0",   base: "#000000" },
+  "contrast-azure": { accent: "34 224 255", base: "#000000" },
 };
 
 const VALID_THEME_IDS: readonly ThemeId[] = [
@@ -87,6 +111,9 @@ const ACCENT_LS_KEY = "aura:accent-rgb";
 
 function applyTheme(theme: ThemeId) {
   document.documentElement.setAttribute("data-theme", theme);
+  // The user's custom accent for this theme, if any (src/themeAccent.ts):
+  // before the splash accent is cached below, so the cache has it.
+  applyThemeAccent(theme);
   // Persist for the next cold start's pre-paint inline script (index.html) so
   // the app renders in the right theme from the first frame instead of
   // flashing the default until get_settings resolves. Cache the resolved

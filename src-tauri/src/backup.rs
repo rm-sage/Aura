@@ -18,7 +18,7 @@
 // holds the contents and the user can restore from Settings → Backups.
 //
 // CAUTION FOR FUTURE WORK — many flows touch the localStorage keys
-// `aura:manual-state:<scope>`, `aura:auto-bumped-series:v1`, and
+// `aura:manual-state:<scope>`, `aura:auto-bumped-series:<scope>`, and
 // `aura:settings:v1` (history moved to history_store.rs; see below). ANY code path
 // that calls `localStorage.removeItem` / `localStorage.clear` on those
 // keys MUST first invoke `create_user_backup` so the user has a

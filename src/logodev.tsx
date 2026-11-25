@@ -52,7 +52,6 @@ export function ratingDomain(source: string): string | null {
   if (s.includes("tmdb") || s.includes("the movie")) return "themoviedb.org";
   if (s.includes("anilist")) return "anilist.co";
   if (s.includes("kitsu")) return "kitsu.io";
-  if (s.includes("trakt")) return "trakt.tv";
   if (s.includes("letterboxd")) return "letterboxd.com";
   return null;
 }
@@ -78,7 +77,7 @@ export function groupRatingsByBrand<T extends { source: string }>(rows: T[]): T[
 /** Tooltip suffix disambiguating critic vs audience — ONLY for the
  *  sources that actually publish both axes (Rotten Tomatoes'
  *  Tomatometer vs Audience Score, Metacritic's Metascore vs User
- *  Score). Single-figure aggregate sites (IMDb, TMDB, Trakt,
+ *  Score). Single-figure aggregate sites (IMDb, TMDB,
  *  Letterboxd, MyAnimeList, AniList) don't differentiate, so the
  *  suffix would be noise → "". Mirrors DetailView's ratingLabelFor so
  *  the detail page and the hover card read identically. */

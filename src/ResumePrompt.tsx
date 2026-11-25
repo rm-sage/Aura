@@ -93,7 +93,7 @@ export default function ResumePrompt({ pending }: { pending: PendingResume | nul
       className="fixed inset-0 z-[10550] flex items-center justify-center
                  bg-black/70 backdrop-blur-md animate-[fade-in_120ms_ease-out]"
     >
-      <div className="aura-glass-menu rounded-2xl max-w-[420px] w-[92%] p-6 text-white">
+      <div className="aura-glass-player rounded-[20px] max-w-[420px] w-[92%] p-6 text-white">
         <h2
           id="resume-prompt-title"
           className="text-[16px] font-semibold tracking-tight mb-1"
@@ -103,14 +103,14 @@ export default function ResumePrompt({ pending }: { pending: PendingResume | nul
         <p className="text-white/70 text-[13px] leading-relaxed mb-4">
           <span className="text-white/95">{pending.title}</span>
           {pending.episodeTag && (
-            <span className="text-white/55 font-mono text-[12px] ml-2">
+            <span className="text-white/60 font-mono text-[12px] ml-2">
               {pending.episodeTag}
             </span>
           )}
         </p>
 
         <div className="rounded-xl border border-white/12 bg-white/[0.03] p-3 mb-4">
-          <p className="text-white/55 text-[10.5px] font-mono uppercase tracking-[0.2em] mb-1.5">
+          <p className="text-white/60 text-[10.5px] font-mono uppercase tracking-[0.2em] mb-1.5">
             Saved Position
           </p>
           <div className="flex items-baseline gap-3">
@@ -118,7 +118,7 @@ export default function ResumePrompt({ pending }: { pending: PendingResume | nul
               {formatTime(pending.resumeSeconds)}
             </span>
             {pending.durationSeconds && (
-              <span className="text-white/45 text-[11.5px] tabular-nums">
+              <span className="text-white/60 text-[11.5px] tabular-nums">
                 / {formatTime(pending.durationSeconds)}
                 {pct != null && ` · ${pct.toFixed(0)}% in`}
               </span>
@@ -138,25 +138,20 @@ export default function ResumePrompt({ pending }: { pending: PendingResume | nul
           <button
             type="button"
             onClick={pending.onStartOver}
-            className="px-4 py-2 rounded-lg text-[13px] font-medium tracking-wide
-                       text-white/85 bg-white/[0.06] border border-white/12
-                       hover:bg-white/[0.10] hover:text-white
-                       transition-colors"
+            className="aura-glass-flat px-4 py-2 rounded-lg text-[13px] font-medium tracking-wide
+                       text-white/85 hover:text-white"
           >
             Start over
           </button>
           <button
             type="button"
             onClick={pending.onResume}
-            className="px-4 py-2 rounded-lg text-[13px] font-medium tracking-wide
-                       text-ln-accent bg-ln-accent/15 border border-ln-accent/35
-                       hover:bg-ln-accent/25 hover:border-ln-accent/55
-                       transition-colors"
+            className="aura-glass-flat is-primary px-4 py-2 rounded-lg text-[13px] font-medium tracking-wide"
           >
             Resume from {formatTime(pending.resumeSeconds)}
           </button>
         </div>
-        <p className="text-white/35 text-[11px] mt-3 text-center">
+        <p className="text-white/60 text-[11px] mt-3 text-center">
           Esc or click outside to cancel
         </p>
       </div>

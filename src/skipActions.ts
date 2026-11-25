@@ -18,7 +18,7 @@
 //      Skip-to-canon button, because a skip states the episode is finished
 //      with and the services have no way to record that other than as watched.
 //      An unattended countdown firing the same button with nobody watching
-//      does NOT: waking to a dozen Trakt plays you cannot easily undo is worse
+//      does NOT: waking to a dozen scrobbled plays you cannot easily undo is worse
 //      than a missing scrobble. (Manual mark-as-WATCHED still never scrobbles;
 //      that path does not come through here.)
 //
@@ -49,9 +49,6 @@ export interface SkipTarget {
   season: number | null;
   episode: number | null;
   episodeTitle: string | null;
-  /** VideoEntry `released`, kept on the History row for Trakt's title +
-   *  air-date fallback. Optional so older callers need not supply it. */
-  episodeReleased?: string | null;
   poster: string | null;
   background: string | null;
   anilistId: number | null;
@@ -124,8 +121,7 @@ export async function markEpisodesSkipped(
   // That is three separate harms: a duplicate History row per episode (the
   // dedupe key is (id, played_at), so a new timestamp is a new row), those
   // duplicates evicting genuine plays off the 1000-entry tail, and a genuinely
-  // duplicate Trakt play, because Trakt dedupes on `watched_at` and a new one
-  // is a new play the user has to delete by hand.
+  // duplicate scrobbled play the user has to delete by hand.
   // ONE predicate, shared with `unskippedOf`, so a caller's toast count can
   // never disagree with what was actually written.
   const fresh = targets.filter((t) => isSkipMarkable(t.id));
@@ -140,9 +136,8 @@ export async function markEpisodesSkipped(
   setManualWatchedMany(ids, "watched");
   setSkipped(ids, true);
 
-  // Stamped ONCE for the whole batch. Trakt dedupes on watched_at, so reusing
-  // one timestamp makes re-marking the same run idempotent there instead of
-  // creating a fresh play per attempt.
+  // Stamped ONCE for the whole batch, so every row and push of the run shares
+  // one played_at.
   const playedAt = new Date().toISOString();
   const entries: HistoryEntry[] = targets.map((t) => {
     const entry: HistoryEntry = {
@@ -155,7 +150,6 @@ export async function markEpisodesSkipped(
       season: t.season,
       episode: t.episode,
       episode_title: t.episodeTitle,
-      episode_released: t.episodeReleased ?? null,
       played_at: playedAt,
       // No watched_seconds on purpose. Nothing was played, and the stats
       // surfaces sum that field: a fabricated duration would inflate lifetime
@@ -197,19 +191,7 @@ export async function markEpisodesSkipped(
     }
   };
 
-  // TRAKT records one PLAY per episode, so it needs a request each. Sequential
-  // on purpose: these are the same per-row commands the History tab uses, and
-  // firing a dozen episodes concurrently would hammer the API for no gain. A
-  // failure on one row must not abort the rest.
-  if (services.includes("trakt")) {
-    for (const t of targets) {
-      // Recorded so the History row reads as pushed and a later bulk run does
-      // not send it a second time.
-      if (await push(t, "trakt")) markScrobbled(opts.scrobbleScope!, "trakt", t.id, playedAt);
-    }
-  }
-
-  // SIMKL logs one play per episode, like Trakt, so nothing is collapsed; but
+  // SIMKL logs one play per episode, so nothing is collapsed; but
   // its command takes the whole set in ONE call (Simkl allows about one POST
   // per second, and Rust sends up to 100 rows per request), not one per
   // episode. Movies, series and anime alike, so no anime gate: only rows with

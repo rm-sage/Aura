@@ -63,7 +63,7 @@ fn auth_client() -> &'static reqwest::Client {
             .tcp_keepalive(Duration::from_secs(60))
             .pool_max_idle_per_host(1)
             .pool_idle_timeout(Duration::from_secs(30))
-            .user_agent("Aura/0.6.6")
+            .user_agent(concat!("Aura/", env!("CARGO_PKG_VERSION")))
             .build()
             .expect("Auth HTTP client init failed")
     })
@@ -882,6 +882,7 @@ pub async fn get_synced_addons(auth_key: String) -> Result<Vec<AddonEntry>, Stri
             let (stream_types, stream_id_prefixes) =
                 crate::stremio::extract_stream_resource_info(manifest);
             let configurable = crate::stremio::extract_manifest_configurable(manifest);
+            let (wrapped, landscape_art) = crate::addons::wrapped_from_hints(manifest.get("behaviorHints"));
             let manifest_id = manifest
                 .get("id")
                 .and_then(|v| v.as_str())
@@ -914,6 +915,8 @@ pub async fn get_synced_addons(auth_key: String) -> Result<Vec<AddonEntry>, Stri
                     id_prefixes,
                     stream_id_prefixes,
                     configurable,
+                    wrapped,
+                    landscape_art,
                 })
             }
         })

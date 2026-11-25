@@ -1,7 +1,7 @@
 // Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { memo, useMemo, useRef, useEffect, useReducer, useState, type CSSProperties } from "react";
+import { memo, useCallback, useMemo, useRef, useEffect, useReducer, useState, type CSSProperties } from "react";
 import { createPortal } from "react-dom";
 import { channelPrograms } from "../../iptv/epgStore";
 import { isFavorite, toggleFavorite, subscribeFavorites } from "../../iptv/favoritesStore";
@@ -125,13 +125,22 @@ export default function GuideView({ channels, sourceId, sourceName, nowMs, hasEp
 
   const nowX = ((nowMs - windowStart) / 60_000) * PX_PER_MIN;
 
+  // Stable row callbacks: a programme hover sets `hover` here, and inline
+  // closures re-rendered every memoized row (each with its programme blocks)
+  // on every block the pointer crossed. Declared above the early return so
+  // the hook order never changes.
+  const onBlockHover = useCallback((p: EpgProgram, el: HTMLElement, live: boolean) => {
+    setHover({ p, rect: el.getBoundingClientRect(), live });
+  }, []);
+  const onBlockLeave = useCallback(() => setHover(null), []);
+
   if (!hasEpg) {
     return (
       <div className="flex-1 flex flex-col items-center justify-center text-center px-6 gap-3">
         {epgLoading ? (
           <>
             <span className="w-7 h-7 rounded-full border-2 border-white/15 border-t-ln-accent animate-spin" />
-            <p className="text-white/45 text-sm">Loading the TV guide…</p>
+            <p className="text-white/60 text-sm">Loading the TV guide…</p>
           </>
         ) : epgError ? (
           // The EPG was configured but the fetch/parse failed — show the real
@@ -143,15 +152,14 @@ export default function GuideView({ channels, sourceId, sourceName, nowMs, hasEp
               <button
                 type="button"
                 onClick={onRetryEpg}
-                className="px-3.5 h-9 rounded-xl text-[13px] font-medium bg-white/5 border border-white/10
-                           text-white/80 hover:bg-white/10"
+                className="aura-glass-flat aura-glass-press px-3.5 h-9 rounded-xl text-[13px] font-medium text-white/80"
               >
                 Retry
               </button>
             )}
           </>
         ) : (
-          <p className="text-white/40 text-sm max-w-[24rem]">
+          <p className="text-white/60 text-sm max-w-[24rem]">
             No EPG loaded for this playlist. Add an EPG (XMLTV) URL to the playlist,
             or use an Xtream login (its guide is fetched automatically).
           </p>
@@ -179,7 +187,7 @@ export default function GuideView({ channels, sourceId, sourceName, nowMs, hasEp
         <div style={{ width: CHANNEL_COL_W + timelineW, position: "relative" }}>
         {/* Sticky header: a LIVE-pill strip ABOVE the time ruler, so the pill
             never overlaps the hour labels or the top programme row. */}
-        <div className="sticky top-0 z-20 bg-[rgba(12,12,16,0.96)] backdrop-blur-sm">
+        <div className="sticky top-0 z-20 bg-[rgba(12,12,16,0.96)]">
           {/* LIVE pill strip — pill sits flush to the strip's bottom, just
               above the ruler, with the now-line descending from its base. */}
           <div className="relative" style={{ height: LIVE_STRIP_H }}>
@@ -248,11 +256,9 @@ export default function GuideView({ channels, sourceId, sourceName, nowMs, hasEp
             windowEnd={windowEnd}
             nowMs={nowMs}
             timelineW={timelineW}
-            onPlay={() => onPlayChannel(ch)}
-            onBlockHover={(p, el, live) =>
-              setHover({ p, rect: el.getBoundingClientRect(), live })
-            }
-            onBlockLeave={() => setHover(null)}
+            onPlayChannel={onPlayChannel}
+            onBlockHover={onBlockHover}
+            onBlockLeave={onBlockLeave}
           />
         ))}
 
@@ -284,7 +290,7 @@ const GuideRow = memo(function GuideRow({
   windowEnd,
   nowMs,
   timelineW,
-  onPlay,
+  onPlayChannel,
   onBlockHover,
   onBlockLeave,
 }: {
@@ -296,10 +302,12 @@ const GuideRow = memo(function GuideRow({
   windowEnd: number;
   nowMs: number;
   timelineW: number;
-  onPlay: () => void;
+  /** Stable (LiveView's useCallback); the row passes its own channel. */
+  onPlayChannel: (channel: IptvChannel) => void;
   onBlockHover: (p: EpgProgram, el: HTMLElement, live: boolean) => void;
   onBlockLeave: () => void;
 }) {
+  const onPlay = () => onPlayChannel(channel);
   // Programmes intersecting the window, with their pixel geometry.
   const blocks = useMemo(() => {
     const programs = channelPrograms(sourceId, channel) ?? [];
@@ -408,7 +416,7 @@ function fmtTime(ms: number): string {
   return new Date(ms).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
 }
 function fmtRange(a: number, b: number): string {
-  return `${fmtTime(a)} – ${fmtTime(b)}`;
+  return `${fmtTime(a)} - ${fmtTime(b)}`;
 }
 function fmtDur(ms: number): string {
   const m = Math.round(ms / 60_000);
@@ -450,8 +458,9 @@ function ProgramHoverCard({ hover }: { hover: HoverState | null }) {
 
   return createPortal(
     <div
-      className="fixed z-[300] pointer-events-none rounded-xl border border-white/12
-                 bg-[rgba(16,16,20,0.98)] backdrop-blur-2xl shadow-glass-edge p-3.5"
+      // A hover card: the tooltip tier of the shared glass (cheap, never
+      // refracted, aura-glass-tip).
+      className="aura-float-glass aura-glass-tip fixed z-[300] pointer-events-none rounded-xl p-3.5"
       style={{ width: HOVER_CARD_W, ...pos }}
     >
       {live && (

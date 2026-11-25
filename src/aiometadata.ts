@@ -3,6 +3,7 @@
 
 import { useSyncExternalStore } from "react";
 import type { AddonEntry, MetaPreview, LibraryItem } from "./types";
+import { addonHints } from "./addonHints";
 
 // ---------------------------------------------------------------------------
 // AIOMetadata helpers
@@ -224,13 +225,19 @@ export function isAnimeLibraryItem(i: LibraryItem): boolean {
 //
 // For FIELD-SCOPED calls addressed at AIOMetadata specifically, never for
 // deciding who answers meta (that is addonElection.ts, by addon order).
-// Exactly two callers, both fetching something no other addon can supply:
-// the Home hero's title logos (HomeView) and the CW cards' landscape art
-// (CinemaRows -> landscapeArt.ts, AIOMetadata's own /api/art/landscape).
+// AIOMetadata can be installed on its own or WRAPPED inside AIOStreams, which
+// re-serves its catalogs and metas unchanged under AIOStreams' own manifest id,
+// name and URL. Its data then arrives through the normal meta election; only
+// AIOMetadata's non-Stremio routes need it located, and only the CW cards'
+// landscape art uses one (`findLandscapeArtAddon`).
 // ---------------------------------------------------------------------------
 
-/** AIOMetadata's upstream manifest id, from its manifest.json. */
+/** AIOMetadata's upstream manifest id, from its manifest.json. Current
+ *  builds (upstream and the rm-sage fork alike) actually serve the package
+ *  name "aio-metadata" on a configured manifest and "com.aio.metadata" on the
+ *  unconfigured one, so every id goes through `AIOMETADATA_MANIFEST_IDS`. */
 export const AIOMETADATA_MANIFEST_ID = "com.aiometadata";
+const AIOMETADATA_MANIFEST_IDS = new Set([AIOMETADATA_MANIFEST_ID, "aio-metadata", "com.aio.metadata"]);
 
 const AIO_NAME_RE = /aio[\s-]?metadata/i;
 
@@ -242,13 +249,47 @@ const AIO_NAME_RE = /aio[\s-]?metadata/i;
  *   - the name / URL match covers both of those, but not a renamed
  *     instance on a neutral host. */
 export function isAIOMetadataAddon(a: AddonEntry): boolean {
-  return a.manifest_id === AIOMETADATA_MANIFEST_ID
+  return AIOMETADATA_MANIFEST_IDS.has(a.manifest_id ?? "")
     || AIO_NAME_RE.test(a.name ?? "")
     || AIO_NAME_RE.test(a.url ?? "");
 }
 
-/** The first installed AIOMetadata instance, in addon order. */
-export function findAIOMetadataAddon(addons: AddonEntry[]): AddonEntry | null {
-  return addons.find(isAIOMetadataAddon) ?? null;
+/** AIOMetadata's catalog types. No other addon in the ecosystem serves
+ *  "anime.series" / "anime.movie", so a META addon whose catalogs include one
+ *  is re-serving AIOMetadata (AIOStreams wrapping it, a wrapper that does not
+ *  declare `wrappedAddons`). A heuristic: for wording and labels only. */
+const AIOMETADATA_TYPES = ["anime.series", "anime.movie"];
+
+function isAIOMetadataIdentity(manifestId: string, name: string): boolean {
+  return AIOMETADATA_MANIFEST_IDS.has(manifestId) || AIO_NAME_RE.test(name);
 }
 
+/** The addon re-serves an AIOMetadata instance (AIOStreams wrapping it):
+ *  declared in its manifest's `behaviorHints.wrappedAddons` (the live
+ *  manifest's, `addonHints.ts`, else the entry's own), else inferred from
+ *  AIOMetadata's own catalog types. Not for calling AIOMetadata's routes
+ *  through it (see `findLandscapeArtAddon`). */
+export function wrapsAIOMetadata(a: AddonEntry): boolean {
+  if (isAIOMetadataAddon(a)) return false;
+  const wrapped = addonHints(a.url)?.wrapped ?? a.wrapped ?? [];
+  if (wrapped.some((w) => isAIOMetadataIdentity(w.manifest_id, w.name))) return true;
+  return (a.resources ?? []).includes("meta")
+    && (a.types ?? []).some((t) => AIOMETADATA_TYPES.includes(t.toLowerCase()));
+}
+
+/** AIOMetadata's data reaches Aura, installed on its own or wrapped. */
+export function hasAIOMetadata(addons: readonly AddonEntry[]): boolean {
+  return addons.some((a) => isAIOMetadataAddon(a) || wrapsAIOMetadata(a));
+}
+
+/** Who answers AIOMetadata's Continue Watching art route
+ *  (`{base}/api/art/landscape/...`): an AIOMetadata installed on its own, else
+ *  an addon whose manifest declares it serves the route
+ *  (`behaviorHints.landscapeArt`, AIOStreams forwarding it to the AIOMetadata
+ *  it wraps). Null when neither exists; the card then keeps the item's own
+ *  background. */
+export function findLandscapeArtAddon(addons: readonly AddonEntry[]): AddonEntry | null {
+  return addons.find(isAIOMetadataAddon)
+    ?? addons.find((a) => (addonHints(a.url)?.landscape_art ?? a.landscape_art) === true)
+    ?? null;
+}

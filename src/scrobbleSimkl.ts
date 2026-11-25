@@ -8,8 +8,8 @@ import type { HistoryEntry } from "./historyStore";
 // ---------------------------------------------------------------------------
 // scrobbleSimkl - the frontend half of `scrobble_history_simkl`.
 //
-// Simkl's History command is the one BATCHED sibling of the per-row Trakt /
-// AniList commands: Simkl allows about one POST per second (plus a 20 s
+// Simkl's History command is the BATCHED sibling of the per-row AniList
+// command: Simkl allows about one POST per second (plus a 20 s
 // per-user write lock), so a bulk run of one call per row is unsafe. It takes
 // every row in ONE call, sends them in chunks of 100 at Simkl's pace, and
 // answers with one result per row, in input order. Every caller (the History
@@ -35,7 +35,7 @@ export interface SimklHistoryItem {
 
 /** `added` counts as scrobbled. `not_found` and `skipped` are verdicts about
  *  the ITEM (no catalog match, no usable id), so a retry changes nothing and
- *  the row is retired like a Trakt / AniList permanent failure. `failed` is
+ *  the row is retired like an AniList permanent failure. `failed` is
  *  about the attempt and is left for the next run. */
 export type SimklItemStatus = "added" | "not_found" | "failed" | "skipped";
 

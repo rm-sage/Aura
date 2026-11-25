@@ -1,7 +1,8 @@
 // Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { memo, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { GLASS_SHADOW, useLiveAnnouncer } from "./AppToast";
 
 // ---------------------------------------------------------------------------
 // FlyUpToast — small label that spawns at the click point and floats
@@ -54,25 +55,29 @@ export function showFlyUpToast(message: string, opts: ShowOptions) {
   );
 }
 
-export default function FlyUpToastHost() {
+function FlyUpToastHost() {
   const [toasts, setToasts] = useState<ToastEntry[]>([]);
+  const { announce, regions } = useLiveAnnouncer();
 
   useEffect(() => {
     const onShow = (e: Event) => {
       const detail = (e as CustomEvent<ToastEntry>).detail;
       if (!detail) return;
       setToasts((prev) => [...prev, detail]);
+      announce(detail.message, detail.tone === "danger");
       window.setTimeout(() => {
         setToasts((prev) => prev.filter((t) => t.id !== detail.id));
       }, DURATION_MS);
     };
     window.addEventListener(EVENT, onShow);
     return () => window.removeEventListener(EVENT, onShow);
-  }, []);
+  }, [announce]);
 
-  if (toasts.length === 0) return null;
+  if (toasts.length === 0) return <>{regions}</>;
 
   return (
+    <>
+    {regions}
     <div className="fixed inset-0 z-[250] pointer-events-none">
       {toasts.map((t) => (
         <FlyUpItem key={t.id} toast={t} />
@@ -84,8 +89,30 @@ export default function FlyUpToastHost() {
           85%  { opacity: 0.95; transform: translate(-50%, -${RISE_PX * 0.85}px) scale(1); }
           100% { opacity: 0;    transform: translate(-50%, -${RISE_PX}px)        scale(1); }
         }
+        /* The entry flash, timed to the pop (the first 12% of the rise): a
+           halo in the THEME accent for default and success toasts (var() in
+           keyframes resolves on the toast, so a theme switch is honoured);
+           only an error flashes red. Every frame carries the glass list
+           (AppToast GLASS_SHADOW), so the edge and drop survive the fill. */
+        @keyframes aura-flyup-flash {
+          0%   { box-shadow: 0 0 0 0 rgb(var(--ln-accent-rgb) / 0), 0 0 0 0 rgb(var(--ln-accent-rgb) / 0), ${GLASS_SHADOW}; }
+          30%  { box-shadow: 0 6px 18px -4px rgb(var(--ln-accent-rgb) / 0.50),
+                             0 0 0 4px rgb(var(--ln-accent-rgb) / 0.16), ${GLASS_SHADOW}; }
+          50%  { box-shadow: 0 6px 18px -4px rgb(var(--ln-accent-rgb) / 0.34),
+                             0 0 0 0 rgb(var(--ln-accent-rgb) / 0), ${GLASS_SHADOW}; }
+          100% { box-shadow: 0 0 0 0 rgba(0, 0, 0, 0), 0 0 0 0 rgba(0, 0, 0, 0), ${GLASS_SHADOW}; }
+        }
+        @keyframes aura-flyup-flash-danger {
+          0%   { box-shadow: 0 0 0 0 rgba(251, 113, 133, 0), 0 0 0 0 rgba(251, 113, 133, 0), ${GLASS_SHADOW}; }
+          30%  { box-shadow: 0 6px 18px -4px rgba(251, 113, 133, 0.50),
+                             0 0 0 4px rgba(251, 113, 133, 0.16), ${GLASS_SHADOW}; }
+          50%  { box-shadow: 0 6px 18px -4px rgba(251, 113, 133, 0.34),
+                             0 0 0 0 rgba(251, 113, 133, 0), ${GLASS_SHADOW}; }
+          100% { box-shadow: 0 0 0 0 rgba(0, 0, 0, 0), 0 0 0 0 rgba(0, 0, 0, 0), ${GLASS_SHADOW}; }
+        }
       `}</style>
     </div>
+    </>
   );
 }
 
@@ -127,31 +154,43 @@ function FlyUpItem({ toast }: { toast: ToastEntry }) {
     setPos({ left, top });
   }, [toast.x, toast.y]);
 
+  // Tone: the text colour, and for an error only a faint red hairline
+  // through the glass ring hook (src/styles/glass-settings.css), never a
+  // border utility. A success toast has no green ring (the same call as
+  // AppToast: a persistent coloured line round the edge read worse than the
+  // neutral glass edge); its colour is the label plus the accent flash.
   const accent =
     toast.tone === "success"
-      ? "border-emerald-300/45 text-emerald-100"
+      ? "text-emerald-100"
       : toast.tone === "danger"
-        ? "border-rose-300/45 text-rose-100"
-        : "border-white/20 text-white/95";
+        ? "aura-glass-tone-danger text-rose-100"
+        : "text-white/95";
+  const flash = toast.tone === "danger" ? "aura-flyup-flash-danger" : "aura-flyup-flash";
 
   return (
     <div
       ref={ref}
-      role="status"
-      aria-live="polite"
-      className={`absolute px-3.5 py-1.5 rounded-full
-                  bg-black/85 backdrop-blur-2xl shadow-glass-edge
-                  border ${accent}
+      // Not a live region: the host announces through useLiveAnnouncer.
+      // The tooltip tier of the shared glass: cheap, never refracted.
+      className={`aura-float-glass aura-glass-tip ${accent} absolute px-3.5 py-1.5 rounded-full
                   text-[12.5px] font-medium tracking-wide whitespace-nowrap`}
       style={{
         left: pos.left,
         top:  pos.top,
         // Anchor + lift driven entirely by the keyframes — keeps the
         // component declarative and avoids any per-frame React renders.
-        animation: `aura-flyup ${DURATION_MS}ms ease-out forwards`,
+        // The flash (box-shadow only) runs beside it over the pop.
+        animation: `aura-flyup ${DURATION_MS}ms ease-out forwards, `
+          + `${flash} 960ms cubic-bezier(0.22, 1, 0.36, 1) both`,
       }}
     >
       {toast.message}
     </div>
   );
 }
+
+// Memoized: App renders this host with no props (or only primitives / its own
+// stable state) and re-renders on every playback-update tick. The host is
+// driven by its own state and store subscriptions, so skipping those renders
+// changes nothing on screen.
+export default memo(FlyUpToastHost);

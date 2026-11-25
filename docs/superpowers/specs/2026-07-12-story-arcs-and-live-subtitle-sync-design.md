@@ -43,7 +43,7 @@ Psycho, Chainsaw Man, Spy x Family, Frieren, Haikyu, Blue Lock, Dr. Stone, One-P
 Code Geass.
 
 Every other candidate source was investigated and rejected. AniList (schema introspected: 55
-Media fields, no arc concept), MAL/Jikan, Kitsu, AniDB, Trakt, Simkl, Shikimori, and
+Media fields, no arc concept), MAL/Jikan, Kitsu, AniDB, Simkl, Shikimori, and
 AnimeThemes have no arc model at all. **animefillerlist has no arcs either** - its episode table
 is exactly four columns (#, Title, Type, Airdate) - so the existing filler/recap pipeline cannot
 be extended to carry arcs. No maintained multi-show arc dataset exists on GitHub.

@@ -73,11 +73,16 @@ export default function LoginView({ onSuccess, onGuest }: Props) {
 
   return (
     /* Full-screen dim overlay */
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
-      {/* Glass card — narrowed from max-w-sm (384) to 320 so the
-          inputs feel proportional on ultrawide displays. */}
-      <div className="glass-panel-elevated rounded-3xl px-7 py-8 w-full max-w-[320px] mx-4
-                      shadow-glass-edge flex flex-col gap-6">
+    <div className="fixed inset-0 z-50 flex items-center justify-center">
+      {/* The dim + blur is a SIBLING layer, not the wrapper: a backdrop-filter
+          on an ancestor would blind the card's own glass. */}
+      <div aria-hidden className="aura-modal-backdrop-in absolute inset-0 bg-black/60 backdrop-blur-sm" />
+      {/* Floating glass card (menu tier), growing from the centre. Narrowed
+          from max-w-sm (384) to 320 so the inputs feel proportional on
+          ultrawide displays. */}
+      <div className="aura-float-glass aura-glass-pop-in relative rounded-3xl px-7 py-8 w-full max-w-[320px] mx-4
+                      flex flex-col gap-6"
+        style={{ "--lg-origin": "50% 50%" } as React.CSSProperties}>
         {/* Header */}
         <div className="flex flex-col gap-1.5">
           <h1 className="text-white text-2xl font-light tracking-wide">Sign in to Stremio</h1>
@@ -96,9 +101,9 @@ export default function LoginView({ onSuccess, onGuest }: Props) {
               placeholder="you@example.com"
               autoComplete="email"
               disabled={loading}
-              className="bg-white/6 border border-white/12 rounded-xl px-4 py-2.5
-                         text-white text-sm placeholder:text-white/25 outline-none
-                         focus:border-white/30 transition-colors disabled:opacity-40"
+              className="aura-glass-field rounded-xl px-4 py-2.5
+                         text-white text-sm placeholder:text-white/40 outline-none
+                         disabled:opacity-40"
             />
           </div>
 
@@ -111,9 +116,9 @@ export default function LoginView({ onSuccess, onGuest }: Props) {
               placeholder="••••••••"
               autoComplete="current-password"
               disabled={loading}
-              className="bg-white/6 border border-white/12 rounded-xl px-4 py-2.5
-                         text-white text-sm placeholder:text-white/25 outline-none
-                         focus:border-white/30 transition-colors disabled:opacity-40"
+              className="aura-glass-field rounded-xl px-4 py-2.5
+                         text-white text-sm placeholder:text-white/40 outline-none
+                         disabled:opacity-40"
             />
           </div>
 
@@ -128,13 +133,12 @@ export default function LoginView({ onSuccess, onGuest }: Props) {
           <button
             type="submit"
             disabled={!canSubmit}
-            className="mt-1 w-full py-3 rounded-xl font-medium text-sm transition-all
-                       bg-ln-accent/80 hover:bg-ln-accent active:scale-95 text-white
-                       disabled:opacity-35 disabled:cursor-not-allowed"
+            className="aura-glass-flat aura-glass-press is-cta mt-1 w-full py-3 rounded-xl font-semibold text-sm
+                       text-ln-accent-ink disabled:opacity-35 disabled:cursor-not-allowed"
           >
             {loading ? (
               <span className="flex items-center justify-center gap-2">
-                <span className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                <span className="w-4 h-4 border-2 border-current border-t-transparent rounded-full animate-spin opacity-70" />
                 Signing in…
               </span>
             ) : "Sign In"}
@@ -148,7 +152,7 @@ export default function LoginView({ onSuccess, onGuest }: Props) {
             resulting session key. See LinkLoginModal. */}
         <div className="flex items-center gap-3">
           <div className="flex-1 h-px bg-white/8" />
-          <span className="text-white/25 text-xs">or continue with</span>
+          <span className="text-white/50 text-xs">or continue with</span>
           <div className="flex-1 h-px bg-white/8" />
         </div>
 
@@ -156,10 +160,8 @@ export default function LoginView({ onSuccess, onGuest }: Props) {
           <button
             onClick={() => setLinkProvider("facebook")}
             disabled={loading}
-            className="flex-1 py-2.5 rounded-xl bg-white/6 border border-white/12
-                       hover:bg-white/10 hover:border-white/20 text-white/85 text-sm
-                       transition-all flex items-center justify-center gap-2
-                       disabled:opacity-40"
+            className="aura-glass-flat aura-glass-press flex-1 py-2.5 rounded-xl text-white/85 text-sm
+                       flex items-center justify-center gap-2 disabled:opacity-40"
           >
             <svg width="17" height="17" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
               <path d="M22 12.06C22 6.5 17.52 2 12 2S2 6.5 2 12.06c0 5 3.66 9.15 8.44 9.94v-7.03H7.9v-2.9h2.54V9.85c0-2.5 1.49-3.89 3.77-3.89 1.09 0 2.24.2 2.24.2v2.46h-1.26c-1.24 0-1.63.77-1.63 1.56v1.88h2.78l-.44 2.9h-2.34V22c4.78-.79 8.44-4.94 8.44-9.94z" />
@@ -169,10 +171,8 @@ export default function LoginView({ onSuccess, onGuest }: Props) {
           <button
             onClick={() => setLinkProvider("apple")}
             disabled={loading}
-            className="flex-1 py-2.5 rounded-xl bg-white/6 border border-white/12
-                       hover:bg-white/10 hover:border-white/20 text-white/85 text-sm
-                       transition-all flex items-center justify-center gap-2
-                       disabled:opacity-40"
+            className="aura-glass-flat aura-glass-press flex-1 py-2.5 rounded-xl text-white/85 text-sm
+                       flex items-center justify-center gap-2 disabled:opacity-40"
           >
             <svg width="17" height="17" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
               <path d="M17.05 12.54c-.03-2.6 2.12-3.85 2.22-3.91-1.21-1.77-3.09-2.02-3.76-2.05-1.6-.16-3.12.94-3.93.94-.81 0-2.06-.92-3.39-.9-1.74.03-3.35 1.01-4.25 2.57-1.81 3.14-.46 7.79 1.3 10.34.86 1.25 1.89 2.65 3.24 2.6 1.3-.05 1.79-.84 3.36-.84 1.57 0 2.01.84 3.39.81 1.4-.02 2.29-1.27 3.15-2.53.99-1.45 1.4-2.85 1.42-2.93-.03-.01-2.72-1.04-2.75-4.13zM14.6 4.7c.72-.87 1.2-2.08 1.07-3.28-1.03.04-2.28.69-3.02 1.55-.66.77-1.24 2-1.09 3.18 1.15.09 2.32-.58 3.04-1.45z" />
@@ -184,7 +184,7 @@ export default function LoginView({ onSuccess, onGuest }: Props) {
         {/* Guest option */}
         <div className="flex items-center gap-3">
           <div className="flex-1 h-px bg-white/8" />
-          <span className="text-white/25 text-xs">or</span>
+          <span className="text-white/50 text-xs">or</span>
           <div className="flex-1 h-px bg-white/8" />
         </div>
 

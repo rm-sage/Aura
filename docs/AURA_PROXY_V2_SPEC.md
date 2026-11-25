@@ -10,7 +10,7 @@ exist on the proxy. No client changes are needed once the proxy is up.
 
 ## 1. Scope
 
-The proxy already handles OAuth (`/oauth/{trakt,anilist}/...`).
+The proxy already handles OAuth (`/oauth/anilist/...`).
 Phase 2 adds a parallel route group `/sync/v1/...` that stores per-
 account JSON blobs. The two route groups share nothing operationally;
 the OAuth flow is unchanged.

@@ -2,51 +2,59 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 // ---------------------------------------------------------------------------
-// First-run onboarding state — fires after the user makes their first
-// Sign In / Continue as Guest choice on LandingView. Runs ONLY on true
-// fresh installs (uninstall/reinstall); updates preserve the
-// "completed" flag and skip the wizard entirely.
+// First-run setup state (the OnboardingView wizard).
 //
-// Two localStorage keys split the state:
-//   • `aura:onboarding-completed-v1` (boolean-ish): set when the user
-//     either finishes the wizard or skips out entirely. Survives auth
-//     churn (logout/login). Absent on a fresh install.
-//   • `aura:onboarding-progress-v1` (object): per-step state preserved
-//     during the wizard so an app-quit mid-onboarding resumes at the
-//     same step on next launch. Deleted on completion.
+// Two localStorage keys:
+//   - `aura:onboarding-completed-v1` ("true" once the wizard was finished or
+//     skipped). It gates the wizard on launch, so it must NEVER be renamed: a
+//     new name would show the wizard again to every existing user. Survives
+//     sign-in and sign-out.
+//   - `aura:onboarding-progress-v2`: which step a first run is on and which
+//     recommended addons it installed, so a quit mid-wizard resumes there.
+//     Holds no settings: every choice in the wizard is applied the moment it
+//     is made. Removed on completion.
 //
-// "Reopen onboarding addons" in AddonsView routes through
-// `requestReopenAddons()` so the user can revisit just page 3 without
-// re-running the whole wizard.
+// The wizard opens in one of three modes (App.tsx picks it):
+//   - "first-run": after Landing on an install that never completed it.
+//   - "addons-only": Addons > Suggested addons (`requestReopenAddons`), just
+//     the addon list, nothing persisted.
+//   - "rerun": Settings > Backup & Restore > Run setup again
+//     (`requestRerunOnboarding`), every step again over the live settings.
 // ---------------------------------------------------------------------------
 
 const COMPLETED_KEY = "aura:onboarding-completed-v1";
-const PROGRESS_KEY  = "aura:onboarding-progress-v1";
+const PROGRESS_KEY = "aura:onboarding-progress-v2";
+/** The old progress key (a bare step index plus a settings draft). Read once
+ *  to migrate, then removed. */
+const LEGACY_PROGRESS_KEY = "aura:onboarding-progress-v1";
 
-export interface OnboardingProgress {
-  /** 0 = import, 1 = settings, 2 = addons. */
-  step: number;
-  /** Per-step skip flags so a relaunch knows the user already opted
-   *  out of importing / settings setup and lands on the next step. */
-  skipped?: { import?: boolean; settings?: boolean };
-  /** Partial state from step 2 so a mid-page exit preserves choices.
-   *  Free-form bag — each question writes its own key. */
-  settingsDraft?: Record<string, unknown>;
-  /** Which suggested addons have been installed in this session. URL
-   *  list so a relaunch's step-3 view knows what to mark as "done"
-   *  vs "available". */
-  installedAddons?: string[];
+export type OnboardingMode = "first-run" | "addons-only" | "rerun";
+
+/** Every step the wizard can show, in order. The wizard filters this list
+ *  (the tracking step needs a scrobble service this build can use), and the
+ *  stepper, "Step n of N" and navigation all derive from the filtered list. */
+export const ONBOARDING_STEP_IDS = ["welcome", "look", "playback", "addons", "tracking"] as const;
+export type OnboardingStepId = typeof ONBOARDING_STEP_IDS[number];
+
+function isStepId(value: unknown): value is OnboardingStepId {
+  return typeof value === "string" && (ONBOARDING_STEP_IDS as readonly string[]).includes(value);
 }
 
-const DEFAULT_PROGRESS: OnboardingProgress = {
-  step: 0,
-  skipped: {},
-  settingsDraft: {},
-  installedAddons: [],
-};
+export interface OnboardingProgress {
+  v: 2;
+  stepId: OnboardingStepId;
+  /** Recommended-addon entry ids installed from the wizard (for example
+   *  "cinemeta"). Never URLs: a configured manifest URL carries the user's
+   *  config token or debrid key. */
+  installed: string[];
+}
 
-/** True if the wizard has been completed (or fully skipped) on this
- *  install. Reads localStorage; treats absent as not-completed. */
+function defaultProgress(): OnboardingProgress {
+  return { v: 2, stepId: ONBOARDING_STEP_IDS[0], installed: [] };
+}
+
+/** True once the wizard was finished or skipped on this install. Absent (or
+ *  unreadable storage) reads as not completed. */
 export function isOnboardingComplete(): boolean {
   try {
     return localStorage.getItem(COMPLETED_KEY) === "true";
@@ -55,55 +63,68 @@ export function isOnboardingComplete(): boolean {
   }
 }
 
-/** Persist the completion flag and drop any per-step progress state.
- *  Returns `true` when this call flipped state from incomplete →
- *  complete (i.e. the user is finishing onboarding for the FIRST time),
- *  `false` when the flag was already set (reopen-addons flow, manual
- *  re-run, etc.). Callers use the return to gate first-run-only side
- *  effects like the post-completion scrobble notification. */
+/** Set the completion flag and drop saved progress. Returns true only when
+ *  this call is the FIRST completion (the flag was not set before), false on
+ *  a re-run or a reopen. Callers gate first-run-only side effects on it, like
+ *  the scrobble notice. */
 export function markOnboardingComplete(): boolean {
   try {
     const wasAlreadyComplete = localStorage.getItem(COMPLETED_KEY) === "true";
     localStorage.setItem(COMPLETED_KEY, "true");
     localStorage.removeItem(PROGRESS_KEY);
+    localStorage.removeItem(LEGACY_PROGRESS_KEY);
     return !wasAlreadyComplete;
   } catch {
-    // localStorage unavailable (private browsing mode / quota error /
-    // etc.) — the wizard will re-fire on next launch. Acceptable
-    // degradation; the user clicks through it again. Treat as
-    // "first time" so the notification still fires.
+    // Storage unavailable: the wizard shows again next launch, which is an
+    // acceptable degradation. Count it as a first completion so the notice
+    // still fires.
     return true;
   }
 }
 
-/** Read the persisted per-step progress. Returns the default shape
- *  when nothing's stored or the stored value is malformed. */
-export function loadOnboardingProgress(): OnboardingProgress {
+/** Map an old v1 progress record to v2: step 0 (import) and 1 (settings)
+ *  and 2 (addons) land on the step that now holds that content. The old
+ *  installed list held URLs and is dropped. */
+function migrateLegacy(raw: string): OnboardingProgress {
+  const fallback = defaultProgress();
   try {
-    const raw = localStorage.getItem(PROGRESS_KEY);
-    if (!raw) return { ...DEFAULT_PROGRESS };
-    const parsed = JSON.parse(raw) as Partial<OnboardingProgress>;
-    return {
-      step: typeof parsed.step === "number" && parsed.step >= 0 && parsed.step <= 2
-        ? parsed.step : 0,
-      skipped: parsed.skipped && typeof parsed.skipped === "object"
-        ? { import: !!parsed.skipped.import, settings: !!parsed.skipped.settings }
-        : {},
-      settingsDraft: parsed.settingsDraft && typeof parsed.settingsDraft === "object"
-        ? { ...parsed.settingsDraft }
-        : {},
-      installedAddons: Array.isArray(parsed.installedAddons)
-        ? parsed.installedAddons.filter((u): u is string => typeof u === "string")
-        : [],
-    };
+    const parsed = JSON.parse(raw) as { step?: unknown };
+    const byIndex: Record<number, OnboardingStepId> = { 0: "welcome", 1: "look", 2: "addons" };
+    const stepId = typeof parsed.step === "number" ? byIndex[parsed.step] : undefined;
+    return { ...fallback, stepId: stepId ?? fallback.stepId };
   } catch {
-    return { ...DEFAULT_PROGRESS };
+    return fallback;
   }
 }
 
-/** Persist the wizard's per-step progress. Called on every navigation
- *  and on every partial-state mutation so a mid-page app-quit doesn't
- *  lose the user's in-progress choices. */
+/** The saved progress, or the first step when nothing (or nothing valid) is
+ *  stored. Migrates a v1 record once: writes v2 and removes v1. */
+export function loadOnboardingProgress(): OnboardingProgress {
+  try {
+    const raw = localStorage.getItem(PROGRESS_KEY);
+    if (!raw) {
+      const legacy = localStorage.getItem(LEGACY_PROGRESS_KEY);
+      if (!legacy) return defaultProgress();
+      const migrated = migrateLegacy(legacy);
+      saveOnboardingProgress(migrated);
+      localStorage.removeItem(LEGACY_PROGRESS_KEY);
+      return migrated;
+    }
+    const parsed = JSON.parse(raw) as Partial<Record<keyof OnboardingProgress, unknown>>;
+    return {
+      v: 2,
+      stepId: isStepId(parsed.stepId) ? parsed.stepId : ONBOARDING_STEP_IDS[0],
+      installed: Array.isArray(parsed.installed)
+        ? parsed.installed.filter((id): id is string => typeof id === "string")
+        : [],
+    };
+  } catch {
+    return defaultProgress();
+  }
+}
+
+/** Persist the wizard's progress. Synchronous, so a quit right after a step
+ *  change still round-trips. */
 export function saveOnboardingProgress(progress: OnboardingProgress): void {
   try {
     localStorage.setItem(PROGRESS_KEY, JSON.stringify(progress));
@@ -112,21 +133,28 @@ export function saveOnboardingProgress(progress: OnboardingProgress): void {
   }
 }
 
-/** Reset progress without flipping the completed flag — used when the
- *  user opens the "Reopen onboarding addons" button so step 3 starts
- *  fresh without re-running steps 0 and 1. */
+/** Drop saved progress without touching the completion flag. */
 export function clearOnboardingProgress(): void {
   try {
     localStorage.removeItem(PROGRESS_KEY);
+    localStorage.removeItem(LEGACY_PROGRESS_KEY);
   } catch {
     // ignore
   }
 }
 
-/** Dispatch a request to reopen the addons step of the wizard from
- *  anywhere (typically the AddonsView "Reopen onboarding addons"
- *  button). App.tsx subscribes and remounts the OnboardingView at
- *  step 2. */
+/** Show just the recommended-addons list again (Addons > Suggested addons).
+ *  App.tsx listens and opens the wizard in "addons-only" mode. */
 export function requestReopenAddons(): void {
   window.dispatchEvent(new CustomEvent("aura:onboarding-reopen-addons"));
+}
+
+/** Run the whole setup again (Settings > Backup & Restore > Run setup
+ *  again). Clears any saved step progress so it starts at the first step,
+ *  leaves the completed flag set (so finishing it again is not a first
+ *  completion), and asks App.tsx to show the wizard in "rerun" mode.
+ *  Nothing is reset: every step reads the live settings. */
+export function requestRerunOnboarding(): void {
+  clearOnboardingProgress();
+  window.dispatchEvent(new CustomEvent("aura:onboarding-rerun"));
 }

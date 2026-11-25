@@ -117,6 +117,29 @@ export function screenWidthHint(): number {
   return Math.min(4096, Math.max(1280, Math.round(w * dpr)));
 }
 
+/** A title LOGO at the size it is shown: `cssW` CSS px wide at most, times
+ *  the display scale. Logos need their alpha, so never the resize proxy (it
+ *  re-encodes to JPEG); TMDB serves every logo as a PNG at w45 .. w500, and
+ *  this picks the smallest rung that covers the width (`original` past 500).
+ *  Other hosts pass through. Why (2026-11-24): the hero rendered TMDB
+ *  `original` logos, and Avengers: Endgame's is a 7795 x 2877 PNG (10.7 MB,
+ *  22.4 Mpx) shown 96 px tall: decoding it held the frame after its slide
+ *  change about 330 ms with the main thread idle (the "colour bleed waits for
+ *  the logo" report), on every visit after its decode was dropped. */
+export function sizedLogo(url: string | null | undefined, cssW = 440): string | null | undefined {
+  if (!url) return url;
+  const m = url.match(/^(https?:\/\/image\.tmdb\.org\/t\/p\/)(original|w\d+)(\/.*)$/i);
+  if (!m) return url;
+  const dpr = typeof window !== "undefined" ? window.devicePixelRatio || 1 : 1;
+  const want = cssW * dpr;
+  // w500 up to 1.5x its width (a logo is mostly narrower than cssW, as it is
+  // capped at 96 px tall too); `original` only past that.
+  const rung = [45, 92, 154, 185, 300, 500].find((w) => w >= want) ?? (want <= 750 ? 500 : undefined);
+  const cur = m[2].toLowerCase() === "original" ? Infinity : parseInt(m[2].slice(1), 10);
+  if (!rung || rung >= cur) return url; // never upsize
+  return `${m[1]}w${rung}${m[3]}`;
+}
+
 /** Downsize a poster URL to roughly `targetW` CSS px (callers fold in hi-DPI,
  *  e.g. 360 for a 180px card on a 2x display). Applies the CDN size hint, then
  *  wraps in the on-device resize proxy. Passthrough on null / non-http. */

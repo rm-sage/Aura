@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { useEffect, useMemo, useRef, useState, memo } from "react";
+import type React from "react";
 import type { MetaPreview } from "./types";
+import { ToggleSwitch } from "./settingsControls";
 
 // ---------------------------------------------------------------------------
 // FilterBar / FilterMenu — client-side filter & sort over an in-memory
@@ -295,7 +297,7 @@ function FilterControls({ state, model }: { state: FilterState; model: FilterMod
           it's the coarsest cut of the list. */}
       {statusChoices && statusChoices.length > 0 && (
         <div className="space-y-1.5">
-          <label className="text-white/40 text-[10px] font-semibold tracking-wider uppercase">
+          <label className="text-white/60 text-[10px] font-semibold tracking-wider uppercase">
             Status
           </label>
           <div className="flex flex-wrap gap-1.5">
@@ -305,11 +307,8 @@ function FilterControls({ state, model }: { state: FilterState; model: FilterMod
                 <button
                   key={value}
                   onClick={() => setStatus(value)}
-                  className={`px-2.5 py-1 rounded-full text-[11px] transition-colors
-                              ${active
-                                ? "bg-ln-accent/25 text-ln-accent border border-ln-accent/40"
-                                : "bg-white/5 text-white/55 border border-white/10 hover:bg-white/10"
-                              }`}
+                  aria-pressed={active}
+                  className="aura-glass-flat aura-filter-chip px-2.5 py-1 rounded-full text-[11px] text-white/55"
                 >
                   {label}
                 </button>
@@ -324,7 +323,7 @@ function FilterControls({ state, model }: { state: FilterState; model: FilterMod
           honor it so it can't render as an inert control. */}
       {showAiringToggle && (
       <div className="space-y-1.5">
-        <label className="text-white/40 text-[10px] font-semibold tracking-wider uppercase">
+        <label className="text-white/60 text-[10px] font-semibold tracking-wider uppercase">
           Airing
         </label>
         <button
@@ -332,22 +331,22 @@ function FilterControls({ state, model }: { state: FilterState; model: FilterMod
           role="switch"
           aria-checked={state.airingOnly ?? false}
           onClick={() => set({ airingOnly: !(state.airingOnly ?? false) })}
-          className={`w-full flex items-center justify-between px-2.5 py-1.5 rounded-lg text-[11px] transition-colors
-                      ${state.airingOnly
-                        ? "bg-ln-accent/25 text-ln-accent border border-ln-accent/40"
-                        : "bg-white/5 text-white/55 border border-white/10 hover:bg-white/10"}`}
+          // A menu row inside the glass filter popover (never a raised glass
+          // face on glass); the toggle carries the state, not the row.
+          className="aura-glass-row w-full flex items-center justify-between px-2.5 py-1.5
+                     rounded-lg text-[11px] text-white/55"
         >
           <span>Currently airing only</span>
-          <span className={`relative w-8 h-4 rounded-full transition-colors ${state.airingOnly ? "bg-ln-accent/60" : "bg-white/15"}`}>
-            <span className={`absolute top-0.5 w-3 h-3 rounded-full bg-white transition-all ${state.airingOnly ? "left-4" : "left-0.5"}`} />
-          </span>
+          {/* The shared glass switch, decorative: the button above carries
+              the switch role, the click and the keyboard. */}
+          <ToggleSwitch decorative size="xs" value={state.airingOnly ?? false} />
         </button>
       </div>
       )}
 
       {/* Sort */}
       <div className="space-y-1.5">
-        <label className="text-white/40 text-[10px] font-semibold tracking-wider uppercase">
+        <label className="text-white/60 text-[10px] font-semibold tracking-wider uppercase">
           Sort By
         </label>
         <div className={`grid gap-1 ${sortChoices.length === 4 ? "grid-cols-2" : "grid-cols-3"}`}>
@@ -357,11 +356,8 @@ function FilterControls({ state, model }: { state: FilterState; model: FilterMod
               <button
                 key={value}
                 onClick={() => setSort(value)}
-                className={`px-2 py-1.5 rounded-lg text-xs transition-colors
-                            ${active
-                              ? "bg-ln-accent/25 text-ln-accent border border-ln-accent/35"
-                              : "bg-white/5 text-white/55 border border-white/8 hover:bg-white/10"
-                            }`}
+                aria-pressed={active}
+                className="aura-glass-flat aura-filter-chip px-2 py-1.5 rounded-lg text-xs text-white/55"
               >
                 {label}
               </button>
@@ -373,7 +369,7 @@ function FilterControls({ state, model }: { state: FilterState; model: FilterMod
       {/* Release year — one track, two thumbs (min / max) */}
       <div className="space-y-1.5">
         <div className="flex items-center justify-between">
-          <label className="text-white/40 text-[10px] font-semibold tracking-wider uppercase">
+          <label className="text-white/60 text-[10px] font-semibold tracking-wider uppercase">
             Release Year
           </label>
           <span className="text-white/55 text-xs font-mono tabular-nums">
@@ -420,7 +416,7 @@ function FilterControls({ state, model }: { state: FilterState; model: FilterMod
       {/* Genres */}
       {genres.length > 0 && (
         <div className="space-y-1.5">
-          <label className="text-white/40 text-[10px] font-semibold tracking-wider uppercase">
+          <label className="text-white/60 text-[10px] font-semibold tracking-wider uppercase">
             Genres
           </label>
           <div className="flex flex-wrap gap-1.5">
@@ -430,11 +426,8 @@ function FilterControls({ state, model }: { state: FilterState; model: FilterMod
                 <button
                   key={g}
                   onClick={() => toggleGenre(g)}
-                  className={`px-2.5 py-1 rounded-full text-[11px] transition-colors
-                              ${active
-                                ? "bg-ln-accent/25 text-ln-accent border border-ln-accent/40"
-                                : "bg-white/5 text-white/55 border border-white/10 hover:bg-white/10"
-                              }`}
+                  aria-pressed={active}
+                  className="aura-glass-flat aura-filter-chip px-2.5 py-1 rounded-full text-[11px] text-white/55"
                 >
                   {g}
                 </button>
@@ -448,8 +441,7 @@ function FilterControls({ state, model }: { state: FilterState; model: FilterMod
       <button
         onClick={reset}
         disabled={!isDirty}
-        className="w-full py-1.5 rounded-lg text-xs transition-all
-                   bg-white/5 hover:bg-white/10 border border-white/10
+        className="aura-glass-flat w-full py-1.5 rounded-lg text-xs
                    text-white/55 hover:text-white/85
                    disabled:opacity-30 disabled:cursor-not-allowed"
       >
@@ -502,11 +494,11 @@ function FilterMenuInner(props: Props) {
         type="button"
         onClick={() => setPinned((p) => !p)}
         aria-expanded={open}
-        className={`flex items-center gap-2 px-3 py-1.5 rounded-lg border text-xs font-semibold tracking-[0.1em] uppercase transition-colors
-                    ${pinned
-                      ? "bg-ln-accent/25 border-ln-accent/35 text-ln-accent"
-                      : "bg-white/5 border-white/8 text-white/75 hover:bg-white/10"
-                    }`}
+        // Pinned open reads as SELECTED (is-selected, src/styles/glass-search.css):
+        // Frosted an accent wash, Liquid a raised face with an accent label.
+        className={`aura-glass-flat aura-filter-chip flex items-center gap-2 px-3 py-1.5 rounded-lg
+                    text-xs font-semibold tracking-[0.1em] uppercase text-white/75
+                    ${pinned ? "is-selected" : ""}`}
       >
         <FilterIcon />
         Filter &amp; Sort
@@ -524,9 +516,15 @@ function FilterMenuInner(props: Props) {
         // continuous. right-0 anchors it under the pill so the card can't
         // overflow the popup's right edge. z-50 floats it over the grid.
         <div className="absolute right-0 top-full z-50 pt-2">
+          {/* The menu tier of the glass (aura-float-glass), growing out of
+              the trigger's corner (aura-glass-pop-in, origin top right). */}
           <div
-            className="w-72 aura-glass-menu rounded-2xl p-4 max-h-[70vh] overflow-y-auto shadow-2xl"
-            style={{ scrollbarWidth: "thin", scrollbarColor: "rgba(255,255,255,0.08) transparent" }}
+            className="w-72 aura-float-glass aura-glass-pop-in rounded-2xl p-4 max-h-[70vh] overflow-y-auto"
+            style={{
+              scrollbarWidth: "thin",
+              scrollbarColor: "rgba(255,255,255,0.08) transparent",
+              "--lg-origin": "top right",
+            } as React.CSSProperties}
           >
             <FilterControls state={props.state} model={model} />
           </div>

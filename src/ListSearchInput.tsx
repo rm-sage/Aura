@@ -34,8 +34,16 @@ export default function ListSearchInput({
   value, onChange, placeholder, className, ariaLabel,
 }: Props) {
   return (
-    <div className={`relative ${className ?? ""}`}>
-      <span className="absolute left-3 top-1/2 -translate-y-1/2 text-white/35 pointer-events-none">
+    // The glass text field is the WRAPPER (aura-glass-field, :focus-within
+    // styling): the input inside is bare and transparent, and a press on the
+    // icon or the padding lands in it through the <label>. The box widens a
+    // little on focus (aura-list-search, src/styles/glass-search.css) from
+    // the rest width the caller gives in `className`.
+    <label
+      className={`aura-glass-field aura-glass-morph-w aura-list-search relative block rounded-full cursor-text
+                  ${className ?? ""}`}
+    >
+      <span className="aura-list-search-icon absolute left-3 top-1/2 -translate-y-1/2 text-white/35 pointer-events-none">
         <SearchIcon />
       </span>
       <input
@@ -62,10 +70,9 @@ export default function ListSearchInput({
         // 5 px above and 7 below instead of py-1.5 (same height): the UI font's
         // metrics put its ink 1-2 px under the line box's centre, which left the
         // text sitting visibly lower than the search icon beside it.
-        className="w-full bg-white/5 border border-white/10 rounded-full
+        className="w-full bg-transparent border-0 rounded-full
                    pl-8 pr-8 pt-[5px] pb-[7px] text-xs text-white/85
-                   placeholder:text-white/30 outline-none transition-colors
-                   hover:border-white/20 focus:border-white/30 focus:bg-black/30"
+                   placeholder:text-white/30 outline-none"
       />
       {value && (
         <button
@@ -79,7 +86,7 @@ export default function ListSearchInput({
           <ClearIcon />
         </button>
       )}
-    </div>
+    </label>
   );
 }
 

@@ -11,99 +11,37 @@ use crate::scrobble_auth;
 use crate::settings;
 
 // ---------------------------------------------------------------------------
-// Scrobble — direct Trakt progress reporting using OAuth tokens stored
-// by scrobble_auth.rs.
+// Scrobble: completion reporting to AniList and Simkl, using the OAuth tokens
+// stored by scrobble_auth.rs.
 //
 // Earlier rounds of Aura proxied scrobble events through the AIOMetadata
-// addon's `/scrobble` resource. The OAuth proxy migration replaced that:
-// Trakt's `client_secret` is held server-side at aura.animasec.dev, the
-// desktop holds only the access token, and we POST directly to Trakt's
-// API with the bearer token. AIOMetadata is no longer in the scrobble
-// path at all — see `aura-proxy/main.go` and the integration doc for
-// the full flow.
+// addon's `/scrobble` resource. That is gone: each provider is called
+// directly with the user's own token, and AIOMetadata is no longer in the
+// scrobble path at all.
 //
-// Wire format (per Trakt API v2):
-//   POST https://api.trakt.tv/sync/history
-//   Headers: Authorization: Bearer <token>, trakt-api-version: 2,
-//            trakt-api-key: <client_id>, Content-Type: application/json
-//   Body for movies:
-//     { "movies":   [{ "ids": { "imdb": "tt0111161" } }] }
-//   Body for episodes:
-//     { "shows":    [{
-//         "ids":     { "imdb": "tt0903747" },
-//         "seasons": [{
-//           "number":   1,
-//           "episodes": [{ "number": 5 }]
-//         }]
-//       }] }
+// AniList (scrobble_anilist.rs): the IMDb id resolves to an AniList media id
+// (the addon's embedded per-video pair first, then the Fribb id map, a title
+// search and a persistent cache). `is_anime` on the session decides whether it
+// fires; the anime detector in `aiometadata.ts` needs the meta's genre /
+// original language / production country signals, all of which are carried on
+// `ActiveScrobbleTarget` so Cinemeta-supplied IMDb anime (Frieren, Demon
+// Slayer, etc.) flows through correctly.
 //
-// Why `/sync/history` and not `/scrobble/stop`?
+// Simkl (scrobble_simkl.rs) is completion-only (POST /sync/history, never
+// /scrobble/*): one POST per finished movie / episode, plus one fallback POST
+// with show-level ids for an anime episode whose cour-level ids come back
+// not_found, every one paced by send_paced. Anime goes to it alongside AniList
+// rather than instead of it. Inert in a build without a Simkl client_id.
 //
-//   1. `/scrobble/stop` is designed to terminate an in-progress scrobble
-//      session opened via `/scrobble/start`. Aura deliberately skips
-//      `/scrobble/start` (it would put the user on Trakt's public
-//      "currently watching" feed for every preview attempt), so calling
-//      `/stop` standalone is supported by Trakt but inconsistent: it
-//      returns 409 Conflict on the second call within 30 minutes for
-//      the same item, and the implicit "intent" semantics are awkward
-//      when there was no prior start.
-//
-//   2. `/sync/history` is the canonical "add this to watched history"
-//      endpoint. It's idempotent in the right way (multiple plays
-//      produce multiple history entries the user can inspect) and
-//      doesn't depend on Trakt's scrobble session state at all.
-//
-//   3. AIOMetadata uses `/checkin` (which both scrobbles AND adds to
-//      history) for the same reason — `/scrobble/stop` is unreliable
-//      for "I just finished this" semantics. We picked `/sync/history`
-//      over `/checkin` because Aura's stricter completion gates
-//      (80% + 5 min elapsed in useScrobble.ts) already mean we only
-//      fire on a confirmed completion, so the public-feed effect of
-//      `/checkin` adds no value over a plain history write.
-//
-// Aura only fires this on session-end with auto-complete already gated
-// to >= 80% (see useScrobble.ts), so the wire path always intends
-// "mark watched".
-//
-// AniList scrobbling is wired through scrobble_anilist.rs — IMDB id
-// resolves to AniList media id via title search + a persistent cache.
-// `is_anime` on the session drives whether it fires; the anime
-// detector in `aiometadata.ts` needs the meta's genre / original
-// language / production country signals, all of which are now carried
-// on `ActiveScrobbleTarget` so Cinemeta-supplied IMDB anime
-// (Frieren, Demon Slayer, etc.) flows through correctly.
-//
-// Simkl is the third provider (scrobble_simkl.rs), completion-only like
-// Trakt (POST /sync/history, never /scrobble/*): one POST per finished
-// movie / episode, plus one fallback POST with show-level ids for an anime
-// episode whose cour-level ids come back not_found, every one paced by
-// send_paced. Anime goes alongside AniList rather than instead of it. Inert
-// in a build without a Simkl client_id.
+// Aura fires a provider only on session end with auto-complete gated to
+// >= 80% (see useScrobble.ts), so the wire path always means "mark watched".
+// Nothing is sent at session start: a live "watching now" push would put a
+// preview on a public feed.
 //
 // All scrobble traffic is best-effort: failures are logged via
-// `crate::devlog!` but never propagate to the user. The scrobble
-// pipeline must never block playback.
+// `crate::devlog!` but never propagate to the user. The scrobble pipeline
+// must never block playback.
 // ---------------------------------------------------------------------------
-
-const TRAKT_API: &str = "https://api.trakt.tv";
-const TIMEOUT: Duration = Duration::from_secs(8);
-
-static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-
-fn client() -> &'static reqwest::Client {
-    CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .https_only(true)
-            .timeout(TIMEOUT)
-            .tcp_nodelay(true)
-            .tcp_keepalive(Duration::from_secs(60))
-            .pool_max_idle_per_host(1)
-            .pool_idle_timeout(Duration::from_secs(30))
-            .user_agent(concat!("Aura/", env!("CARGO_PKG_VERSION"), " scrobble"))
-            .build()
-            .expect("Scrobble HTTP client init failed")
-    })
-}
 
 // ---------------------------------------------------------------------------
 // Active session — at most one scrobble session at a time
@@ -125,12 +63,12 @@ pub struct ScrobbleSession {
     pub scope: String,
     /// Authoritative season number from the VideoEntry the user
     /// actually clicked in the episode picker. When present, preferred
-    /// over the ID-parsed value for the Trakt payload (the two can
-    /// disagree when AIOMetadata's metadata provider produces absolute
-    /// vs multi-season numbering inconsistently — common for anime
-    /// where the stream id may be TMDB-multi-season while the
-    /// VideoEntry's display numbers are TVDB-absolute, or vice-versa).
-    /// `None` for movies and for older targets that don't supply it.
+    /// over the ID-parsed value (the two can disagree when AIOMetadata's
+    /// metadata provider produces absolute vs multi-season numbering
+    /// inconsistently, common for anime where the stream id may be
+    /// TMDB-multi-season while the VideoEntry's display numbers are
+    /// TVDB-absolute, or vice versa). `None` for movies and for older
+    /// targets that don't supply it.
     #[serde(default)]
     pub season: Option<u32>,
     /// Authoritative episode number, paired with `season` above. Same
@@ -139,60 +77,28 @@ pub struct ScrobbleSession {
     pub episode_num: Option<u32>,
     /// Series-root IMDb id (e.g. `"tt22248376"`), kept separately from
     /// `imdb_id` (which carries the *video* id for the episode being
-    /// scrobbled). Required after AIOMetadata's IMDb-anime patch makes
+    /// scrobbled). Required since AIOMetadata's IMDb-anime patch makes
     /// the video id non-tt-prefixed (e.g. `kitsu:46474:5`) while the
-    /// series root stays IMDb. Trakt scrobble keys the show by IMDb id
-    /// + S/E numbers, so without this we lose the show anchor for
-    /// anime once the video ids switch shape.
+    /// series root stays IMDb, so a provider keying the show by IMDb id
+    /// + S/E numbers still has its show anchor.
     ///
-    /// Optional because movies and pre-patch shows don't need it (the
-    /// id parse path still works) and because frontend may not always
-    /// have a separate series root to thread. When None, scrobble.rs
-    /// falls back to extracting the show id from `imdb_id` via the
-    /// existing parse path — which yields the same value for IMDb-keyed
-    /// episodes today.
+    /// Optional because movies and pre-patch shows don't need it and the
+    /// frontend may not always have a separate series root to thread.
+    /// When None, the show id is parsed from `imdb_id`, which yields the
+    /// same value for IMDb-keyed episodes.
     #[serde(default)]
     pub series_imdb_id: Option<String>,
-    /// Absolute episode number across the entire show, summed from
-    /// every earlier main-run cour's episode count + the current
-    /// cour-relative episode. Aura computes this on the frontend
-    /// from the meta detail (cour-relative is what AIOMetadata's
-    /// cour-aggregated `videos[].episode` carries).
-    ///
-    /// Used by `trakt_targets` to build a tertiary fallback target
-    /// for shows Trakt indexes by absolute numbering instead of
-    /// per-cour seasons (Frieren is the canonical example —
-    /// `tt22248376` on Trakt has all 38 episodes under S1, so a
-    /// cour-2-ep-9 payload returns `not_found` while
-    /// cour-2-absolute-37 succeeds). None when the frontend doesn't
-    /// have a meta detail to compute against (movies, pre-patch
-    /// shows, scoped scrobble events firing before the videos array
-    /// resolved).
-    #[serde(default)]
-    pub absolute_episode_num: Option<u32>,
     /// AIOMetadata-embedded AniList media id for this episode's cour, threaded
     /// from the VideoEntry (Aura<->AIOMetadata scrobble contract). When present
     /// with `anilist_episode`, `scrobble_anilist::save_progress` saves straight
     /// to this entry and bypasses the Fribb id-map / title-search / sequel-walk
-    /// / offset heuristics. AniList-only; Trakt still keys by IMDb + S/E.
+    /// / offset heuristics.
     #[serde(default)]
     pub anilist_id: Option<u64>,
     /// AIOMetadata-embedded episode number LOCAL to `anilist_id` (1-indexed).
     /// Paired with `anilist_id`; ignored without it.
     #[serde(default)]
     pub anilist_episode: Option<u32>,
-    /// The episode's own title from the VideoEntry (e.g. "Foundation Stones").
-    /// Feeds the last-resort Trakt title + air-date search, for an episode whose
-    /// show Trakt files under a DIFFERENT show id than the addon does (Bleach:
-    /// Thousand-Year Blood War is its own IMDb title, but Trakt keeps its
-    /// episodes in Bleach season 2). Optional: older callers omit it.
-    #[serde(default)]
-    pub episode_title: Option<String>,
-    /// The episode's air date from the VideoEntry (`released`, ISO 8601; only
-    /// the date part is read). Paired with `episode_title`: the search result
-    /// is accepted only when BOTH agree.
-    #[serde(default)]
-    pub episode_released: Option<String>,
 }
 
 static SESSION: OnceLock<Mutex<Option<ScrobbleSession>>> = OnceLock::new();
@@ -210,12 +116,11 @@ pub fn current() -> Option<ScrobbleSession> {
 // Last-seen playback snapshot
 //
 // Tracked via heartbeat / start so the synchronous CloseRequested handler
-// can fire a `/scrobble/stop` with realistic time/duration values without
+// can flush a completion with realistic time/duration values without
 // touching MPV (libmpv get_property during the close transition is one of
 // the documented STATUS_ACCESS_VIOLATION triggers — CLAUDE.md landmine #3).
-// Without this, hard window-closes left Trakt stuck in "Currently watching"
-// because the JS-side scrobble_end never fired and Trakt couldn't
-// distinguish stop-by-close from stop-by-pause.
+// Without this, a hard window-close lost a completion: the JS-side
+// scrobble_end never fires when the process exits.
 // ---------------------------------------------------------------------------
 
 static LAST_PLAYBACK: OnceLock<Mutex<(f64, f64)>> = OnceLock::new();
@@ -231,388 +136,12 @@ fn record_playback(time: f64, duration: f64) {
 }
 
 // ---------------------------------------------------------------------------
-// Trakt target id parsing
-//
-// Aura's session ids follow Stremio's convention:
-//   • Movies: a bare IMDB id (`tt0111161`).
-//   • Episodes: `<show_imdb>:<season>:<episode>` (e.g. `tt0903747:1:5`).
-// Anything that doesn't match (e.g. `kitsu:42:3`, MAL ids, etc.) is
-// silently skipped — Trakt accepts IMDB ids as the canonical bridge,
-// and adding non-IMDB id resolution is a separate task.
-// ---------------------------------------------------------------------------
-
-#[derive(Clone, Debug, PartialEq)]
-enum TraktTarget {
-    Movie { imdb: String },
-    Episode { show_imdb: String, season: u32, number: u32 },
-    /// An episode keyed by Trakt's own episode id. Only the title + air-date
-    /// fallback produces this (never `trakt_targets`): it is the one path that
-    /// finds the episode without knowing which show Trakt files it under.
-    EpisodeByTraktId { trakt: u64 },
-}
-
-fn parse_trakt_target(id: &str, media_type: &str) -> Option<TraktTarget> {
-    let parts: Vec<&str> = id.split(':').collect();
-    match parts.as_slice() {
-        [imdb] if imdb.starts_with("tt") && media_type == "movie" => {
-            Some(TraktTarget::Movie { imdb: (*imdb).to_string() })
-        }
-        [imdb, s, e] if imdb.starts_with("tt") => {
-            let season: u32 = s.parse().ok()?;
-            let number: u32 = e.parse().ok()?;
-            Some(TraktTarget::Episode {
-                show_imdb: (*imdb).to_string(),
-                season,
-                number,
-            })
-        }
-        _ => None,
-    }
-}
-
-/// Build the primary + optional fallback Trakt targets for a session.
-///
-/// AIOMetadata can produce dual-numbering inconsistencies depending on
-/// the selected metadata provider for anime — the stream id may carry
-/// one season/episode tuple (e.g. TMDB multi-season `tt22248376:2:3`)
-/// while the VideoEntry's `season` / `episode` fields carry another
-/// (TVDB absolute `S1E31` for the same physical episode). Trakt
-/// indexes by TVDB ordering for anime, so the "right" payload depends
-/// on whether Trakt's catalog uses absolute or multi-season for that
-/// show. Rather than guess, we send the VideoEntry's authoritative
-/// numbers first; if Trakt reports `not_found`, the wrapper retries
-/// with the ID-parsed alternate.
-///
-/// Returns:
-///   • Primary  — what to send first (VideoEntry override if present,
-///     else the ID-parsed value).
-///   • Fallback — a different target to retry with on not_found; None
-///     when the two would be identical (no retry needed) or when the
-///     session has no usable id (skip path).
-/// Build the ordered list of Trakt /sync/history targets to try for a
-/// single scrobble event. Tried in priority order; the retry loop in
-/// `trakt_sync_history` walks the list until one returns `Added` or
-/// the list is exhausted.
-///
-/// Ordering rationale:
-///   1. VideoEntry-authoritative cour numbering (`series_imdb_id` +
-///      `sess.season` + `sess.episode_num`). What AIOMetadata's
-///      cour-aggregation patch encodes as the canonical view. Trakt
-///      anime entries that follow TVDB's cour-per-season layout
-///      accept this directly.
-///   2. ID-parsed numbering (legacy `tt…:S:E` ids). Only different
-///      from #1 when the id-string S/E disagrees with the VideoEntry
-///      override — the dual-numbering anime case that the original
-///      fallback was designed for.
-///   3. Absolute episode under S1 (`series_imdb_id` + S1 +
-///      `sess.absolute_episode_num`). Covers Trakt entries that
-///      index by show-wide absolute numbering (Frieren is the
-///      canonical example — all 38 eps under S1). Only added when
-///      the absolute number differs from #1's episode (so single-
-///      cour shows don't generate a duplicate retry).
-///
-/// Movies emit one target — the IMDb movie id. The Vec contract
-/// keeps the calling shape uniform.
-///
-/// Returns an empty Vec when no valid target can be synthesized
-/// (movie without a valid IMDb id, series without any S/E source).
-/// Callers treat empty as "skip — id format unsupported".
-fn trakt_targets(sess: &ScrobbleSession) -> Vec<TraktTarget> {
-    let from_id = parse_trakt_target(&sess.imdb_id, &sess.media_type);
-    let series_root = sess.series_imdb_id.clone().or_else(|| {
-        sess.imdb_id.split(':').next().filter(|s| s.starts_with("tt")).map(String::from)
-    });
-
-    let primary: Option<TraktTarget> = match (&from_id, sess.season, sess.episode_num, &series_root) {
-        // VideoEntry S/E + id-parsed show — use S/E with the show
-        // anchor from the id parse.
-        (Some(TraktTarget::Episode { show_imdb, .. }), Some(s), Some(e), _) => {
-            Some(TraktTarget::Episode {
-                show_imdb: show_imdb.clone(),
-                season: s,
-                number: e,
-            })
-        }
-        // Id parse failed (kitsu-shape video) but we have the series
-        // root + VideoEntry S/E.
-        (None, Some(s), Some(e), Some(root)) if sess.media_type != "movie" => {
-            Some(TraktTarget::Episode {
-                show_imdb: root.clone(),
-                season: s,
-                number: e,
-            })
-        }
-        // Movie variant.
-        (None, _, _, Some(root)) if sess.media_type == "movie" => {
-            Some(TraktTarget::Movie { imdb: root.clone() })
-        }
-        _ => None,
-    };
-
-    // Build the ordered candidate list, dedup'ing identical entries
-    // so a single-cour show or a show whose cour/absolute numbering
-    // matches doesn't fan out duplicate POSTs.
-    let mut out: Vec<TraktTarget> = Vec::new();
-    let mut push_unique = |t: TraktTarget| {
-        if !out.iter().any(|existing| existing == &t) {
-            out.push(t);
-        }
-    };
-
-    if let Some(p) = primary {
-        push_unique(p);
-    }
-    if let Some(id_target) = from_id {
-        push_unique(id_target);
-    }
-    // Absolute-numbering retry — only for episodes (movies don't
-    // carry episode numbers). Synthesized under S1 with the
-    // absolute episode supplied by the frontend.
-    if sess.media_type != "movie" {
-        if let (Some(root), Some(abs)) = (series_root.as_ref(), sess.absolute_episode_num) {
-            push_unique(TraktTarget::Episode {
-                show_imdb: root.clone(),
-                season: 1,
-                number: abs,
-            });
-        }
-    }
-    out
-}
-
-/// Build the `/sync/history` body for marking a target as watched.
-/// Trakt accepts top-level `movies`, `shows`, and `episodes` arrays;
-/// for episodes we use the nested `shows[].seasons[].episodes[]` shape
-/// which lets us key the show by IMDB id and the episode by S/E
-/// numbers without needing the Trakt-internal episode id.
-///
-/// `watched_at` (ISO 8601 UTC, e.g. `2026-07-12T21:04:00.000Z`) backdates
-/// the history row to the original watch time. Trakt accepts it on the
-/// movie object and on the episode object; when `None`, Trakt stamps the
-/// row with "now" (the automatic scrobble path's behavior). Only the
-/// manual "scrobble a History item" path supplies it.
-fn build_history_body(target: &TraktTarget, watched_at: Option<&str>) -> serde_json::Value {
-    match target {
-        TraktTarget::Movie { imdb } => {
-            let mut movie = serde_json::json!({ "ids": { "imdb": imdb } });
-            if let Some(ts) = watched_at {
-                movie["watched_at"] = serde_json::Value::String(ts.to_string());
-            }
-            serde_json::json!({ "movies": [movie] })
-        }
-        TraktTarget::Episode { show_imdb, season, number } => {
-            let mut episode = serde_json::json!({ "number": number });
-            if let Some(ts) = watched_at {
-                episode["watched_at"] = serde_json::Value::String(ts.to_string());
-            }
-            serde_json::json!({
-                "shows": [{
-                    "ids":     { "imdb": show_imdb },
-                    "seasons": [{
-                        "number":   season,
-                        "episodes": [episode],
-                    }],
-                }],
-            })
-        }
-        // Trakt's /sync/history takes a top-level `episodes` array keyed by
-        // episode ids, with the same optional per-item `watched_at`.
-        TraktTarget::EpisodeByTraktId { trakt } => {
-            let mut episode = serde_json::json!({ "ids": { "trakt": trakt } });
-            if let Some(ts) = watched_at {
-                episode["watched_at"] = serde_json::Value::String(ts.to_string());
-            }
-            serde_json::json!({ "episodes": [episode] })
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Trakt /sync/history — async path, called from scrobble_end
-// ---------------------------------------------------------------------------
-
-/// Structured outcome of one /sync/history POST attempt. Distinguishes
-/// "Trakt accepted AND added the row" from "Trakt accepted but said
-/// not_found" so the retry-on-fallback path and the scrobble-test
-/// command can both surface the difference.
-#[derive(Clone, Copy, Debug)]
-enum TraktSyncOutcome {
-    /// Trakt's response body had `added.episodes > 0` (or `added.movies`)
-    /// — actually written to history.
-    Added,
-    /// Trakt accepted the payload (201) but the show/episode wasn't in
-    /// their catalog under that numbering. Caller may retry with an
-    /// alternate (season, number) tuple.
-    NotFound,
-    /// Trakt parsed the payload and reported zero added AND zero not_found:
-    /// it already holds a play of this item at this `watched_at` (the
-    /// History page's repeat of a row still on Trakt). Trusted as such only
-    /// for a top-level target (movie, episode by Trakt id), where Trakt lists
-    /// a miss in not_found; for the nested shows/seasons/episodes shape Trakt
-    /// can also answer zero/zero when it found the show but not that season
-    /// or episode, so there it counts as a miss (`post_target_with_refresh`).
-    AlreadyPresent,
-    /// HTTP-level failure (4xx other than 401, 5xx, network blip, etc.).
-    /// Distinct from NotFound: doesn't trigger the dual-numbering retry
-    /// because the cause isn't a metadata mismatch.
-    HttpError,
-    /// 401 — token expired/revoked. Caller is responsible for clearing.
-    Unauthorized,
-}
-
-/// Public summary used by `scrobble_test_fire` so the DevConsole toast
-/// can say "fired" vs "not_found" vs "failed" instead of the generic
-/// "fired" that masked silent misses for the entire dual-numbered
-/// anime catalog.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum TraktSyncResult {
-    Fired,        // Primary or fallback added a row.
-    NotFound,     // Both attempts (or single attempt with no fallback) returned not_found.
-    AlreadyPresent, // Trakt already had this play at this watched_at; nothing added.
-    Skipped,      // No token / unsupported id / movie pre-checks failed.
-    Failed,       // HTTP error or network blip.
-}
-
-#[derive(Deserialize)]
-struct TraktSyncResponseAdded { #[serde(default)] episodes: u32, #[serde(default)] movies: u32 }
-#[derive(Deserialize)]
-struct TraktSyncResponseNotFound {
-    #[serde(default)] episodes: Vec<serde_json::Value>,
-    #[serde(default)] movies:   Vec<serde_json::Value>,
-    /// Show-level miss: Trakt couldn't find the show under the
-    /// supplied imdb id at all. Distinct from episode-level miss
-    /// (show exists but the requested S/E doesn't). When present,
-    /// the whole scrobble is a no-op regardless of episode count.
-    #[serde(default)] shows:    Vec<serde_json::Value>,
-    /// Season-level miss for sync/history payloads that key by
-    /// season instead of episode. Included for completeness — Aura
-    /// doesn't currently send season-keyed payloads but the field
-    /// keeps the catch-all `not_found_n` count accurate if a
-    /// future call shape does.
-    #[serde(default)] seasons:  Vec<serde_json::Value>,
-}
-#[derive(Deserialize)]
-struct TraktSyncResponseBody {
-    #[serde(default)] added:     Option<TraktSyncResponseAdded>,
-    #[serde(default)] not_found: Option<TraktSyncResponseNotFound>,
-}
-
-/// Single POST to /sync/history with the given target. Returns the
-/// structured outcome; the caller decides whether to retry with a
-/// fallback target (dual-numbering) or surface the result as final.
-async fn trakt_sync_history_once(
-    token_bearer: &str, target: &TraktTarget, sess: &ScrobbleSession, progress_pct: f64,
-    watched_at: Option<&str>,
-) -> TraktSyncOutcome {
-    let body = build_history_body(target, watched_at);
-    let res = client()
-        .post(format!("{TRAKT_API}/sync/history"))
-        .header("Authorization", format!("Bearer {token_bearer}"))
-        .header("Content-Type", "application/json")
-        .header("trakt-api-version", "2")
-        .header("trakt-api-key", scrobble_auth::TRAKT_CLIENT_ID)
-        .json(&body)
-        .send()
-        .await;
-
-    match res {
-        Ok(r) if r.status().is_success() => {
-            // Parse `added` vs `not_found` from the response body. Trakt
-            // accepts syntactically valid payloads even when the show or
-            // episode isn't in their catalog (silent miss). The earlier
-            // status-only handler treated those as success — that's the
-            // bug this whole refactor fixes.
-            let status = r.status().as_u16();
-            // Read raw text first so the diagnostic on parse failure
-            // can dump what Trakt actually sent — previously the
-            // "unparseable, treating as added" branch ate every silent
-            // miss because `r.json()` consumed the body and we had
-            // nothing to show.
-            let raw = r.text().await.unwrap_or_default();
-            let body: Result<TraktSyncResponseBody, _> = serde_json::from_str(&raw);
-            let (added_n, not_found_n) = match &body {
-                Ok(b) => {
-                    let added = b.added.as_ref()
-                        .map(|a| a.episodes + a.movies)
-                        .unwrap_or(0);
-                    let nf = b.not_found.as_ref()
-                        .map(|n| (n.shows.len() + n.seasons.len() + n.episodes.len() + n.movies.len()) as u32)
-                        .unwrap_or(0);
-                    (added, nf)
-                }
-                Err(_) => (0, 0),
-            };
-            if added_n > 0 {
-                crate::devlog!(
-                    info, "scrobble",
-                    "Trakt /sync/history OK (status={}, {:.0}% watched, added={}) for {}",
-                    status, progress_pct, added_n, sess.imdb_id,
-                );
-                TraktSyncOutcome::Added
-            } else if not_found_n > 0 {
-                let preview: String = raw.chars().take(400).collect();
-                crate::devlog!(
-                    warn, "scrobble",
-                    "Trakt /sync/history accepted but not_found (status={}, not_found={}) for {} \
-                     — show/episode not in Trakt's catalog under this numbering. body: {}",
-                    status, not_found_n, sess.imdb_id, preview,
-                );
-                TraktSyncOutcome::NotFound
-            } else if body.is_err() {
-                // Parse failed AND no added/not_found extracted —
-                // surface the raw body so the cause is diagnosable
-                // (truncated to 400 chars to keep the log usable).
-                // Treated as a NotFound so the retry path engages
-                // instead of silently false-flagging the scrobble.
-                let preview: String = raw.chars().take(400).collect();
-                crate::devlog!(
-                    warn, "scrobble",
-                    "Trakt /sync/history body parse failed (status={}) for {}: {} — treating as not_found so the retry fallback can engage",
-                    status, sess.imdb_id, preview,
-                );
-                TraktSyncOutcome::NotFound
-            } else {
-                // Successfully parsed but both counters are zero: usually
-                // Trakt already holds a play at this watched_at
-                // (sync/history is idempotent on it). Never "fired";
-                // post_target_with_refresh decides per target shape
-                // whether it can also be a catalog miss.
-                crate::devlog!(
-                    info, "scrobble",
-                    "Trakt /sync/history added nothing and listed no miss (status={}) for {}",
-                    status, sess.imdb_id,
-                );
-                TraktSyncOutcome::AlreadyPresent
-            }
-        }
-        Ok(r) if r.status().as_u16() == 401 => {
-            crate::devlog!(
-                warn, "scrobble",
-                "Trakt 401: token expired/revoked (will clear, user must reconnect)",
-            );
-            TraktSyncOutcome::Unauthorized
-        }
-        Ok(r) => {
-            crate::devlog!(warn, "scrobble", "Trakt /sync/history status {}", r.status().as_u16());
-            TraktSyncOutcome::HttpError
-        }
-        Err(e) => {
-            let category = if e.is_timeout() { "timeout" }
-                else if e.is_connect() { "connect" }
-                else { "send" };
-            crate::devlog!(warn, "scrobble", "Trakt /sync/history {category}");
-            TraktSyncOutcome::HttpError
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Bulk-run flag, mirrored from the frontend.
 //
 // The bulk History scrobble runs in the WEBVIEW (see scrobbleRun.ts), but the
 // window-close decision is made in Rust. This flag is how the close handler
 // learns that a job is in flight so it can ask the user instead of silently
-// killing a half-finished run and leaving Trakt/AniList partially updated with
+// killing a half-finished run and leaving AniList/Simkl partially updated with
 // no record of where it stopped.
 // ---------------------------------------------------------------------------
 
@@ -621,8 +150,8 @@ static SCROBBLE_RUN_ACTIVE: std::sync::atomic::AtomicBool =
 
 /// Marker prefix on an error a RETRY CAN NEVER FIX.
 ///
-/// Trakt simply does not have Frieren S02E10 under this numbering; AniList cannot
-/// resolve some titles at all. Those verdicts are stable, so the bulk runner marks
+/// Simkl has no catalog match for some items; AniList cannot resolve some titles
+/// at all. Those verdicts are stable, so the bulk runner marks
 /// the row permanently ineligible instead of re-attempting it (and re-reporting it
 /// as a failure) on every single run.
 ///
@@ -650,7 +179,7 @@ pub fn set_scrobble_run_active(app: tauri::AppHandle, active: bool) {
     }
 }
 
-/// Last time a PROACTIVE Trakt refresh was attempted, per scope.
+/// Last time a PROACTIVE token refresh was attempted, per key.
 static LAST_PROACTIVE_REFRESH: OnceLock<Mutex<std::collections::HashMap<String, std::time::Instant>>> =
     OnceLock::new();
 
@@ -668,8 +197,8 @@ static LAST_PROACTIVE_REFRESH: OnceLock<Mutex<std::collections::HashMap<String, 
 /// The reactive (401) refresh is deliberately NOT gated by this: that one only
 /// fires when the server has already rejected the token, so it is self-limiting.
 ///
-/// The key is Trakt's bare scope; scrobble_simkl.rs passes `simkl:<scope>`, so
-/// the two providers never spend each other's cooldown.
+/// The key names the provider and scope (scrobble_simkl.rs passes
+/// `simkl:<scope>`), so a provider added later never spends Simkl's cooldown.
 pub(crate) fn proactive_refresh_allowed(scope: &str) -> bool {
     const REFRESH_COOLDOWN: Duration = Duration::from_secs(60);
     let map = LAST_PROACTIVE_REFRESH.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
@@ -684,631 +213,12 @@ pub(crate) fn proactive_refresh_allowed(scope: &str) -> bool {
     true
 }
 
-async fn trakt_sync_history(
-    scope: &str, sess: &ScrobbleSession, time: f64, duration: f64, watched_at: Option<&str>,
-) -> TraktSyncResult {
-    let Some(mut token) = scrobble_auth::read_token_for("trakt", scope) else {
-        crate::devlog!(
-            info, "scrobble",
-            "Trakt /sync/history skipped: no token for scope={scope}",
-        );
-        return TraktSyncResult::Skipped;
-    };
-
-    // ── Proactive refresh ──────────────────────────────────────────
-    // Refresh BEFORE dispatching when the access token is close to expiry, so
-    // the request goes out fresh rather than leaning on the reactive 401
-    // backstop. `expires_at == None` means the proxy didn't stamp an expiry
-    // (older token) — skip the proactive check entirely.
-    //
-    // THE WINDOW MUST STAY WELL UNDER THE TOKEN LIFETIME. This was 7 DAYS, on
-    // the assumption (in a comment) that Trakt tokens live 90 days. The proxy
-    // actually issues SEVEN-DAY tokens, so `exp - now` was ~604800 against a
-    // 604800 window: every call one second past the last refresh fell inside the
-    // window and minted ANOTHER token. A bulk history scrobble therefore hit
-    // /trakt/refresh once per push and rate-limited itself (429) within a couple
-    // of minutes -- the /sync/history calls themselves were fine. Keep this small
-    // enough that a normal token is nowhere near it; the reactive 401 path is the
-    // real safety net, and REFRESH_COOLDOWN below is a hard backstop against ever
-    // re-entering that storm.
-    if let Some(exp) = token.expires_at {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        const PROACTIVE_WINDOW: u64 = 30 * 60;
-        if exp.saturating_sub(now) < PROACTIVE_WINDOW && proactive_refresh_allowed(scope) {
-            match scrobble_auth::refresh_access_token("trakt", scope, Some(&token.access_token)).await {
-                Ok(_) => {
-                    // Re-read so the dispatch below uses the rotated token.
-                    match scrobble_auth::read_token_for("trakt", scope) {
-                        Some(fresh) => token = fresh,
-                        None => {
-                            // Cleared out from under us between refresh
-                            // and re-read — treat as expired.
-                            crate::devlog!(
-                                warn, "scrobble",
-                                "Trakt token vanished after proactive refresh for scope={scope}",
-                            );
-                            return TraktSyncResult::Skipped;
-                        }
-                    }
-                }
-                Err(scrobble_auth::RefreshError::Rejected) => {
-                    // Refresh token dead — keyring already cleared by
-                    // refresh_trakt_token; the expired-token notification
-                    // will fire. Abort the sync cleanly.
-                    crate::devlog!(
-                        warn, "scrobble",
-                        "Trakt proactive refresh rejected for scope={scope} — aborting sync, user must reconnect",
-                    );
-                    return TraktSyncResult::Skipped;
-                }
-                Err(scrobble_auth::RefreshError::Transient(reason)) => {
-                    // Proxy/network blip — proceed with the still-valid
-                    // current token; the reactive 401 path is the backstop.
-                    crate::devlog!(
-                        info, "scrobble",
-                        "Trakt proactive refresh transient failure for scope={scope}: {reason} — proceeding with current token",
-                    );
-                }
-                Err(scrobble_auth::RefreshError::NoRefreshToken) => {
-                    // No refresh_token stored — nothing to do proactively;
-                    // the reactive 401 path will fall back to re-auth.
-                    crate::devlog!(
-                        info, "scrobble",
-                        "Trakt token near expiry for scope={scope} but no refresh_token stored",
-                    );
-                }
-            }
-        }
-    }
-
-    let candidates = trakt_targets(sess);
-    if candidates.is_empty() {
-        crate::devlog!(
-            warn, "scrobble",
-            "Trakt /sync/history skipped: id format unsupported: {} (type={})",
-            sess.imdb_id, sess.media_type,
-        );
-        return TraktSyncResult::Skipped;
-    }
-
-    let progress_pct = if duration > 0.0 {
-        (time / duration * 100.0).clamp(0.0, 100.0)
-    } else {
-        0.0
-    };
-
-    // Walk the candidate list in priority order. First Added wins;
-    // NotFound triggers the next attempt; everything else short-
-    // circuits and surfaces the corresponding TraktSyncResult.
-    // Logs name which candidate position is firing so the user can
-    // see in DevConsole which numbering Trakt's catalog accepted.
-    let total = candidates.len();
-    for (idx, target) in candidates.iter().enumerate() {
-        if idx > 0 {
-            crate::devlog!(
-                info, "scrobble",
-                "Trakt not_found on attempt {} - retrying with candidate {}/{}",
-                idx, idx + 1, total,
-            );
-        }
-        match post_target_with_refresh(scope, &mut token, target, sess, progress_pct, watched_at).await {
-            PostStep::Added => return TraktSyncResult::Fired,
-            PostStep::Final(result) => return result,
-            // Try the next candidate.
-            PostStep::NotFound => continue,
-        }
-    }
-
-    // ── Fallbacks past the candidate list ──────────────────────────
-    // Only episodes reach here. Each fallback asks Trakt's own catalog where
-    // the episode lives rather than guessing a numbering, and each one gives
-    // up (rather than guessing) when the answer is not unique.
-    if sess.media_type != "movie" {
-        // A. Season-aware absolute resolve (One Piece: the addon files it as
-        //    one 1100-episode season, Trakt splits it into 23).
-        if let Some((show_imdb, season, number, abs)) = resolve_via_season_list(sess, &candidates).await {
-            crate::devlog!(
-                info, "scrobble",
-                "Trakt fallback matched (season list, absolute {}): \"{}\" S{}E{}",
-                abs, sess.title, season, number,
-            );
-            let target = TraktTarget::Episode { show_imdb, season, number };
-            match post_target_with_refresh(scope, &mut token, &target, sess, progress_pct, watched_at).await {
-                PostStep::Added => return TraktSyncResult::Fired,
-                PostStep::Final(result) => return result,
-                PostStep::NotFound => {}
-            }
-        }
-        // B. Title + air-date search (Bleach TYBW: the addon's show id is a
-        //    stub on Trakt; the real episode lives under another show).
-        if let Some(hit) = resolve_via_title_search(sess).await {
-            crate::devlog!(
-                info, "scrobble",
-                "Trakt fallback matched (episode title + air date): \"{}\" -> \"{}\" S{}E{}",
-                sess.title,
-                hit.show_title.as_deref().unwrap_or("?"),
-                hit.season.map(|s| s.to_string()).unwrap_or_else(|| "?".into()),
-                hit.number.map(|n| n.to_string()).unwrap_or_else(|| "?".into()),
-            );
-            let target = TraktTarget::EpisodeByTraktId { trakt: hit.trakt_id };
-            match post_target_with_refresh(scope, &mut token, &target, sess, progress_pct, watched_at).await {
-                PostStep::Added => return TraktSyncResult::Fired,
-                PostStep::Final(result) => return result,
-                PostStep::NotFound => {}
-            }
-        }
-    }
-    crate::devlog!(
-        warn, "scrobble",
-        "Trakt /sync/history exhausted all {} candidate target(s) without Added",
-        total,
-    );
-    TraktSyncResult::NotFound
-}
-
-/// Result of one target POST once the reactive 401 refresh has been applied.
-enum PostStep {
-    Added,
-    NotFound,
-    /// Stop walking: the sync ends with this result (401 after refresh,
-    /// transient HTTP failure, ...).
-    Final(TraktSyncResult),
-}
-
-/// POST one target, refreshing the token ONCE on a 401 and retrying the same
-/// request. `token` is updated in place so later targets use the fresh one.
-async fn post_target_with_refresh(
-    scope: &str,
-    token: &mut scrobble_auth::ScrobbleAuthToken,
-    target: &TraktTarget,
-    sess: &ScrobbleSession,
-    progress_pct: f64,
-    watched_at: Option<&str>,
-) -> PostStep {
-    let mut outcome = trakt_sync_history_once(
-        &token.access_token, target, sess, progress_pct, watched_at,
-    ).await;
-
-    // ── Reactive refresh on 401 ────────────────────────────────
-    // The token 401'd mid-flight (expired since the proactive
-    // check, or there was no proactive check). Try to refresh and
-    // retry this exact request ONCE. The per-scope async mutex in
-    // refresh_trakt_token collapses concurrent 401s onto a single
-    // refresh so the rotating refresh_token isn't double-spent.
-    if let TraktSyncOutcome::Unauthorized = outcome {
-        match scrobble_auth::refresh_access_token("trakt", scope, Some(&token.access_token)).await {
-            Ok(refreshed) => {
-                crate::devlog!(
-                    info, "scrobble",
-                    "Trakt 401 - token refreshed, retrying /sync/history once",
-                );
-                // Re-read the persisted token so any later candidate
-                // iteration also uses the fresh access_token.
-                if let Some(fresh) = scrobble_auth::read_token_for("trakt", scope) {
-                    *token = fresh;
-                } else {
-                    token.access_token = refreshed.access_token.clone();
-                }
-                outcome = trakt_sync_history_once(
-                    &token.access_token, target, sess, progress_pct, watched_at,
-                ).await;
-                if let TraktSyncOutcome::Unauthorized = outcome {
-                    // Refreshed token still 401s - give up, clear,
-                    // surface the reconnect prompt. Do NOT loop.
-                    crate::devlog!(
-                        warn, "scrobble",
-                        "Trakt /sync/history 401 even after refresh - clearing token",
-                    );
-                    scrobble_auth::clear_token_for("trakt", scope);
-                    return PostStep::Final(TraktSyncResult::Failed);
-                }
-            }
-            Err(scrobble_auth::RefreshError::Rejected) => {
-                // refresh_token dead - refresh_trakt_token already
-                // cleared the keyring. Same outcome as the old
-                // clear-on-401 path; the notification fires.
-                return PostStep::Final(TraktSyncResult::Failed);
-            }
-            Err(scrobble_auth::RefreshError::Transient(reason)) => {
-                // Transient refresh failure - do NOT clear; the
-                // token is left intact for a later retry.
-                crate::devlog!(
-                    warn, "scrobble",
-                    "Trakt 401 + transient refresh failure: {reason} - leaving token intact, failing this sync",
-                );
-                return PostStep::Final(TraktSyncResult::Failed);
-            }
-            Err(scrobble_auth::RefreshError::NoRefreshToken) => {
-                // Nothing to refresh with - fall back to the legacy
-                // clear-token-and-re-auth behaviour.
-                scrobble_auth::clear_token_for("trakt", scope);
-                return PostStep::Final(TraktSyncResult::Failed);
-            }
-        }
-    }
-
-    match outcome {
-        TraktSyncOutcome::Added => PostStep::Added,
-        TraktSyncOutcome::Unauthorized => {
-            // Reached only when the reactive block above didn't run
-            // (it always resolves Unauthorized to a return or a
-            // non-401 outcome) - defensive, mirrors legacy behaviour.
-            scrobble_auth::clear_token_for("trakt", scope);
-            PostStep::Final(TraktSyncResult::Failed)
-        }
-        TraktSyncOutcome::HttpError => PostStep::Final(TraktSyncResult::Failed),
-        // Zero/zero on the nested shows/seasons/episodes shape is ambiguous:
-        // Trakt answers that way both for a duplicate and for a show it found
-        // whose season or episode it does not have, so the show's own season
-        // list (public, cached per show) settles it: the episode exists = a
-        // duplicate (the History page's repeat of a row still on Trakt), it
-        // does not = a miss and the walk goes on. A list that cannot be read
-        // is a failure, never a miss: walking on could add the play under
-        // another numbering, a different episode.
-        TraktSyncOutcome::AlreadyPresent => match target {
-            TraktTarget::Episode { show_imdb, season, number } => match trakt_season_list(show_imdb).await {
-                Some(eps) if eps.iter().any(|(s, n, _)| s == season && n == number) => {
-                    PostStep::Final(TraktSyncResult::AlreadyPresent)
-                }
-                Some(_) => PostStep::NotFound,
-                None => {
-                    crate::devlog!(
-                        warn, "scrobble",
-                        "Trakt added nothing for {show_imdb} S{season}E{number} and its season list could not be read: not retrying under another numbering",
-                    );
-                    PostStep::Final(TraktSyncResult::Failed)
-                }
-            },
-            TraktTarget::Movie { .. } | TraktTarget::EpisodeByTraktId { .. } => {
-                PostStep::Final(TraktSyncResult::AlreadyPresent)
-            }
-        },
-        TraktSyncOutcome::NotFound => PostStep::NotFound,
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Trakt catalog fallbacks
-//
-// Past the candidate list, two read-only lookups ask Trakt where an episode
-// actually lives. Both are precision-first: an ambiguous answer is no answer,
-// because a wrong history row on the user's account is worse than a miss.
-// Both are public data, sent with the client id and never the user's token.
-//
-//   A. Season list: GET /shows/{imdb}/seasons?extended=full,episodes gives
-//      every episode's (season, number, number_abs). Trakt splits One Piece
-//      into 23 seasons whose episodes are numbered ABSOLUTELY (S21 runs
-//      892..1088), while the addon files it as one season, so the addon's
-//      S1E894 is Trakt's S21E894. Found from Trakt's list, never from an
-//      offset. (`extended=episodes` alone omits `number_abs`.)
-//   B. Title + air date: GET /search/episode?query=<title>&fields=title.
-//      Accepted only on an exact (case-insensitive, trimmed) title AND an
-//      air date within one day, with exactly one result satisfying both.
-// ---------------------------------------------------------------------------
-
-/// One Trakt episode, reduced to what the absolute resolve needs:
-/// (season, number, number_abs). One Piece has ~1200 of these, so the cache
-/// keeps only this, never the payload.
-type EpTriple = (u32, u32, Option<u32>);
-
-const SEASON_CACHE_CAP: usize = 20;
-const SEASON_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
-
-type SeasonCache =
-    std::collections::HashMap<String, (std::time::Instant, std::sync::Arc<Vec<EpTriple>>)>;
-static SEASON_CACHE: OnceLock<Mutex<SeasonCache>> = OnceLock::new();
-
-fn season_cache() -> &'static Mutex<SeasonCache> {
-    SEASON_CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
-}
-
-fn season_cache_get(show_imdb: &str) -> Option<std::sync::Arc<Vec<EpTriple>>> {
-    let guard = season_cache().lock().ok()?;
-    let (at, eps) = guard.get(show_imdb)?;
-    (at.elapsed() < SEASON_CACHE_TTL).then(|| eps.clone())
-}
-
-fn season_cache_put(show_imdb: &str, eps: std::sync::Arc<Vec<EpTriple>>) {
-    let Ok(mut guard) = season_cache().lock() else { return };
-    guard.retain(|_, (at, _)| at.elapsed() < SEASON_CACHE_TTL);
-    while guard.len() >= SEASON_CACHE_CAP && !guard.contains_key(show_imdb) {
-        let oldest = guard.iter().min_by_key(|(_, (at, _))| *at).map(|(k, _)| k.clone());
-        match oldest {
-            Some(k) => { guard.remove(&k); }
-            None => break,
-        }
-    }
-    guard.insert(show_imdb.to_string(), (std::time::Instant::now(), eps));
-}
-
-#[derive(Deserialize)]
-struct TraktSeasonDto {
-    #[serde(default)] number: Option<u32>,
-    #[serde(default)] episodes: Option<Vec<TraktSeasonEpisodeDto>>,
-}
-#[derive(Deserialize)]
-struct TraktSeasonEpisodeDto {
-    #[serde(default)] number: Option<u32>,
-    #[serde(default)] number_abs: Option<u32>,
-}
-
-/// Category of a failed reqwest call, for a log line that never carries the
-/// URL (reqwest's Display appends it).
-fn req_err_category(e: &reqwest::Error) -> &'static str {
-    if e.is_timeout() { "timeout" }
-    else if e.is_connect() { "connect" }
-    else if e.is_decode() { "decode" }
-    else { "send" }
-}
-
-/// True for a bare IMDb id (`tt` + digits), the only shape spliced into a
-/// Trakt URL path here.
-fn is_bare_imdb_id(id: &str) -> bool {
-    id.len() <= 16
-        && id.strip_prefix("tt").is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
-}
-
-/// Trakt's episode list for a show as (season, number, number_abs) triples,
-/// cached per show.
-async fn trakt_season_list(show_imdb: &str) -> Option<std::sync::Arc<Vec<EpTriple>>> {
-    if let Some(hit) = season_cache_get(show_imdb) {
-        return Some(hit);
-    }
-    if !is_bare_imdb_id(show_imdb) {
-        return None;
-    }
-    let res = client()
-        .get(format!("{TRAKT_API}/shows/{show_imdb}/seasons"))
-        .query(&[("extended", "full,episodes")])
-        .header("trakt-api-version", "2")
-        .header("trakt-api-key", scrobble_auth::TRAKT_CLIENT_ID)
-        .send()
-        .await;
-    let seasons: Vec<TraktSeasonDto> = match res {
-        Ok(r) if r.status().is_success() => match r.json().await {
-            Ok(v) => v,
-            Err(e) => {
-                crate::devlog!(warn, "scrobble", "Trakt season list for {show_imdb}: {}", req_err_category(&e));
-                return None;
-            }
-        },
-        Ok(r) => {
-            crate::devlog!(warn, "scrobble", "Trakt season list for {show_imdb}: status {}", r.status().as_u16());
-            return None;
-        }
-        Err(e) => {
-            crate::devlog!(warn, "scrobble", "Trakt season list for {show_imdb}: {}", req_err_category(&e));
-            return None;
-        }
-    };
-    let mut eps: Vec<EpTriple> = Vec::new();
-    for s in seasons {
-        let Some(season) = s.number else { continue };
-        for e in s.episodes.unwrap_or_default() {
-            if let Some(number) = e.number {
-                eps.push((season, number, e.number_abs));
-            }
-        }
-    }
-    eps.shrink_to_fit();
-    let eps = std::sync::Arc::new(eps);
-    season_cache_put(show_imdb, eps.clone());
-    Some(eps)
-}
-
-/// The absolute episode Aura holds for this session: the frontend's computed
-/// value, else the addon's episode number when the addon's season is 1 and
-/// that number runs past Trakt's season 1 (so on Trakt's side it can only be
-/// an absolute number). `None` means fallback A has nothing to look up.
-fn absolute_episode_for(
-    sess_abs: Option<u32>, addon_season: Option<u32>, addon_episode: Option<u32>, trakt_s1_count: usize,
-) -> Option<u32> {
-    if let Some(abs) = sess_abs.filter(|a| *a > 0) {
-        return Some(abs);
-    }
-    match (addon_season, addon_episode) {
-        (Some(1), Some(ep)) if ep as usize > trakt_s1_count => Some(ep),
-        _ => None,
-    }
-}
-
-/// Find the unique Trakt (season, number) whose absolute number is `abs`.
-/// Season 0 (specials) never matches. `number_abs` decides when Trakt supplies
-/// it; an episode without one matches on `number` only inside a season Trakt
-/// numbers absolutely (its first episode is not 1, or it is the first regular
-/// season, where number and absolute coincide). More than one match is no
-/// match.
-fn resolve_absolute(eps: &[EpTriple], abs: u32) -> Option<(u32, u32)> {
-    let regular = || eps.iter().filter(|(s, _, _)| *s > 0);
-    let by_abs: Vec<(u32, u32)> = regular()
-        .filter(|(_, _, a)| *a == Some(abs))
-        .map(|(s, n, _)| (*s, *n))
-        .collect();
-    match by_abs.len() {
-        1 => return Some(by_abs[0]),
-        0 => {}
-        _ => return None,
-    }
-    let first_season = regular().map(|(s, _, _)| *s).min()?;
-    let absolute_season = |season: u32| {
-        season == first_season
-            || regular()
-                .filter(|(s, _, _)| *s == season)
-                .map(|(_, n, _)| *n)
-                .min()
-                .is_some_and(|m| m > 1)
-    };
-    let by_number: Vec<(u32, u32)> = regular()
-        .filter(|(s, n, a)| a.is_none() && *n == abs && absolute_season(*s))
-        .map(|(s, n, _)| (*s, *n))
-        .collect();
-    (by_number.len() == 1).then(|| by_number[0])
-}
-
-/// Fallback A. Returns (show_imdb, season, number, absolute) when Trakt's own
-/// season list places the episode somewhere not already tried.
-async fn resolve_via_season_list(
-    sess: &ScrobbleSession, tried: &[TraktTarget],
-) -> Option<(String, u32, u32, u32)> {
-    // The addon's view of the episode: the first (highest-priority) episode
-    // candidate carries the show anchor and the VideoEntry's S/E.
-    let (show_imdb, addon_season, addon_episode) = tried.iter().find_map(|t| match t {
-        TraktTarget::Episode { show_imdb, season, number } => Some((show_imdb.clone(), *season, *number)),
-        _ => None,
-    })?;
-    // No absolute number from the frontend and not a one-season addon layout:
-    // there is nothing to look up, so skip the fetch.
-    if sess.absolute_episode_num.is_none() && addon_season != 1 {
-        return None;
-    }
-    let eps = trakt_season_list(&show_imdb).await?;
-    let s1_count = eps.iter().filter(|(s, _, _)| *s == 1).count();
-    let abs = absolute_episode_for(sess.absolute_episode_num, Some(addon_season), Some(addon_episode), s1_count)?;
-    let (season, number) = resolve_absolute(&eps, abs)?;
-    let target = TraktTarget::Episode { show_imdb: show_imdb.clone(), season, number };
-    if tried.contains(&target) {
-        return None;
-    }
-    Some((show_imdb, season, number, abs))
-}
-
-/// One `/search/episode` result, reduced to what the acceptance rule and the
-/// log line need.
-#[derive(Clone, Debug, PartialEq)]
-struct EpisodeSearchHit {
-    trakt_id: u64,
-    title: Option<String>,
-    first_aired: Option<String>,
-    season: Option<u32>,
-    number: Option<u32>,
-    show_title: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct TraktSearchResultDto {
-    #[serde(default)] show: Option<TraktSearchShowDto>,
-    #[serde(default)] episode: Option<TraktSearchEpisodeDto>,
-}
-#[derive(Deserialize)]
-struct TraktSearchShowDto {
-    #[serde(default)] title: Option<String>,
-}
-#[derive(Deserialize)]
-struct TraktSearchEpisodeDto {
-    #[serde(default)] title: Option<String>,
-    #[serde(default)] first_aired: Option<String>,
-    #[serde(default)] season: Option<u32>,
-    #[serde(default)] number: Option<u32>,
-    #[serde(default)] ids: Option<TraktSearchIdsDto>,
-}
-#[derive(Deserialize)]
-struct TraktSearchIdsDto {
-    #[serde(default)] trakt: Option<u64>,
-}
-
-/// Days since 1970-01-01 for the `YYYY-MM-DD` prefix of an ISO 8601 string
-/// (Howard Hinnant's days_from_civil). `None` for anything not date-shaped.
-fn iso_date_days(iso: &str) -> Option<i64> {
-    let date = iso.trim().get(0..10)?;
-    let b = date.as_bytes();
-    if b[4] != b'-' || b[7] != b'-' {
-        return None;
-    }
-    let y: i64 = date[0..4].parse().ok()?;
-    let m: i64 = date[5..7].parse().ok()?;
-    let d: i64 = date[8..10].parse().ok()?;
-    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
-        return None;
-    }
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;
-    let mp = (m + 9) % 12;
-    let doy = (153 * mp + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    Some(era * 146097 + doe - 719468)
-}
-
-/// The acceptance rule for fallback B: exactly one hit whose title equals
-/// `title` (trimmed, case-insensitive) and whose first-aired UTC date is within
-/// one day of `released` (the addon's date may be the local broadcast day).
-fn pick_title_date_match<'a>(
-    hits: &'a [EpisodeSearchHit], title: &str, released: &str,
-) -> Option<&'a EpisodeSearchHit> {
-    let want_title = title.trim().to_lowercase();
-    if want_title.is_empty() {
-        return None;
-    }
-    let want_day = iso_date_days(released)?;
-    let mut matching = hits.iter().filter(|h| {
-        let title_ok = h.title.as_deref().is_some_and(|t| t.trim().to_lowercase() == want_title);
-        let date_ok = h.first_aired.as_deref()
-            .and_then(iso_date_days)
-            .is_some_and(|day| (day - want_day).abs() <= 1);
-        title_ok && date_ok
-    });
-    let first = matching.next()?;
-    matching.next().is_none().then_some(first)
-}
-
-/// Fallback B. Needs both the episode title and the air date on the session.
-async fn resolve_via_title_search(sess: &ScrobbleSession) -> Option<EpisodeSearchHit> {
-    let title = sess.episode_title.as_deref().map(str::trim).filter(|t| !t.is_empty())?;
-    let released = sess.episode_released.as_deref().filter(|r| iso_date_days(r).is_some())?;
-    // A title is free text from the addon; keep the query bounded.
-    if title.chars().count() > 200 {
-        return None;
-    }
-    let res = client()
-        .get(format!("{TRAKT_API}/search/episode"))
-        .query(&[("query", title), ("fields", "title"), ("extended", "full"), ("limit", "30")])
-        .header("trakt-api-version", "2")
-        .header("trakt-api-key", scrobble_auth::TRAKT_CLIENT_ID)
-        .send()
-        .await;
-    let results: Vec<TraktSearchResultDto> = match res {
-        Ok(r) if r.status().is_success() => match r.json().await {
-            Ok(v) => v,
-            Err(e) => {
-                crate::devlog!(warn, "scrobble", "Trakt episode search: {}", req_err_category(&e));
-                return None;
-            }
-        },
-        Ok(r) => {
-            crate::devlog!(warn, "scrobble", "Trakt episode search: status {}", r.status().as_u16());
-            return None;
-        }
-        Err(e) => {
-            crate::devlog!(warn, "scrobble", "Trakt episode search: {}", req_err_category(&e));
-            return None;
-        }
-    };
-    let hits: Vec<EpisodeSearchHit> = results
-        .into_iter()
-        .filter_map(|r| {
-            let ep = r.episode?;
-            Some(EpisodeSearchHit {
-                trakt_id: ep.ids?.trakt?,
-                title: ep.title,
-                first_aired: ep.first_aired,
-                season: ep.season,
-                number: ep.number,
-                show_title: r.show.and_then(|s| s.title),
-            })
-        })
-        .collect();
-    pick_title_date_match(&hits, title, released).cloned()
-}
-
 // ---------------------------------------------------------------------------
 // Provider fan-out
 //
 // An automatic push goes to every provider in `Provider::ALL`. scrobble_end,
-// scrobble_test_fire and shutdown_blocking used to spell out the same Trakt
-// call and AniList call by hand, each in its own shape (sequential,
+// scrobble_test_fire and shutdown_blocking used to spell out each provider
+// call by hand, each in its own shape (sequential,
 // sequential-with-results, tokio::join!), so a provider wired into one of
 // them could be missing from another with nothing to say so. All three now
 // iterate the slice and route through `dispatch`, whose match is exhaustive
@@ -1325,24 +235,23 @@ async fn resolve_via_title_search(sess: &ScrobbleSession) -> Option<EpisodeSearc
 /// A provider an automatic scrobble push fans out to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Provider {
-    Trakt,
     Anilist,
     Simkl,
 }
 
 impl Provider {
     /// Every provider, in dispatch order. The sequential callers run them in
-    /// exactly this order: Trakt, then AniList, then Simkl.
-    const ALL: &'static [Provider] = &[Provider::Trakt, Provider::Anilist, Provider::Simkl];
+    /// exactly this order: AniList, then Simkl.
+    const ALL: &'static [Provider] = &[Provider::Anilist, Provider::Simkl];
 }
 
 /// Which kind of push `dispatch` is making.
 #[derive(Clone, Copy, Debug)]
 enum Push {
     /// End of playback, or the DevConsole test: each provider's full path
-    /// (Trakt's refresh + fallback-candidate walk, AniList's resolver), with
+    /// (AniList's resolver, Simkl's refresh + fallback-id walk), with
     /// the outcome handed back to the caller.
-    Completion { time: f64, duration: f64 },
+    Completion,
     /// The window-close flush: a hard ~2 s budget and nobody left to report
     /// to, so each provider takes a cheaper fire-and-forget path.
     Shutdown { progress_pct: f64 },
@@ -1350,7 +259,6 @@ enum Push {
 
 /// What one provider did with a push.
 enum ProviderOutcome {
-    Trakt(TraktSyncResult),
     /// A 401 in here has already been handled (token cleared) by `dispatch`.
     Anilist(Result<crate::scrobble_anilist::SaveOutcome, crate::scrobble_anilist::AnilistError>),
     /// Refresh, 401 and not_found handling already happened inside
@@ -1369,17 +277,12 @@ async fn dispatch<R: Runtime>(
 ) -> ProviderOutcome {
     use crate::scrobble_anilist::{save_progress, AnilistError};
     match (provider, push) {
-        // Trakt: covers movies + IMDB-id'd series (most of the catalogue).
-        (Provider::Trakt, Push::Completion { time, duration }) => {
-            ProviderOutcome::Trakt(trakt_sync_history(scope, sess, time, duration, None).await)
-        }
         // AniList: separate provider, separate keyring entry, separate
         // failure mode. Internally no-ops when sess.is_anime is false or
         // no AniList token is stored, so calling it unconditionally is
-        // cheap. We treat its outcome as best-effort the same way Trakt
-        // does: a 401 clears the keyring entry so Settings reflects
-        // "expired, reconnect" on next refresh.
-        (Provider::Anilist, Push::Completion { .. }) => {
+        // cheap. Its outcome is best-effort: a 401 clears the keyring
+        // entry so Settings reflects "expired, reconnect" on next refresh.
+        (Provider::Anilist, Push::Completion) => {
             let outcome = save_progress(app, scope, sess, None).await;
             if let Err(AnilistError::Unauthorized) = outcome {
                 crate::devlog!(
@@ -1389,42 +292,6 @@ async fn dispatch<R: Runtime>(
                 scrobble_auth::clear_token_for("anilist", scope);
             }
             ProviderOutcome::Anilist(outcome)
-        }
-        // Trakt uses the highest-priority trakt_targets candidate (VideoEntry's
-        // authoritative season/episode over the ID-parsed / absolute fallback),
-        // fire-and-forget with no not_found retry: the shutdown path can't wait
-        // on a body parse + a second round-trip. The client is built locally
-        // with a 2 s timeout, tighter than the 8 s runtime default.
-        (Provider::Trakt, Push::Shutdown { progress_pct }) => {
-            let primary_target = trakt_targets(sess).into_iter().next();
-            let trakt_token = scrobble_auth::read_token_for("trakt", scope);
-            let (Some(target), Some(token)) = (primary_target, trakt_token) else {
-                return ProviderOutcome::Flushed;
-            };
-            crate::devlog!(
-                info, "scrobble",
-                "shutdown_blocking flushing Trakt /sync/history for {} ({:.0}%)",
-                sess.imdb_id, progress_pct,
-            );
-            let body = build_history_body(&target, None);
-            let Ok(cli) = reqwest::Client::builder()
-                .timeout(Duration::from_secs(2))
-                .https_only(true)
-                .user_agent(concat!("Aura/", env!("CARGO_PKG_VERSION"), " scrobble"))
-                .build()
-            else {
-                return ProviderOutcome::Flushed;
-            };
-            let _ = cli
-                .post(format!("{TRAKT_API}/sync/history"))
-                .header("Authorization", format!("Bearer {}", token.access_token))
-                .header("Content-Type", "application/json")
-                .header("trakt-api-version", "2")
-                .header("trakt-api-key", scrobble_auth::TRAKT_CLIENT_ID)
-                .json(&body)
-                .send()
-                .await;
-            ProviderOutcome::Flushed
         }
         // AniList reuses save_progress under a 2 s cap. Skipped outright for
         // a non-anime session or when no AniList token is stored.
@@ -1449,7 +316,7 @@ async fn dispatch<R: Runtime>(
         // Simkl: movies, series AND anime (it supplements AniList, so an anime
         // episode reaches both). Returns at once, with no request, in a build
         // without a Simkl client_id or when no Simkl token is stored.
-        (Provider::Simkl, Push::Completion { .. }) => {
+        (Provider::Simkl, Push::Completion) => {
             ProviderOutcome::Simkl(crate::scrobble_simkl::push_completion(scope, sess).await)
         }
         // One POST of the best candidate, no refresh and no not_found retry,
@@ -1479,12 +346,10 @@ pub async fn scrobble_start<R: Runtime>(
     );
     *session_slot().lock().map_err(|e| e.to_string())? = Some(session);
     record_playback(0.0, duration);
-    // Intentionally no HTTP fires here. Trakt's /scrobble/start would
-    // put the user on the public "currently watching" feed, which
-    // earlier feedback flagged as too eager — flipping an episode the
-    // user is previewing into the public feed before they decided to
-    // commit. The /sync/history POST fires on completion only (>= 80%
-    // + useScrobble's elapsed-time floor).
+    // Intentionally no HTTP fires here. A live "watching now" push would
+    // put an episode the user is only previewing on a public feed before
+    // they decided to commit. Providers are told on completion only
+    // (>= 80% + useScrobble's elapsed-time floor).
     Ok(())
 }
 
@@ -1532,9 +397,9 @@ pub async fn scrobble_end<R: Runtime>(
     let progress = if duration > 0.0 { (time / duration * 100.0).clamp(0.0, 100.0) } else { 0.0 };
     // Completion floor. `scrobble_end` is invoked from EVERY frontend teardown
     // path (exit playback, episode switch, unmount, beforeunload), not only
-    // from the >= 80% completion branch, and /sync/history is an unconditional
-    // "mark watched" with no progress semantics. Without this, quitting two
-    // minutes into an episode marked it watched on Trakt and advanced AniList.
+    // from the >= 80% completion branch, and Simkl's /sync/history is an
+    // unconditional "mark watched" with no progress semantics. Without this,
+    // quitting two minutes into an episode marked it watched and advanced AniList.
     // `duration <= 0` means we never learned the runtime, so the ratio is not
     // meaningful: keep the old behaviour there rather than silently dropping a
     // real completion.
@@ -1552,14 +417,11 @@ pub async fn scrobble_end<R: Runtime>(
         "scrobble_end: id={} progress={:.0}% anime={} scope={} - dispatching to providers",
         sess.imdb_id, progress, sess.is_anime, scope,
     );
-    // In order, one after the other, exactly as before: Trakt, then AniList,
-    // then Simkl.
+    // In order, one after the other: AniList, then Simkl.
     use crate::scrobble_anilist::AnilistError;
-    let push = Push::Completion { time, duration };
+    let push = Push::Completion;
     for &provider in Provider::ALL {
         match dispatch(provider, push, &app, &scope, &sess).await {
-            // trakt_sync_history logs its own outcome.
-            ProviderOutcome::Trakt(_) => {}
             // Saved / already ahead, or a 401 `dispatch` has already handled.
             ProviderOutcome::Anilist(Ok(_))
             | ProviderOutcome::Anilist(Err(AnilistError::Unauthorized)) => {}
@@ -1594,8 +456,6 @@ pub struct ScrobbleTestResult {
     /// branch). The DevConsole prints this so the user can reason
     /// about why AniList fired or didn't.
     pub is_anime: bool,
-    /// Did Trakt fire (token present + parseable target)?
-    pub trakt_fired: bool,
     /// Did AniList fire (token present + is_anime + resolvable id)?
     pub anilist_fired: bool,
     /// Did Simkl record it (client_id in this build + token present + an id
@@ -1610,7 +470,7 @@ pub struct ScrobbleTestResult {
 //
 // Fires the same scrobble paths that scrobble_end uses, but bypasses
 // the elapsed-time warmup gates so the user can verify their
-// Trakt/AniList wiring without having to actually watch 120+ seconds
+// AniList / Simkl wiring without having to actually watch 120+ seconds
 // of every test stream.
 //
 // Session source preference:
@@ -1627,11 +487,10 @@ pub struct ScrobbleTestResult {
 //      message so the DevConsole user understands what happened.
 //
 // Honors the same gates as scrobble_end:
-//   - Trakt token present (skipped silently if not connected)
 //   - AniList: is_anime + token present + resolvable IMDB id
 //   - Simkl: a client_id in this build + token present + an id Simkl can use
 //
-// Pretends time = 95% of duration so Trakt's /sync/history records
+// Pretends time = 95% of duration so each provider records it
 // as a normal completion instead of the 0%-watched edge case. If
 // the caller passes a real `time` / `duration` we use those instead.
 // ---------------------------------------------------------------------------
@@ -1654,7 +513,7 @@ pub async fn scrobble_test_fire<R: Runtime>(
                 return Ok(ScrobbleTestResult {
                     session_active: false,
                     id: None, media_type: None, is_anime: false,
-                    trakt_fired: false, anilist_fired: false, simkl_fired: false,
+                    anilist_fired: false, simkl_fired: false,
                     message: "no active stream - either load_video hasn't been called \
                               or the frontend didn't pass an activeTarget".into(),
                 });
@@ -1691,28 +550,15 @@ pub async fn scrobble_test_fire<R: Runtime>(
         sess.season, sess.episode_num,
     );
 
-    // Same order as scrobble_end (Trakt, then AniList, then Simkl), one after
-    // the other. Each provider contributes its `*_fired` flag and one
-    // "<Name>: <outcome>" leg of the message; the Trakt and AniList legs are
-    // the exact text this always printed.
-    let push = Push::Completion { time: test_time, duration: test_duration };
-    let mut trakt_fired = false;
+    // Same order as scrobble_end (AniList, then Simkl), one after the other.
+    // Each provider contributes its `*_fired` flag and one "<Name>: <outcome>"
+    // leg of the message.
+    let push = Push::Completion;
     let mut anilist_fired = false;
     let mut simkl_fired = false;
     let mut legs: Vec<String> = Vec::with_capacity(Provider::ALL.len());
     for &provider in Provider::ALL {
         match dispatch(provider, push, &app, &scope, &sess).await {
-            ProviderOutcome::Trakt(trakt_result) => {
-                trakt_fired = trakt_result == TraktSyncResult::Fired;
-                let trakt_msg = match trakt_result {
-                    TraktSyncResult::Fired    => "fired".to_string(),
-                    TraktSyncResult::NotFound => "not_found (S/E mismatch with Trakt catalog)".to_string(),
-                    TraktSyncResult::AlreadyPresent => "already in history".to_string(),
-                    TraktSyncResult::Skipped  => "skipped (no token or unsupported id)".to_string(),
-                    TraktSyncResult::Failed   => "failed (network or HTTP error)".to_string(),
-                };
-                legs.push(format!("Trakt: {trakt_msg}"));
-            }
             ProviderOutcome::Anilist(anilist_outcome) => {
                 anilist_fired = anilist_will_fire && anilist_outcome.is_ok();
                 let anilist_msg = if anilist_will_fire {
@@ -1757,7 +603,6 @@ pub async fn scrobble_test_fire<R: Runtime>(
         id: Some(sess.imdb_id),
         media_type: Some(sess.media_type),
         is_anime: sess.is_anime,
-        trakt_fired,
         anilist_fired,
         simkl_fired,
         message,
@@ -1767,11 +612,11 @@ pub async fn scrobble_test_fire<R: Runtime>(
 // ---------------------------------------------------------------------------
 // Manual "scrobble a History item" commands
 //
-// The History tab lets the user push a past watch to Trakt / AniList on
+// The History tab lets the user push a past watch to AniList / Simkl on
 // demand, backdated to the ORIGINAL watch time (`played_at`). These go
-// through the SAME target resolution + POST/retry machinery as the
-// automatic scrobble path (trakt_targets / trakt_sync_history for Trakt,
-// save_progress for AniList); they only differ in (a) supplying the
+// through the SAME resolution + POST/retry machinery as the automatic
+// scrobble path (save_progress for AniList, scrobble_simkl for Simkl);
+// they only differ in (a) supplying the
 // backdate and (b) returning a human-readable outcome string (or an Err
 // with a legible reason) so the UI can toast it. Nothing here fails
 // silently.
@@ -1787,7 +632,6 @@ pub async fn scrobble_test_fire<R: Runtime>(
 /// from the VideoEntry the user clicked; `parent_id` becomes the
 /// series-root IMDb anchor. `imdb_id`/`title` reuse the existing session
 /// field names.
-#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn session_from_history(
     id:              String,
@@ -1811,7 +655,6 @@ pub(crate) fn session_from_history(
         season,
         episode_num: episode,
         series_imdb_id: parent_id,
-        absolute_episode_num: None,
         // The addon's per-video AniList mapping, carried on the History row. These
         // used to be hardcoded None, which quietly disabled the AIOMetadata
         // fast-path for EVERY manual/bulk history scrobble: the resolver fell back
@@ -1821,71 +664,6 @@ pub(crate) fn session_from_history(
         // passed these; history simply never stored them.
         anilist_id,
         anilist_episode,
-        // Set by the caller that has them (scrobble_history_trakt).
-        episode_title: None,
-        episode_released: None,
-    }
-}
-
-/// Push a History item to Trakt's /sync/history, backdated to `played_at`
-/// (ISO 8601 UTC). Returns a short outcome string on success, or an Err
-/// with a legible reason (not connected / unsupported id / catalog miss /
-/// network failure).
-#[allow(clippy::too_many_arguments)]
-#[tauri::command]
-pub async fn scrobble_history_trakt<R: Runtime>(
-    _app:            AppHandle<R>,
-    id:              String,
-    parent_id:       Option<String>,
-    media_type:      String,
-    season:          Option<u32>,
-    episode:         Option<u32>,
-    name:            String,
-    scope:           String,
-    played_at:       String,
-    anilist_id:      Option<u64>,
-    anilist_episode: Option<u32>,
-    // The row's episode title and air date, for the title + air-date
-    // fallback. Optional: rows written before they were recorded omit them.
-    episode_title:    Option<String>,
-    episode_released: Option<String>,
-) -> Result<String, String> {
-    // Trakt never reads the AniList fields; accepted only so both history
-    // commands take the identical payload from the frontend.
-    let _ = (anilist_id, anilist_episode);
-    if scrobble_auth::read_token_for("trakt", &scope).is_none() {
-        return Err("Trakt is not connected. Connect it in Settings > Scrobbling.".into());
-    }
-    let mut sess = session_from_history(id, parent_id, media_type, season, episode, name, false, scope.clone(), None, None);
-    sess.episode_title = episode_title;
-    sess.episode_released = episode_released;
-    let trimmed = played_at.trim();
-    let watched_at = if trimmed.is_empty() { None } else { Some(trimmed) };
-    crate::devlog!(
-        info, "scrobble",
-        "scrobble_history_trakt: id={} scope={} watched_at={:?}",
-        sess.imdb_id, scope, watched_at,
-    );
-    // time/duration only feed a progress-% log line on this path; pass a
-    // synthetic completion pair.
-    match trakt_sync_history(&scope, &sess, 100.0, 100.0, watched_at).await {
-        TraktSyncResult::Fired    => Ok("Added to Trakt history".into()),
-        TraktSyncResult::AlreadyPresent => Ok("Already in Trakt history at this time".into()),
-        // Both of these are verdicts about the ITEM, not about this attempt: Trakt's
-        // catalog does not contain it under this numbering, or there is no IMDb id to
-        // key on. Retrying changes nothing, so they carry PERMANENT_PREFIX and the
-        // caller retires the row instead of failing it again on every run.
-        TraktSyncResult::NotFound => {
-            Err(format!("{PERMANENT_PREFIX}Trakt has no catalog match for this title under its numbering."))
-        }
-        TraktSyncResult::Skipped  => {
-            Err(format!("{PERMANENT_PREFIX}This item has no IMDb id Trakt can use."))
-        }
-        // Transient: network blip or a token that needs refreshing. Retry is exactly
-        // the right response, so this one is deliberately NOT marked permanent.
-        TraktSyncResult::Failed   => {
-            Err("Trakt request failed (network error or token rejected). Try again.".into())
-        }
     }
 }
 
@@ -1981,15 +759,14 @@ pub async fn scrobble_history_simkl<R: Runtime>(
 
 // ---------------------------------------------------------------------------
 // Synchronous shutdown helper — called from window_logic's CloseRequested
-// handler before app.exit(0) so Trakt sees the stop signal even on hard
-// window-closes (X button on the title bar). The previous flow only fired
-// /scrobble/end via the React useScrobble unmount, which doesn't run when
-// the process exits without React shutting down — leaving Trakt stuck in
-// "Currently watching" until its server-side TTL elapsed (often hours).
+// handler before app.exit(0) so a completion is still recorded on a hard
+// window-close (X button on the title bar). The React useScrobble unmount,
+// the normal path, doesn't run when the process exits without React
+// shutting down.
 //
-// Uses tauri::async_runtime::block_on so the HTTP POST completes before
-// the process exits. Capped at 2 s so a slow / unreachable Trakt API
-// can't hold up app shutdown.
+// Uses tauri::async_runtime::block_on so the HTTP POSTs complete before
+// the process exits. Capped at 2 s so a slow / unreachable provider can't
+// hold up app shutdown.
 // ---------------------------------------------------------------------------
 
 pub fn shutdown_blocking<R: Runtime>(app: &AppHandle<R>) {
@@ -2026,17 +803,17 @@ pub fn shutdown_blocking<R: Runtime>(app: &AppHandle<R>) {
 
     let scope = sess.scope.clone();
 
-    // ── Flush Trakt + AniList CONCURRENTLY ─────────────────────────
-    // Both are best-effort network writes each capped at 2 s. They used to run
-    // as two SEQUENTIAL `block_on`s (up to 4 s on an anime title linked to
-    // both services), serializing app shutdown (and a slow exit widens the
+    // ── Flush every provider CONCURRENTLY ──────────────────────────
+    // Each is a best-effort network write capped at 2 s. They used to run as
+    // SEQUENTIAL `block_on`s (up to 4 s on an anime title linked to two
+    // services), serializing app shutdown (and a slow exit widens the
     // Windows self-update file-lock window). Joining them in ONE runtime entry
-    // caps the pair at ~2 s. Each still no-ops when its service isn't linked.
+    // caps the lot at ~2 s. Each still no-ops when its service isn't linked.
     //
     // `join_all` over `Provider::ALL` rather than a fixed `tokio::join!`, so a
     // provider added to the slice is flushed alongside the others instead of
-    // needing its own slot here. The per-provider shutdown paths (Trakt's
-    // single-candidate fast path, AniList's capped save_progress) live in the
+    // needing its own slot here. The per-provider shutdown paths (AniList's
+    // capped save_progress, Simkl's single-candidate POST) live in the
     // `Push::Shutdown` arms of `dispatch`.
     let push = Push::Shutdown { progress_pct };
     tauri::async_runtime::block_on(futures_util::future::join_all(
@@ -2046,148 +823,3 @@ pub fn shutdown_blocking<R: Runtime>(app: &AppHandle<R>) {
     ));
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// One Piece shape: specials, then seasons numbered ABSOLUTELY (S2 starts
-    /// at 62, S21 runs 892..1088). Built without number_abs, as the seasons
-    /// endpoint without `full` returns it, so the number fallback is exercised.
-    fn one_piece_like(with_abs: bool) -> Vec<EpTriple> {
-        let mut eps = Vec::new();
-        for n in 1..=39 { eps.push((0, n, None)); }
-        let seasons: [(u32, u32, u32); 4] = [(1, 1, 61), (2, 62, 77), (20, 878, 891), (21, 892, 1088)];
-        for (s, lo, hi) in seasons {
-            for n in lo..=hi { eps.push((s, n, with_abs.then_some(n))); }
-        }
-        eps
-    }
-
-    /// Bleach shape: S1 1..366 and S2 restarting at 1 with number_abs 367+.
-    fn bleach_like() -> Vec<EpTriple> {
-        let mut eps = Vec::new();
-        for n in 1..=4 { eps.push((0, n, None)); }
-        for n in 1..=366 { eps.push((1, n, Some(n))); }
-        for n in 1..=50 { eps.push((2, n, Some(366 + n))); }
-        eps
-    }
-
-    #[test]
-    fn absolute_resolves_one_piece_to_season_21() {
-        assert_eq!(resolve_absolute(&one_piece_like(true), 894), Some((21, 894)));
-        // Same answer from `number` alone when number_abs is missing.
-        assert_eq!(resolve_absolute(&one_piece_like(false), 894), Some((21, 894)));
-        assert_eq!(resolve_absolute(&one_piece_like(false), 70), Some((2, 70)));
-        // Past the end of Trakt's list: no match.
-        assert_eq!(resolve_absolute(&one_piece_like(true), 5000), None);
-    }
-
-    #[test]
-    fn absolute_resolves_bleach_season_2_by_number_abs() {
-        assert_eq!(resolve_absolute(&bleach_like(), 368), Some((2, 2)));
-        assert_eq!(resolve_absolute(&bleach_like(), 366), Some((1, 366)));
-        // Season 2 restarts at 1, so without number_abs its `number` never
-        // stands in for an absolute one.
-        let no_abs: Vec<EpTriple> = bleach_like().into_iter().map(|(s, n, _)| (s, n, None)).collect();
-        assert_eq!(resolve_absolute(&no_abs, 2), Some((1, 2)));
-        assert_eq!(resolve_absolute(&no_abs, 368), None);
-    }
-
-    #[test]
-    fn absolute_never_matches_specials_and_rejects_ambiguity() {
-        let only_specials: Vec<EpTriple> = (1..=10).map(|n| (0, n, Some(n))).collect();
-        assert_eq!(resolve_absolute(&only_specials, 5), None);
-        let dup = vec![(1, 5, Some(5)), (2, 5, Some(5))];
-        assert_eq!(resolve_absolute(&dup, 5), None);
-    }
-
-    #[test]
-    fn absolute_episode_source() {
-        // The frontend's value wins.
-        assert_eq!(absolute_episode_for(Some(37), Some(2), Some(9), 28), Some(37));
-        // Addon season 1 past Trakt's season 1: the number is absolute.
-        assert_eq!(absolute_episode_for(None, Some(1), Some(894), 61), Some(894));
-        // Within Trakt's season 1 it was already tried as S1E<n>.
-        assert_eq!(absolute_episode_for(None, Some(1), Some(40), 61), None);
-        // Any other addon season without a computed value: nothing to look up.
-        assert_eq!(absolute_episode_for(None, Some(3), Some(894), 61), None);
-    }
-
-    fn hit(id: u64, title: &str, aired: &str) -> EpisodeSearchHit {
-        EpisodeSearchHit {
-            trakt_id: id,
-            title: Some(title.to_string()),
-            first_aired: Some(aired.to_string()),
-            season: Some(2),
-            number: Some(2),
-            show_title: Some("Bleach".to_string()),
-        }
-    }
-
-    #[test]
-    fn title_date_accepts_the_single_exact_match() {
-        let hits = vec![
-            hit(6784680, "Foundation Stones", "2022-10-18T14:00:00.000Z"),
-            hit(1, "Foundation Stones", "2015-03-02T01:00:00.000Z"),
-            hit(2, "Foundation Stones Part 2", "2022-10-18T14:00:00.000Z"),
-        ];
-        let got = pick_title_date_match(&hits, "  foundation stones ", "2022-10-18T00:00:00.000Z");
-        assert_eq!(got.map(|h| h.trakt_id), Some(6784680));
-    }
-
-    #[test]
-    fn title_date_rejects_two_matches() {
-        let hits = vec![
-            hit(10, "Foundation Stones", "2022-10-18T14:00:00.000Z"),
-            hit(11, "Foundation Stones", "2022-10-19T02:00:00.000Z"),
-        ];
-        assert_eq!(pick_title_date_match(&hits, "Foundation Stones", "2022-10-18"), None);
-    }
-
-    #[test]
-    fn title_date_rejects_wrong_date() {
-        let hits = vec![hit(10, "Foundation Stones", "2022-10-18T14:00:00.000Z")];
-        assert_eq!(pick_title_date_match(&hits, "Foundation Stones", "2022-10-20"), None);
-        assert_eq!(pick_title_date_match(&hits, "Foundation Stones", "not a date"), None);
-    }
-
-    #[test]
-    fn title_date_allows_one_day_either_way() {
-        let hits = vec![hit(10, "Foundation Stones", "2022-10-18T14:00:00.000Z")];
-        assert!(pick_title_date_match(&hits, "Foundation Stones", "2022-10-17").is_some());
-        assert!(pick_title_date_match(&hits, "Foundation Stones", "2022-10-19").is_some());
-        // Across a month and a year boundary.
-        let hits = vec![hit(10, "X", "2023-01-01T00:30:00.000Z")];
-        assert!(pick_title_date_match(&hits, "x", "2022-12-31").is_some());
-    }
-
-    #[test]
-    fn title_date_rejects_non_exact_title() {
-        let hits = vec![hit(10, "Foundation Stones", "2022-10-18T14:00:00.000Z")];
-        assert_eq!(pick_title_date_match(&hits, "Foundation", "2022-10-18"), None);
-        assert_eq!(pick_title_date_match(&hits, "", "2022-10-18"), None);
-    }
-
-    #[test]
-    fn trakt_id_body_shape() {
-        let body = build_history_body(
-            &TraktTarget::EpisodeByTraktId { trakt: 6784680 },
-            Some("2026-09-27T12:00:00.000Z"),
-        );
-        assert_eq!(
-            body,
-            serde_json::json!({ "episodes": [{
-                "ids": { "trakt": 6784680 },
-                "watched_at": "2026-09-27T12:00:00.000Z",
-            }] }),
-        );
-    }
-
-    #[test]
-    fn imdb_id_guard() {
-        assert!(is_bare_imdb_id("tt0388629"));
-        assert!(!is_bare_imdb_id("tt"));
-        assert!(!is_bare_imdb_id("tt123/../x"));
-        assert!(!is_bare_imdb_id("kitsu:12"));
-    }
-}

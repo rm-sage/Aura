@@ -1,13 +1,16 @@
 // Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useState, useEffect, useRef, useCallback } from "react";
+import { memo, useState, useEffect, useLayoutEffect, useRef, useCallback } from "react";
+import type React from "react";
+import { holdLensForMorph } from "./liquidGlass";
+import { useListDroplet } from "./glassListDroplet";
 
 // ---------------------------------------------------------------------------
 // SearchBar
 //
 // Interactions:
-//   • While the input is focused, a backdrop dims the app and, when the input
+//   • While the input is focused, a backdrop dims (no blur) the app and, when the input
 //     is empty, a dropdown shows "Recent Searches" persisted in localStorage.
 //   • Submitting (Enter) commits the query and saves it to recents.
 // ---------------------------------------------------------------------------
@@ -86,7 +89,10 @@ function clearAllRecents(): string[] {
 // SearchBar
 // ---------------------------------------------------------------------------
 
-export default function SearchBar({
+// memo: the one caller (HomeView) passes state plus [] -deps callbacks, so
+// this only skips renders whose props did not change. Everything else the bar
+// shows comes from its own state, effects and window listeners.
+export default memo(function SearchBar({
   committedQuery, onSubmit, onClear,
 }: Props) {
   const [query, setQuery]     = useState(committedQuery ?? "");
@@ -94,6 +100,9 @@ export default function SearchBar({
   const [recents, setRecents] = useState<string[]>(loadRecents);
 
   const containerRef = useRef<HTMLDivElement>(null);
+  const shellRef = useRef<HTMLLabelElement>(null);
+  const droplet = useListDroplet();
+  const morphPrimed = useRef(false);
 
   // Sync from parent — e.g., user clicked a recent search, or external clear.
   // When the parent sets committedQuery to null (Home re-click), clear the
@@ -145,8 +154,48 @@ export default function SearchBar({
     onSubmit(trimmed);
   }, [query, onSubmit]);
 
-  const showOverlay = focused;
+  // The dim overlay outlives the focus by its exit fade: the bar refracts it,
+  // so unmounting it at once made everything behind the bar jump from dimmed
+  // to bright while the bar was still contracting. Derived during render (not
+  // in an effect), so there is never a frame with the overlay unmounted.
+  const [overlayOn, setOverlayOn] = useState(false);
+  if (focused && !overlayOn) setOverlayOn(true);
+  const showOverlay = focused || overlayOn;
+  // Safety net for the exit: animationend never fires if the animation is
+  // suppressed, and a stuck overlay would leave the page dimmed.
+  useEffect(() => {
+    if (focused || !overlayOn) return;
+    const t = window.setTimeout(() => setOverlayOn(false), 420);
+    return () => window.clearTimeout(t);
+  }, [focused, overlayOn]);
+  // The dim's fade, in and out, through the Web Animations API from the
+  // CURRENT opacity: refocusing during the exit reverses from where the fade
+  // is (a CSS animation-name swap restarted the in-fade from 0, so the page
+  // flashed bright under the widening bar). Base opacity is 0 and the fade
+  // fills forwards, so a fresh mount reads 0 and fades in.
+  const overlayRef = useRef<HTMLDivElement>(null);
+  const overlayAnim = useRef<Animation | null>(null);
+  useLayoutEffect(() => {
+    const el = overlayRef.current;
+    if (!el) { overlayAnim.current = null; return; }
+    const from = Number.parseFloat(getComputedStyle(el).opacity) || 0;
+    overlayAnim.current?.cancel();
+    const a = el.animate([{ opacity: from }, { opacity: focused ? 1 : 0 }], {
+      duration: focused ? 220 : 340,
+      easing: "ease-out",
+      fill: "forwards",
+    });
+    overlayAnim.current = a;
+    if (!focused) a.onfinish = () => setOverlayOn(false);
+  }, [focused, showOverlay]);
   const showDropdown = focused && query.trim() === "" && recents.length > 0;
+  // Tell the rail's notification bubble the dim is up or gone (it waits
+  // retracted while it is up: NotificationsBell useSearchDim). The dim carries
+  // `data-aura-search-dim="on"` while focused; this event is the change signal.
+  useEffect(() => {
+    window.dispatchEvent(new CustomEvent("aura:search-dim"));
+  }, [focused]);
+  useEffect(() => () => { window.dispatchEvent(new CustomEvent("aura:search-dim")); }, []);
 
   const pickRecent = useCallback((q: string) => {
     setQuery(q);
@@ -163,17 +212,42 @@ export default function SearchBar({
 
   const onClearRecents = useCallback(() => setRecents(clearAllRecents()), []);
 
+  // The bar widens to the full column on focus and narrows back on close
+  // (.aura-search-shell.is-open, App.css .aura-glass-morph-w). In Liquid the
+  // bar's lens is the sliced SVG filter that covers every width of its height
+  // (liquidGlass.ts MORPH_SELECTOR), so it stays bound through the transition
+  // and holdLensForMorph is a no-op; only a bar not yet on that filter draws
+  // its CSS face for the transition and binds at rest. Layout effect: before
+  // the paint that starts the width transition. No layout read, nothing per
+  // frame.
+  useLayoutEffect(() => {
+    if (!morphPrimed.current) { morphPrimed.current = true; return; }
+    const shell = shellRef.current;
+    if (shell) holdLensForMorph(shell, 0, 0);
+  }, [focused]);
+
+  // A recents list that changes under the pointer (a removal, a clear)
+  // leaves the droplet over a stale row: drop it.
+  const hideDroplet = droplet.hide;
+  useEffect(() => { hideDroplet(); }, [recents, showDropdown, hideDroplet]);
+
   return (
     <>
       {/* Backdrop dim — covers app behind the input + dropdown when focused */}
       {showOverlay && (
         <div
+          ref={overlayRef}
+          data-aura-search-dim={focused ? "on" : "off"}
           className="fixed inset-0 z-30"
           style={{
             background: "rgba(0,0,0,0.7)",
-            backdropFilter: "blur(12px)",
-            WebkitBackdropFilter: "blur(12px)",
-            animation: "search-overlay-in 220ms ease-out",
+            // A dim only, no blur: a blur here pre-smeared the page the bar
+            // refracts (and cost a full-viewport backdrop pass while focused).
+            // Faded by the layout effect above: in over 220 ms, out over the
+            // bar's contraction (340 ms, the 360 ms width spring), so the
+            // backdrop the bar refracts brightens as it narrows.
+            opacity: 0,
+            pointerEvents: focused ? undefined : "none",
           }}
           aria-hidden
           onMouseDown={() => setFocused(false)}
@@ -190,8 +264,26 @@ export default function SearchBar({
           if (next instanceof Node && !containerRef.current?.contains(next)) setFocused(false);
         }}
       >
-        <div className="relative">
-          <span className="absolute left-4 top-1/2 -translate-y-1/2 text-white/55 pointer-events-none z-10">
+        {/* The glass shell is a <label>, so a press anywhere on it (the icon,
+            the padding) focuses the bare input inside. Floating CONTROL tier
+            (aura-glass-control): in Liquid the milky refracting face, in
+            Frosted the same float glass as before. Its hover and focus edges
+            are hooks in src/styles/glass-search.css (never border-* utilities:
+            they would override both materials). data-glass-base: poster
+            titles scroll under it, so in Liquid it stacks the solid base
+            under its blur (App.css, liquidGlass.ts BASE_SELECTOR).
+            data-glass-bleed: the Home hero's ambient bleed is cut out under
+            it and drawn in its face instead (HeroBleed.tsx), so the bleed
+            never bands under its blur. */}
+        <label
+          ref={shellRef}
+          data-glass-base=""
+          data-glass-bleed=""
+          className={`aura-float-glass aura-glass-control aura-glass-morph-w aura-search-shell
+                      relative flex items-center gap-2.5 rounded-full pl-4 pr-4 cursor-text
+                      ${focused ? "is-open" : ""}`}
+        >
+          <span className="text-white/55 pointer-events-none flex-shrink-0 flex">
             <SearchIcon />
           </span>
           <input
@@ -218,33 +310,24 @@ export default function SearchBar({
             placeholder="Search all sources…"
             data-aura-search
             spellCheck={false}
-            // The focus border is a `focus:` VARIANT, not a `focused`-state
-            // ternary. `.aura-float-glass` sets the `border` shorthand at
-            // one-class specificity and later in the sheet, so a bare
-            // `border-white/30` tied and lost: focusing changed nothing while
-            // hovering visibly did (a `:hover` variant is one step higher),
-            // which is exactly backwards. `focus:` ties with `hover:` and is
-            // emitted after it, so focus correctly wins.
-            className={`aura-float-glass w-full rounded-full pl-10 pr-4 py-2.5 text-sm
-            placeholder:text-white/40 outline-none
-            transition-[border-color,box-shadow] duration-150
-            hover:border-white/25 focus:border-white/30`}
+            className="flex-1 min-w-0 bg-transparent border-0 py-2.5 text-sm
+                       placeholder:text-white/75 outline-none"
             style={{ color: "var(--text-primary)" }}
             aria-label="Global search"
           />
-        </div>
+        </label>
 
         {/* Dropdown: recent searches only (shown when the input is empty) */}
         {showDropdown && (
           <div
-            // aura-float-glass, matching the bar above it. It was
-            // glass-panel-elevated, which composites --ln-glass-3, and that
-            // token is TINTED per theme: on the warm themes it pushed the
-            // whole panel toward orange, which is the accent wash the user
-            // asked to lose. This surface carries a neutral dark base instead.
-            className="aura-float-glass absolute left-0 right-0 top-full mt-2 z-40
+            // aura-float-glass (the MENU tier), never glass-panel-elevated:
+            // that composites --ln-glass-3, which is TINTED per theme and
+            // pushed the whole panel toward orange on the warm themes. This
+            // surface carries a neutral dark base instead. It grows out of the
+            // bar above it (aura-glass-pop-in, origin at the top centre).
+            className="aura-float-glass aura-glass-pop-in absolute left-0 right-0 top-full mt-2 z-40
                        rounded-2xl overflow-hidden"
-            style={{ animation: "search-dropdown-in 220ms ease-out" }}
+            style={{ "--lg-origin": "50% 0" } as React.CSSProperties}
           >
             <div className="py-2">
               <div className="px-4 pb-1 flex items-center justify-between">
@@ -258,12 +341,14 @@ export default function SearchBar({
                   Clear all
                 </button>
               </div>
-              <div className="space-y-0">
+              {/* Rows: .aura-glass-row (Frosted hover fill). In Liquid one
+                  shared droplet slides between them instead (useListDroplet). */}
+              <div className="relative" {...droplet.listProps}>
+                <span ref={droplet.ref} aria-hidden className="aura-glass-hl aura-glass-hl-inset" />
                 {recents.map((r) => (
                   <div
                     key={r}
-                    className="group w-full flex items-center gap-2 hover:bg-white/8
-                               transition-colors"
+                    className="aura-glass-row relative group w-full flex items-center gap-2"
                   >
                     <button
                       onClick={() => pickRecent(r)}
@@ -288,17 +373,6 @@ export default function SearchBar({
           </div>
         )}
       </div>
-
-      <style>{`
-        @keyframes search-overlay-in {
-          from { opacity: 0; }
-          to   { opacity: 1; }
-        }
-        @keyframes search-dropdown-in {
-          from { opacity: 0; transform: translateY(-4px); }
-          to   { opacity: 1; transform: translateY(0); }
-        }
-      `}</style>
     </>
   );
-}
+});

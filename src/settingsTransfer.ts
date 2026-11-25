@@ -60,6 +60,9 @@
 // at their current values on the importing side. No-op forward-compat.
 // ---------------------------------------------------------------------------
 
+import { invoke } from "@tauri-apps/api/core";
+import { loadAuraSettings, saveAuraSettings } from "./auraSettings";
+
 const SCHEMA_VERSION = 2;
 
 /** Backend fields safe to round-trip across installs. Anything keyed by
@@ -93,9 +96,10 @@ const PORTABLE_BACKEND_FIELDS = [
   // Same arrangement as the TMDB key: keyring-resident, hydrated into the blob
   // only when the user opts in to exporting keys, stripped back out on import.
   "introdb_api_key",
-  "hdr_enabled",
-  "hdr_mode",
-  "hdr_target_peak_nits",
+  // `hdr_mode`, `hdr_enabled` and `hdr_target_peak_nits` deliberately do NOT
+  // travel: they describe this machine's display (Rust keeps them in the
+  // machine-local render.json beside `gpu_acceleration`), and they are
+  // stripped from the cloud blob in sync.ts for the same reason.
   "next_up_lead_seconds",
   "audio_passthrough",
   "loudness_normalization",
@@ -107,7 +111,9 @@ const PORTABLE_BACKEND_FIELDS = [
   "trailer_quality",
   // `gpu_acceleration` deliberately does NOT travel: it is a per-machine GPU
   // workaround (Rust keeps it in a machine-local render.json), and it is
-  // stripped from the cloud blob in sync.ts for the same reason.
+  // stripped from the cloud blob in sync.ts for the same reason. Nor does
+  // `real_glass` (Real glass over video): an mpv shader on this machine's
+  // GPU, kept in render.json and stripped in sync.ts alike.
   "cache_secs",
   "demuxer_readahead_secs",
   "demuxer_max_mib",
@@ -166,6 +172,18 @@ const PORTABLE_AURA_FIELDS = [
   // Which debrid providers the title-bar status monitor checks. A preference
   // about the user's services, which are the same on every machine.
   "monitoredProviders",
+  // The glass material and the cursor glint: looks, like the theme (which is
+  // portable on the backend side). Liquid's GPU fallback is decided per
+  // machine at startup, so carrying "liquid" to a machine without hardware
+  // acceleration is harmless.
+  "glassStyle",
+  "glassCursorGlow",
+  // The Cursor glow tuning (edge, surface, size): a look like the two above;
+  // readFromStorage clamps it on import.
+  "glassGlowTune",
+  // The custom accent per theme: a look, like the theme. The whole map is
+  // carried; readFromStorage re-validates it on import (hex only, capped).
+  "themeAccents",
 ] as const;
 export type PortableAuraField = typeof PORTABLE_AURA_FIELDS[number];
 
@@ -412,6 +430,153 @@ export function resolveProviders(
     }
   }
   return { aura, unresolved, ambiguous };
+}
+
+/** The keyring-resident API keys an export can carry (only when the user
+ *  opted in). On import they go to the OS keyring, never settings.json. */
+const IMPORTABLE_API_KEYS = ["opensubtitles", "tmdb", "introdb"] as const;
+
+/** update_settings' answers for a patch it will not take (settings.rs), as
+ *  opposed to a save that failed: only these are worth retrying per field. */
+function isPatchRejection(e: unknown): boolean {
+  const message = String(e);
+  return message.startsWith("Invalid settings patch") || message.startsWith("Unknown theme");
+}
+
+/** What an import actually landed, for the caller's status line. */
+export interface ImportSummary {
+  /** Settings applied: backend fields taken, API keys written to the keyring,
+   *  Aura fields and resolved provider fields. */
+  applied: number;
+  /** Backend fields update_settings refused, even one at a time. */
+  rejected: string[];
+  /** Provider ids with no installed addon to resolve to. */
+  unresolved: number;
+  /** Provider choices that fell back to another install of the same addon. */
+  ambiguous: number;
+}
+
+/** Apply a parsed settings blob: the shared import path for Settings and the
+ *  first-run setup. `applyBackend` is the caller's backend patch writer (it
+ *  must reject when update_settings does, so a refused patch can be retried
+ *  field by field). Rejects when a save fails outright; the caller reports it.
+ *
+ *  Steps, in order: imported API keys are stripped from the backend patch; the
+ *  patch is applied (one bad field rejects the whole patch, so on a rejection
+ *  each field is retried alone, and a failed SAVE ends the import); the keys go
+ *  to the keyring (best effort) with `aura:api-keys-changed`; the Aura fields
+ *  merge over the current ones, then the provider ids resolve against
+ *  `addons`; the loudness switch is mirrored to the engine when the blob held
+ *  it (the Settings toggle does the same). */
+export async function applySettingsImport(
+  blob: SettingsBlob,
+  addons: AddonRef[],
+  applyBackend: (patch: Record<string, unknown>) => Promise<unknown>,
+): Promise<ImportSummary> {
+  // Redirect imported API keys away from settings.json (where they'd remain
+  // readable to anyone with filesystem access) and into the OS keyring. A
+  // copy of blob.backend, so the patch sent to applyBackend has them stripped.
+  const backendPatch = { ...(blob.backend as Record<string, unknown>) };
+  const importedKeys: [string, string][] = [];
+  for (const name of IMPORTABLE_API_KEYS) {
+    const field = `${name}_api_key`;
+    const value = typeof backendPatch[field] === "string"
+      ? backendPatch[field] as string : "";
+    // Strip unconditionally, even when empty: `tmdb_api_key` is not a
+    // backend settings field at all, and an unknown key must not ride along
+    // into the settings.json patch.
+    delete backendPatch[field];
+    if (value.trim()) importedKeys.push([name, value.trim()]);
+  }
+
+  // update_settings deserializes the merged object as one unit, so one bad
+  // field rejects the whole patch. Field by field only then: each call
+  // rewrites settings.json. A failed SAVE is not retried, it ends the import.
+  const backendKeys = Object.keys(backendPatch);
+  const rejected: string[] = [];
+  if (backendKeys.length > 0) {
+    try {
+      await applyBackend(backendPatch);
+    } catch (e) {
+      if (!isPatchRejection(e)) throw e;
+      for (const key of backendKeys) {
+        try {
+          await applyBackend({ [key]: backendPatch[key] });
+        } catch (fieldError) {
+          if (!isPatchRejection(fieldError)) throw fieldError;
+          rejected.push(key);
+        }
+      }
+    }
+  }
+
+  // Now write the imported keys to the keyring. Best-effort: if the keyring
+  // fails (Linux without Secret Service), nothing is left in settings.json
+  // either (the user can re-paste the key manually). Empty values were
+  // skipped above so an existing keyring entry is never overwritten with
+  // nothing.
+  let keysWritten = 0;
+  for (const [name, value] of importedKeys) {
+    await invoke("set_api_key", { name, value }).then(() => { keysWritten += 1; }, () => {});
+  }
+  if (importedKeys.length > 0) {
+    window.dispatchEvent(new CustomEvent("aura:api-keys-changed"));
+  }
+
+  // Aura-side portable subset. Import is additive: any field present in the
+  // blob overwrites; missing fields keep their current value. Provider lists
+  // go through resolveProviders so the imported manifest_ids resolve to the
+  // importing user's actual addon URLs (and unresolvable ids drop with a
+  // count).
+  const next = { ...loadAuraSettings() };
+  if (blob.aura) {
+    // blob.aura is already whitelisted to PORTABLE_AURA_FIELDS (and is
+    // addon-URL-independent), so merge every field present. Each value is
+    // re-validated and clamped by readFromStorage() on the next load, so a
+    // malformed imported field can't corrupt state. (Addon-dependent
+    // provider fields arrive separately via resolveProviders below.)
+    Object.assign(next, blob.aura);
+  }
+  const { aura: providerAura, unresolved, ambiguous } = resolveProviders(blob.providers, addons);
+  // Each resolved provider field overlays the current Aura settings. The
+  // resolveProviders return shape uses the same field names as AuraSettings,
+  // so a direct merge applies.
+  Object.assign(next, providerAura);
+  saveAuraSettings(next);
+
+  // The engine installs its loudness filter at mpv init from a backend
+  // mirror of this switch (set_audio_loudnorm), so an imported value must
+  // reach it too. The re-validated value, not the raw blob field.
+  if (blob.aura && "loudnessNormalization" in blob.aura) {
+    const enabled = loadAuraSettings().loudnessNormalization;
+    invoke("set_audio_loudnorm", { enabled }).catch(() => {});
+  }
+
+  // What actually landed, not what the blob held.
+  const applied =
+    backendKeys.length - rejected.length
+    + keysWritten
+    + Object.keys(blob.aura ?? {}).length
+    + Object.keys(providerAura).length;
+  return { applied, rejected, unresolved, ambiguous };
+}
+
+/** The status line for an import: what landed, what was refused, and the
+ *  provider notes. `kind` is "error" when any backend field was refused. */
+export function importSummaryStatus(summary: ImportSummary): { kind: "ok" | "error"; message: string } {
+  const { applied, rejected, unresolved, ambiguous } = summary;
+  const notes: string[] = [];
+  if (unresolved > 0) {
+    notes.push(`${unresolved} provider id${unresolved === 1 ? "" : "s"} skipped, not installed`);
+  }
+  if (ambiguous > 0) {
+    notes.push(`${ambiguous} provider choice${ambiguous === 1 ? "" : "s"} matched another install of the same addon, check Settings`);
+  }
+  const tail = notes.length > 0 ? ` (${notes.join("; ")})` : "";
+  const imported = `Imported ${applied} setting${applied === 1 ? "" : "s"}`;
+  return rejected.length > 0
+    ? { kind: "error", message: `${imported}; could not apply: ${rejected.join(", ")}${tail}.` }
+    : { kind: "ok", message: `${imported}${tail}.` };
 }
 
 /** Pretty-printed JSON for the file download / textarea. Indent=2 keeps

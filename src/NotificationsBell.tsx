@@ -1,99 +1,140 @@
-// Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
+// Aura - (c) 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNotifications, type Notification } from "./NotificationsContext";
-import NotificationsPanel from "./NotificationsPanel";
+import NotificationsPanel, {
+  NotifThumb,
+  RailBridge,
+  notifDetail,
+  notifPosterUrl,
+  notifTitle,
+  railOrigin,
+  railPopupTop,
+} from "./NotificationsPanel";
 import { nudgeReleasePoller } from "./releaseSearch";
 import { loadAuraSettings } from "./auraSettings";
 import type { LibraryItem } from "./types";
-import SidePill, { SIDE_PILL_LEFT_PX } from "./SidePill";
+import RailRow, { RailPopup } from "./RailRow";
+import { useRailAnchor, type RailAnchor } from "./railLayout";
+import { usePopPresence } from "./popPresence";
+import { playRepeat } from "./AppToast";
+import { reducedMotionActive } from "./glassStyle";
 
 // ---------------------------------------------------------------------------
-// NotificationsBell — fixed bottom-3 left-3, z-30 (above app body, below
-// modals/player). Renders a count badge when unreadCount > 0 and pulses on
-// every new addNotification via the `hasNew` flag exposed by the context.
+// NotificationsBell: the rail's "Notifications" row (its TOP row since round
+// 12, NavSidebar), plus the two surfaces that grow out of it (round 10):
 //
-// Click-out detection mirrors the NavSidebar profile-popover pattern: a
-// global mousedown listener with `closest()` checks for the bell or panel
-// containers via data-attributes.
+//   - the side sheet (NotificationsPanel), opened by the row;
+//   - the ARRIVAL BUBBLE: when something new lands with the sheet closed, a
+//     compact preview (poster, title, one line) grows out of the row to the
+//     right (top flush with the rail's top, growing downward), holds, and
+//     retracts back into it. Arrivals in quick succession
+//     MERGE into it (a count and AppToast's repeat bump), never stack.
+//     Clicking it opens the sheet at that item.
+//
+// Both seat themselves beside the rail, top flush with the rail's top
+// (railLayout `useRailAnchor`, NotificationsPanel `railPopupTop`), grow
+// downward from the row's middle on the rail's edge,
+// and are portalled out of the rail (RailPopup) so its backdrop-filter neither
+// positions nor clips them. A light bridge (RailBridge) ties the bubble to the
+// row; the sheet has none (round 17, user's call).
+//
+// The row itself: an unread count badge, a very faint STATIC wash while a
+// dismissable item is unread (nothing loops), and on each arrival one accent
+// light sweep across the row with the badge popping in sync.
+//
+// Click-out: a global mousedown listener with `closest()` checks for the row or
+// the sheet via data attributes (and spares the context menu).
 // ---------------------------------------------------------------------------
 
-/** Match the aura-bell-panel-out keyframe duration in App.css. The
- *  bell keeps the panel mounted for this long after the user
- *  triggers close so the exit animation has a chance to play before
- *  React removes the DOM node. */
-const PANEL_CLOSE_MS = 200;
-/** Refresh-button cooldown — respects the cloud's per-IP nudge rate
- *  limit (the same 2 s the standalone button used before it was
- *  folded into the bell popup). */
+/** The sheet's close transition (styles/glass-notify.css `.aura-notif-sheet`).
+ *  usePopPresence keeps it mounted this long after a close. */
+const PANEL_CLOSE_MS = 220;
+/** Refresh-button cooldown: respects the cloud's per-IP nudge rate limit. */
 const REFRESH_COOLDOWN_MS = 2000;
+/** The row's arrival sweep (styles/glass-notify.css `aura-notif-sweep`). */
+const SWEEP_MS = 1150;
+
+const NO_IDS: ReadonlySet<string> = new Set();
 
 export default function NotificationsBell({ library }: { library: LibraryItem[] }) {
-  const { notifications, unreadCount, hasNew, popup, dismissPopup, markRead, markAllRead } = useNotifications();
+  const {
+    notifications, unreadCount, popup, popupCount, dismissPopup, markRead, markAllRead,
+  } = useNotifications();
   const [open, setOpen] = useState(false);
+  /** Unread when the sheet opened (see NotificationsPanel `newIds`). */
+  const [newIds, setNewIds] = useState<ReadonlySet<string>>(NO_IDS);
+  /** The item the sheet should land on (from the bubble). */
+  const [focusId, setFocusId] = useState<string | null>(null);
+  const rowRef = useRef<HTMLButtonElement | null>(null);
+  const badgeRef = useRef<HTMLSpanElement | null>(null);
 
-  const openPanel = useCallback(() => {
-    setOpen((wasOpen) => !wasOpen);
+  const openPanel = useCallback((at?: string) => {
+    setNewIds(new Set(notifications.filter((n) => !n.read && !n.dismissed).map((n) => n.id)));
+    setFocusId(at ?? null);
+    setOpen(true);
+  }, [notifications]);
+
+  const requestClose = useCallback(() => {
+    // Focus inside the sheet goes back to the row, not to <body>.
+    const panel = document.querySelector("[data-notifications-panel]");
+    if (panel && panel.contains(document.activeElement)) {
+      rowRef.current?.focus({ preventScroll: true });
+    }
+    setOpen(false);
   }, []);
 
-  // Treat panel-open as a global mark-read. The user has actively
-  // surfaced the panel; whatever they see there counts as seen for
-  // the purpose of the badge. Individual dismiss still works for
-  // hiding entries from the list, but the badge clears immediately
-  // so the bell stops drawing the eye while the user is reading.
-  //
-  // Done in an effect on the open transition — NOT inside the setOpen
-  // updater. Updater functions run during React's render phase, so
-  // calling markAllRead() (a NotificationsProvider setstate) there fired
-  // React's "Cannot update NotificationsProvider while rendering
-  // NotificationsBell" warning. The effect runs after commit, clearing the
-  // badge the moment the panel opens, with no cross-component render-phase
-  // update.
+  const togglePanel = useCallback(() => {
+    if (open) requestClose();
+    else openPanel();
+  }, [open, openPanel, requestClose]);
+
+  // Opening the sheet is a global mark-read: whatever the user sees there counts
+  // as seen for the badge (the sheet keeps its own `newIds` snapshot to mark
+  // them). In an effect on the open transition, NOT inside a state updater:
+  // updaters run during render, and a NotificationsProvider setstate there fired
+  // React's "Cannot update NotificationsProvider while rendering" warning.
   useEffect(() => {
     if (open) markAllRead();
   }, [open, markAllRead]);
-  /** When true, the panel is in the middle of its out-animation —
-   *  still mounted, but pointer-events disabled and visually
-   *  collapsing. setOpen(false) and clearing this flag both run on
-   *  the same PANEL_CLOSE_MS timer. */
-  const [closing, setClosing] = useState(false);
-  const closeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const containerRef = useRef<HTMLDivElement | null>(null);
+  // The user is looking: no bubble while the sheet is open, and one that was
+  // pending (a coalesce timer, the suppression queue) must not float up after
+  // it closes.
+  useEffect(() => {
+    if (open) dismissPopup({ pending: true });
+  }, [open, popup, dismissPopup]);
 
-  // Trigger the panel's exit animation, then unmount once it has
-  // finished. Idempotent — calling while already closing is a no-op.
-  const requestClose = useCallback(() => {
-    if (!open || closing) return;
-    setClosing(true);
-    if (closeTimerRef.current) clearTimeout(closeTimerRef.current);
-    closeTimerRef.current = setTimeout(() => {
-      setOpen(false);
-      setClosing(false);
-      closeTimerRef.current = null;
-    }, PANEL_CLOSE_MS);
-  }, [open, closing]);
-
-  useEffect(() => () => {
-    if (closeTimerRef.current) clearTimeout(closeTimerRef.current);
-  }, []);
-
-  // Suppress the popup while the panel is already open — the user is
-  // looking, no need to chase them with a bubble.
   const popupActive = popup && !open ? popup : null;
-  // The bell shouldn't pulse while the bubble is showing — both
-  // animations layered look messy. Compute a quiet flag.
-  const popupVisible = !!popupActive;
+  // While the Home search focus dim is up the bubble waits (retracted), so it
+  // never floats bright over a dim that exists to focus the search.
+  const searchDim = useSearchDim(!!popupActive);
+  // Where the sheet and the bubble seat themselves, measured only while one of
+  // them is up. Declared BEFORE usePopPresence (its layout effect must batch
+  // into the same render as the mount).
+  const anchor = useRailAnchor(rowRef, open || !!popupActive);
+  const sheet = usePopPresence<HTMLDivElement>(open, PANEL_CLOSE_MS);
 
-  // Drive the recurring "ringing" attention animation. Only fires when
-  // there's at least one DISMISSABLE unread notification — the always-
-  // pinned `update` kind doesn't trigger it (it has its own popup
-  // surface and the bell would ring forever otherwise). The animation
-  // pauses while the panel is open since the user is already looking.
+  // A poster per item: the scanner stamps `data.poster`; older entries find it
+  // in the library. The map is built only while a surface needs it.
+  const needPosters = sheet.render || !!popupActive;
+  const libPosters = useMemo(() => {
+    if (!needPosters) return null;
+    const m = new Map<string, string | null>();
+    for (const it of library) if (it.id) m.set(it.id, it.poster);
+    return m;
+  }, [library, needPosters]);
+  const posterOf = useCallback(
+    (n: Notification) => notifPosterUrl(n, (id) => libPosters?.get(id)),
+    [libPosters],
+  );
+
+  // A dismissable unread item (the always-pinned `update` kind never counts:
+  // it has its own surface) leaves a very faint static wash on the row.
   const hasDismissableUnread =
     !open && notifications.some((n) => !n.read && !n.dismissed && n.kind !== "update");
 
-  // Click-outside / Escape closes the panel (animated).
+  // Click-outside / Escape closes the sheet.
   useEffect(() => {
     if (!open) return;
     const onDown = (e: MouseEvent) => {
@@ -101,11 +142,16 @@ export default function NotificationsBell({ library }: { library: LibraryItem[] 
       if (!target) return;
       if (target.closest?.("[data-notifications-panel]")) return;
       if (target.closest?.("[data-notifications-bell]")) return;
+      if (target.closest?.("[data-aura-context-menu]")) return;
       requestClose();
     };
     // Capture phase, and stopped there: the window-level Escape handlers (App's,
-    // the catalog page's) would otherwise close the page under the panel too.
+    // the catalog page's) would otherwise close the page under the sheet too.
+    // The search chord (searchHotkey.ts) closes the sheet and is NOT stopped:
+    // the sheet can cover the search box, and the closed sheet goes
+    // click-through before the hotkey's bubble listener looks for the box.
     const onKey = (e: KeyboardEvent) => {
+      if (isSearchChord(e)) { requestClose(); return; }
       if (e.key !== "Escape") return;
       e.preventDefault();
       e.stopPropagation();
@@ -119,13 +165,21 @@ export default function NotificationsBell({ library }: { library: LibraryItem[] 
     };
   }, [open, requestClose]);
 
-  // Manual library refresh, folded into the bell popup header. Same
-  // semantics as the old standalone button (release-search-spec §6.2
-  // path 3): fire aura:library-changed, nudge the cloud poller per
-  // tt item, re-batch after 30 s. Short cooldown guards the cloud
-  // per-IP nudge rate limit.
+  // Manual library refresh, folded into the sheet header. Same semantics as the
+  // old standalone button (release-search-spec §6.2 path 3): fire
+  // aura:library-changed, nudge the cloud poller per tt item, re-batch after
+  // 30 s. Short cooldown guards the cloud per-IP nudge rate limit.
   const [refreshCooldown, setRefreshCooldown] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
+  const timersRef = useRef<Set<ReturnType<typeof setTimeout>>>(new Set());
+  const later = useCallback((fn: () => void, ms: number) => {
+    const t = setTimeout(() => { timersRef.current.delete(t); fn(); }, ms);
+    timersRef.current.add(t);
+  }, []);
+  useEffect(() => () => {
+    for (const t of timersRef.current) clearTimeout(t);
+    timersRef.current.clear();
+  }, []);
   useEffect(() => {
     if (!refreshCooldown) return;
     const t = setTimeout(() => setRefreshCooldown(false), REFRESH_COOLDOWN_MS);
@@ -135,7 +189,7 @@ export default function NotificationsBell({ library }: { library: LibraryItem[] 
     if (refreshCooldown) return;
     setRefreshCooldown(true);
     setRefreshing(true);
-    setTimeout(() => setRefreshing(false), REFRESH_COOLDOWN_MS);
+    later(() => setRefreshing(false), REFRESH_COOLDOWN_MS);
     window.dispatchEvent(new CustomEvent("aura:library-changed"));
     if (loadAuraSettings().releaseSearchEnabled) {
       for (const it of library) {
@@ -148,262 +202,334 @@ export default function NotificationsBell({ library }: { library: LibraryItem[] 
         if (!mt) continue;
         nudgeReleasePoller(it.id, mt);
       }
-      // Re-batch after 30 s so the cloud's freshly-polled signals
-      // propagate into the local store without waiting for the next
-      // library mutation.
-      setTimeout(() => {
+      // Re-batch after 30 s so the cloud's freshly-polled signals propagate
+      // into the local store without waiting for the next library mutation.
+      later(() => {
         window.dispatchEvent(new CustomEvent("aura:library-changed"));
       }, 30_000);
     }
-  }, [refreshCooldown, library]);
+  }, [refreshCooldown, library, later]);
 
-  // Format the count badge — "9+" cap handles 10..999 uniformly.
+  // ARRIVAL on the row: one accent light sweep (runs once; a merge during it
+  // does not restart it) and the badge pops in sync with the bubble.
+  const [sweeping, setSweeping] = useState(false);
+  const sweepingRef = useRef(false);
+  const lastArrival = useRef<string | null>(null);
+  const arrivalKey = popupActive && !searchDim ? `${popupActive.id}#${popupCount}` : null;
+  useEffect(() => {
+    if (!arrivalKey) { lastArrival.current = null; return; }
+    if (arrivalKey === lastArrival.current) return;
+    lastArrival.current = arrivalKey;
+    popBadge(badgeRef.current);
+    if (sweepingRef.current) return;
+    sweepingRef.current = true;
+    setSweeping(true);
+    later(() => { sweepingRef.current = false; setSweeping(false); }, SWEEP_MS);
+  }, [arrivalKey, later]);
+
+  // Screen readers: ONE persistent live region (always mounted, so the first
+  // arrival is announced too: a region inserted with its text already in it is
+  // not read). Written on each arrival or merge.
+  const [announce, setAnnounce] = useState("");
+  const announceKey = popupActive ? `${popupActive.id}#${popupCount}` : null;
+  useEffect(() => {
+    if (!announceKey || !popupActive) return;
+    const more = popupCount > 1 ? ` ${popupCount} new notifications.` : "";
+    setAnnounce(`New notification: ${notifTitle(popupActive)}. ${notifDetail(popupActive)}.${more}`);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [announceKey]);
+
+  // Format the count badge: "9+" caps 10..999 uniformly.
   const badgeText = unreadCount > 9 ? "9+" : String(unreadCount);
 
   return (
-    <div
-      ref={containerRef}
-      className="fixed bottom-3 z-30"
-      style={{ left: SIDE_PILL_LEFT_PX, pointerEvents: "auto" }}
-    >
-      {open && (
-        <NotificationsPanel
-          onClose={requestClose}
-          closing={closing}
-          onRefresh={handleRefresh}
-          refreshing={refreshing}
-          refreshDisabled={refreshCooldown}
-        />
-      )}
-      {popupActive && (
-        <NotificationThoughtBubble
-          notification={popupActive}
-          onClick={() => {
-            // Click bubble → open the panel + mark this entry read.
-            markRead(popupActive.id);
-            dismissPopup();
-            setOpen(true);
-          }}
-          onDismiss={dismissPopup}
-        />
-      )}
-      <SidePill
+    <>
+      <RailPopup>
+        {sheet.render && (
+          <NotificationsPanel
+            anchor={anchor}
+            visible={sheet.visible}
+            panelRef={sheet.ref}
+            onClose={requestClose}
+            newIds={newIds}
+            focusId={focusId}
+            posterOf={posterOf}
+            onRefresh={handleRefresh}
+            refreshing={refreshing}
+            refreshDisabled={refreshCooldown}
+          />
+        )}
+        {popupActive && (
+          <ArrivalBubble
+            anchor={anchor}
+            notification={popupActive}
+            count={popupCount}
+            poster={posterOf(popupActive)}
+            onOpen={() => {
+              // The panel lands on this item; the snapshot in openPanel still
+              // sees it unread (this markRead lands after).
+              openPanel(popupActive.id);
+              markRead(popupActive.id);
+              dismissPopup();
+            }}
+            onGone={() => dismissPopup()}
+            suspended={searchDim}
+            focusRow={() => rowRef.current?.focus({ preventScroll: true })}
+          />
+        )}
+      </RailPopup>
+      <span className="sr-only" role="status" aria-live="polite" aria-atomic="true">{announce}</span>
+      <RailRow
+        ref={rowRef}
         label="Notifications"
         ariaLabel={unreadCount > 0
           ? `Notifications (${unreadCount} unread)`
           : "Notifications"}
         ariaExpanded={open}
         active={open}
-        onClick={openPanel}
-        // data-notifications-bell is a CONTRACT: the outside-click guard
-        // finds this node by selector.
+        onClick={togglePanel}
+        // data-notifications-bell is a CONTRACT: the outside-click guard finds
+        // this node by selector.
         extraProps={{ "data-notifications-bell": true }}
         className={[
-          // STATE 1 - something just landed: one short pop, twice. Suppressed
-          // while the thought bubble is showing, because that is already
-          // drawing the eye and two animations would stack.
-          hasNew && !popupVisible ? "aura-pill-arrive" : "",
-          // STATE 2 - still unread and dismissable: the pill's own rim
-          // breathes. On a labelled control the label is what should draw the
-          // eye, so the glow runs around the whole pill rather than ringing
-          // an icon nobody is looking at. `update` notifications deliberately
-          // do not qualify, exactly as before: they have their own surface
-          // and would otherwise pulse forever.
-          hasDismissableUnread ? "aura-pill-alert" : "",
-        ].filter(Boolean).join(" ")}
-        icon={
-          <BellIcon
-            className={[
-              "h-5 w-5",
-              hasDismissableUnread ? "aura-bell-ringing" : "",
-            ].filter(Boolean).join(" ")}
-          />
-        }
-        trailing={unreadCount > 0 ? (
-          <span
-            aria-hidden
-            className={[
-              "min-w-[18px] h-[18px] px-1 rounded-full",
-              "flex items-center justify-center",
-              "text-[10px] font-semibold leading-none",
-              "bg-ln-accent text-black",
-              // Accent-derived, not a hardcoded blue: twelve themes ship
-              // different triplets and the old rgba(91,164,255) was one of
-              // them wearing all the others' clothes.
-              "shadow-[0_0_8px_rgb(var(--ln-accent-rgb)/0.55)]",
-              "aura-bell-badge-pop",
-              hasDismissableUnread ? "aura-bell-badge-bouncing" : "",
-            ].filter(Boolean).join(" ")}
-          >
+          hasDismissableUnread ? "aura-notif-unread" : "",
+          sweeping ? "aura-notif-arrive" : "",
+        ].filter(Boolean).join(" ") || undefined}
+        icon={<BellIcon className="h-5 w-5" />}
+        tail={unreadCount > 0 ? (
+          <span ref={badgeRef} aria-hidden className="aura-rail-unread aura-bell-badge-pop">
             {badgeText}
           </span>
         ) : undefined}
       />
-    </div>
+    </>
   );
 }
 
-/**
- * Thought-bubble popup that springs out of the bell when a new
- * notification arrives. Anchors above + slightly right of the bell
- * (which lives in the bottom-left corner). Three animation phases:
- *
- *   1. Spawn: scales up from a small dot near the bell with a slight
- *      overshoot + bobbing tail trail (mimics a comic thought bubble
- *      "blooming" out of the source).
- *   2. Idle: gentle 2 s breathe loop so the bubble feels alive while
- *      the user reads it.
- *   3. Collapse: scales down toward the bell + fades out — runs on
- *      auto-timeout (handled by the context, ~10 s) OR on user
- *      dismiss / panel-open.
- *
- * Multi-line bodies (notification.subtitle) are line-clamped to two
- * rows with a "..." overflow per the user's "summary if too long"
- * spec — clicking the bubble opens the full panel where the
- * complete entry lives.
- */
-/** Total time the bubble stays in idle before auto-collapsing — matches
- *  the user's "after ~10s, collapse the popup into the bell" spec. The
- *  bubble owns this timer so the exit animation can play in full
- *  before notifying the parent to clear the popup slot. */
-const BUBBLE_AUTO_DISMISS_MS = 10_000;
-/** Length of the entrance keyframe in App.css (.aura-popup-enter). */
-const BUBBLE_ENTER_MS = 520;
-/** Length of the exit keyframe in App.css (.aura-popup-exit). */
-const BUBBLE_EXIT_MS = 460;
+/** The badge's arrival pop (a WAAPI scale on the bouncy spring). Skipped while
+ *  its own mount pop (aura-bell-badge-pop) is still running, so a 0 -> 1 badge
+ *  pops once, and under reduced motion. */
+function popBadge(el: HTMLElement | null) {
+  if (!el || typeof el.animate !== "function" || reducedMotionActive()) return;
+  if (el.getAnimations().some((a) => a.playState === "running")) return;
+  const spring = getComputedStyle(document.documentElement)
+    .getPropertyValue("--aura-spring-bouncy").trim() || "cubic-bezier(0.34, 1.4, 0.64, 1)";
+  const frames = (settle: string): Keyframe[] => [
+    { scale: "1", easing: "cubic-bezier(0.3, 0.7, 0.4, 1)" },
+    { scale: "1.3", offset: 0.22, easing: settle },
+    { scale: "1" },
+  ];
+  try {
+    el.animate(frames(spring), { duration: 520 });
+  } catch {
+    try { el.animate(frames("cubic-bezier(0.34, 1.4, 0.64, 1)"), { duration: 520 }); } catch { /* no WAAPI */ }
+  }
+}
 
-function NotificationThoughtBubble({
-  notification, onClick, onDismiss,
+// ---------------------------------------------------------------------------
+// ArrivalBubble
+// ---------------------------------------------------------------------------
+
+/** How long the bubble holds before it retracts (the user's "after about
+ *  10 s, collapse the popup into the bell", halved to 5 s in round 17 as it
+ *  lingered); paused while the pointer or focus is on it, and a shorter grace
+ *  after both leave. A merge restarts the full hold. */
+const BUBBLE_HOLD_MS = 5_000;
+const BUBBLE_HOLD_AFTER_HOVER_MS = 3_000;
+/** Its retract transition (styles/glass-notify.css `.aura-notif-bubble`). */
+const BUBBLE_EXIT_MS = 300;
+
+function ArrivalBubble({
+  anchor, notification, count, poster, onOpen, onGone, suspended, focusRow,
 }: {
+  /** Beside the rail, top flush with the rail's top. */
+  anchor: RailAnchor;
   notification: Notification;
-  onClick: () => void;
-  onDismiss: () => void;
+  /** Arrivals merged into it (NotificationsContext `popupCount`). */
+  count: number;
+  poster: string | null;
+  onOpen: () => void;
+  /** Called once its retract has played: the parent clears the popup. */
+  onGone: () => void;
+  /** Held retracted (the Home search focus dim is up); grows back, with a
+   *  fresh hold, when it clears. */
+  suspended: boolean;
+  /** Moves focus to the rail row (a retract with focus inside the bubble). */
+  focusRow: () => void;
 }) {
-  // Track which animation phase we're in. The collapse phase plays the
-  // exit keyframe before the parent unmounts us, so the user sees the
-  // bubble actually fly back into the bell instead of just disappearing.
-  const [phase, setPhase] = useState<"enter" | "idle" | "exit">("enter");
-  const exitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const autoDismissRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const idlePhaseRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [leaving, setLeaving] = useState(false);
+  // Open while not leaving: the grow-out is an inline-style transition, so the
+  // flip goes through usePopPresence (no pop-in race). A merge while leaving
+  // reverses the retract from wherever it is.
+  const { ref, visible } = usePopPresence<HTMLDivElement>(!leaving && !suspended, BUBBLE_EXIT_MS);
+  // Pointer and focus hold it separately: a blur under the pointer (or the
+  // pointer leaving while focus stays inside) must not start the retract.
+  const [hovered, setHovered] = useState(false);
+  const [focused, setFocused] = useState(false);
+  const held = hovered || focused;
+  const wasHeld = useRef(false);
+  const onGoneRef = useRef(onGone);
+  onGoneRef.current = onGone;
+  const focusRowRef = useRef(focusRow);
+  focusRowRef.current = focusRow;
 
-  // After the entrance keyframe settles, transition into idle.
-  // The auto-dismiss countdown starts here (idle phase) so the
-  // 10-second window doesn't include the entrance time.
+  // Retract, handing focus back to the row first if it is inside (an
+  // unmounting bubble would drop it on <body>). Stable, so a parent re-render
+  // never restarts the hold timer below.
+  const retract = useCallback(() => {
+    const el = ref.current;
+    if (el && el.contains(document.activeElement)) focusRowRef.current();
+    setLeaving(true);
+  }, [ref]);
+
+  // Hold, then retract. Restarted by a merge (the id or the count changes).
   useEffect(() => {
-    idlePhaseRef.current = setTimeout(() => {
-      setPhase("idle");
-      autoDismissRef.current = setTimeout(() => {
-        triggerDismiss();
-      }, BUBBLE_AUTO_DISMISS_MS);
-    }, BUBBLE_ENTER_MS);
-    return () => {
-      if (idlePhaseRef.current)   clearTimeout(idlePhaseRef.current);
-      if (autoDismissRef.current) clearTimeout(autoDismissRef.current);
+    if (!visible || leaving || held) return;
+    const t = setTimeout(retract, wasHeld.current ? BUBBLE_HOLD_AFTER_HOVER_MS : BUBBLE_HOLD_MS);
+    return () => clearTimeout(t);
+  }, [visible, leaving, held, notification.id, count, retract]);
+  // Suspended (search dim): nothing holds it any more, and the next showing
+  // gets the full hold.
+  useEffect(() => {
+    if (!suspended) return;
+    wasHeld.current = false;
+    setHovered(false);
+    setFocused(false);
+  }, [suspended]);
+
+  // Retracted: hand the slot back.
+  useEffect(() => {
+    if (!leaving) return;
+    const t = setTimeout(() => onGoneRef.current(), BUBBLE_EXIT_MS);
+    return () => clearTimeout(t);
+  }, [leaving]);
+
+  // A merge: come back if retracting, and bump (AppToast's repeat bump: scale
+  // on the bouncy spring, a lift flash, a faint accent halo).
+  const mergeKey = `${notification.id}#${count}`;
+  const lastKey = useRef(mergeKey);
+  useEffect(() => {
+    if (lastKey.current === mergeKey) return;
+    lastKey.current = mergeKey;
+    // Fresh content: the full hold again, whatever an earlier hover left.
+    wasHeld.current = false;
+    setLeaving(false);
+    if (ref.current) playRepeat(ref.current, "default");
+  }, [mergeKey, ref]);
+
+  // Escape while focus is in the bubble retracts it (capture, stopped, so the
+  // page under it keeps its own Escape).
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      const el = ref.current;
+      if (!el || !el.contains(document.activeElement)) return;
+      e.preventDefault();
+      e.stopPropagation();
+      retract();
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [ref, retract]);
 
-  // Trigger the exit phase: play collapse-into-bell animation, then
-  // tell the parent to clear the popup slot. Idempotent — entering
-  // exit twice is a no-op. Used by both the auto-dismiss timer and
-  // user clicks (X / click-through to panel).
-  const triggerDismiss = () => {
-    if (phase === "exit") return;
-    setPhase("exit");
-    // Cancel any pending phase / auto-dismiss work.
-    if (idlePhaseRef.current)   clearTimeout(idlePhaseRef.current);
-    if (autoDismissRef.current) clearTimeout(autoDismissRef.current);
-    if (exitTimerRef.current)   clearTimeout(exitTimerRef.current);
-    exitTimerRef.current = setTimeout(() => onDismiss(), BUBBLE_EXIT_MS);
+  const hover = (on: boolean) => {
+    if (on) wasHeld.current = true;
+    setHovered(on);
   };
-
-  // Truncate subtitle to a 2-line equivalent when it's long. CSS
-  // line-clamp does the visual heavy lifting; the explicit cap here
-  // is a hard safety so a runaway subtitle (e.g. an error message
-  // dumping a stack trace) doesn't blow out the bubble.
-  const subtitleClamped = notification.subtitle && notification.subtitle.length > 280
-    ? notification.subtitle.slice(0, 277) + "…"
-    : notification.subtitle;
+  const focus = (on: boolean) => {
+    if (on) wasHeld.current = true;
+    setFocused(on);
+  };
+  const detail = notifDetail(notification);
+  const title = notifTitle(notification);
+  const shown = visible && !leaving && !suspended;
+  const top = railPopupTop(anchor);
 
   return (
-    <div
-      role="alertdialog"
-      aria-labelledby="aura-popup-title"
-      data-notifications-popup
-      onClick={onClick}
-      className={[
-        // Anchored above the bell, slid right so the accent edge sits
-        // flush with the bell's right border for a chained look.
-        "absolute bottom-12 left-1 z-40",
-        "min-w-[220px] max-w-[300px]",
-        "pl-3 pr-8 py-2.5",
-        "rounded-xl overflow-hidden",
-        // Aura's standard elevated-glass surface — same panel
-        // recipe used by the player overlay, the OAuth popup, and
-        // the settings panels. Drops the plain-black opaque shell
-        // of the old thought bubble in favour of the theme's
-        // signature blurred-glass + subtle accent edge.
-        "aura-float-glass",
-        "shadow-[0_12px_36px_-10px_rgba(0,0,0,0.7),0_0_22px_-8px_rgba(91,164,255,0.35)]",
-        "cursor-pointer select-none text-left",
-        phase === "enter" ? "aura-popup-card-enter" : "",
-        phase === "exit"  ? "aura-popup-card-exit"  : "",
-        phase === "idle"  ? "aura-popup-card-breathe" : "",
-      ].filter(Boolean).join(" ")}
-      style={{ transformOrigin: "bottom left" }}
-    >
-      {/* Left accent stripe — picks up the same ln-accent token the
-          rest of Aura's primary UI uses. Doubles as the visual
-          "anchor" to the bell beneath it. */}
-      <span
-        aria-hidden
-        className="absolute inset-y-0 left-0 w-[3px]
-                   bg-gradient-to-b from-ln-accent/85 via-ln-accent/55 to-ln-accent/20
-                   shadow-[0_0_10px_rgba(91,164,255,0.55)]"
-      />
-      <button
-        type="button"
-        aria-label="Dismiss"
-        onClick={(e) => { e.stopPropagation(); triggerDismiss(); }}
-        className="absolute top-1.5 right-1.5
-                   w-5 h-5 flex items-center justify-center
-                   rounded-full text-white/45 hover:text-white/85 hover:bg-white/8
-                   transition-colors"
+    <>
+      <div
+        ref={ref}
+        data-notifications-popup
+        data-lg-pop=""
+        // A plain group: the announcement goes through the bell's persistent
+        // live region (a status region inserted already filled is not read).
+        role="group"
+        aria-label="New notification"
+        className={["aura-notif-bubble aura-float-glass", shown ? "is-open" : ""].join(" ")}
+        style={{
+          left: anchor.left,
+          // Flush with the rail's top, beside the Notifications row (the
+          // rail's first), growing downward out of it.
+          top,
+          width: `min(304px, calc(100vw - ${anchor.left + 16}px))`,
+          transformOrigin: railOrigin(anchor, top),
+        }}
+        onPointerEnter={() => hover(true)}
+        onPointerLeave={() => hover(false)}
+        onFocus={() => focus(true)}
+        onBlur={(e) => { if (!e.currentTarget.contains(e.relatedTarget as Node | null)) focus(false); }}
       >
-        <svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
-          <path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" />
-        </svg>
-      </button>
-      <div className="flex items-start gap-2.5">
-        {/* Tiny pulsing accent dot — the "fresh notification"
-            signal the bubble used to communicate via its tail. */}
-        <span
-          aria-hidden
-          className="mt-1 flex-shrink-0 w-1.5 h-1.5 rounded-full
-                     bg-ln-accent shadow-[0_0_6px_rgba(91,164,255,0.85)]
-                     aura-popup-card-pulse"
-        />
-        <div className="min-w-0 flex-1">
-          <p
-            id="aura-popup-title"
-            className="text-white/95 text-[13px] font-semibold leading-snug line-clamp-2"
-          >
-            {notification.title}
-          </p>
-          {subtitleClamped && (
-            <p className="text-white/55 text-[11.5px] leading-snug mt-1 line-clamp-2 break-words">
-              {subtitleClamped}
-            </p>
-          )}
-        </div>
+        <button
+          type="button"
+          className="aura-notif-bubble-main"
+          onClick={onOpen}
+          aria-label={`${title}. ${detail}. Open notifications`}
+        >
+          <NotifThumb notification={notification} poster={poster} size="bubble" />
+          <span className="aura-notif-bubble-text">
+            <span className="aura-notif-bubble-line">
+              <span className="aura-notif-bubble-title">{title}</span>
+              {count > 1 && (
+                <span className="aura-notif-newchip font-mono tabular-nums">{count} new</span>
+              )}
+            </span>
+            <span className="aura-notif-bubble-sub">{detail}</span>
+          </span>
+        </button>
+        <button
+          type="button"
+          aria-label="Dismiss"
+          className="aura-notif-bubble-x"
+          onClick={(e) => { e.stopPropagation(); retract(); }}
+        >
+          <svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+            <path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" />
+          </svg>
+        </button>
       </div>
-    </div>
+      <RailBridge anchor={anchor} on={shown} layer="bubble" />
+    </>
   );
+}
+
+/** The chord searchHotkey.ts focuses the search box on (HistoryDateJump keeps
+ *  the same test): keyCode as well as key, so a non-Latin layout matches. */
+function isSearchChord(e: KeyboardEvent): boolean {
+  return e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey && !e.repeat
+    && (e.key.toLowerCase() === "f" || e.keyCode === 70);
+}
+
+/** Whether the Home search focus dim is up (SearchBar.tsx marks it
+ *  `data-aura-search-dim="on"` and fires `aura:search-dim` on each change).
+ *  Listens only while `active`. */
+function useSearchDim(active: boolean): boolean {
+  const [dim, setDim] = useState(false);
+  useEffect(() => {
+    if (!active) { setDim(false); return; }
+    const check = () => setDim(!!document.querySelector('[data-aura-search-dim="on"]'));
+    check();
+    window.addEventListener("aura:search-dim", check);
+    return () => window.removeEventListener("aura:search-dim", check);
+  }, [active]);
+  // Read synchronously as well: the state only catches up in a passive effect,
+  // so the first render with a popup already under the dim would otherwise
+  // pop the badge and start the sweep there, then play both again when the
+  // dim clears. The event still drives the off transition through state.
+  return dim || (active && !!document.querySelector('[data-aura-search-dim="on"]'));
 }
 
 function BellIcon({ className }: { className?: string }) {
-  // Simple bell glyph — stroke-based so it inherits text colour.
+  // Simple bell glyph: stroke-based so it inherits text colour.
   return (
     <svg
       viewBox="0 0 24 24"
@@ -413,6 +539,7 @@ function BellIcon({ className }: { className?: string }) {
       strokeLinecap="round"
       strokeLinejoin="round"
       className={className}
+      aria-hidden
     >
       <path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9" />
       <path d="M10.3 21a1.94 1.94 0 0 0 3.4 0" />

@@ -233,7 +233,7 @@ fn client() -> &'static reqwest::Client {
             .https_only(true)
             .timeout(TIMEOUT)
             .pool_max_idle_per_host(1)
-            .user_agent("Aura/1.4 (+https://github.com/rm-sage/Aura) arc-art")
+            .user_agent(concat!("Aura/", env!("CARGO_PKG_VERSION"), " (+https://github.com/rm-sage/Aura) arc-art"))
             .build()
             .expect("arc_art HTTP client init failed")
     })

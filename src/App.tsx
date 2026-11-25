@@ -1,7 +1,7 @@
 // Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useState, useEffect, useRef, useCallback, useMemo } from "react";
+import { memo, useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 
@@ -20,18 +20,19 @@ import HistoryView from "./views/HistoryView";
 import QueueView from "./views/QueueView";
 import AiringView from "./views/AiringView";
 import SettingsView from "./views/SettingsView";
-import DetailView from "./views/DetailView";
+import DetailView, { DETAIL_EXIT_MS } from "./views/DetailView";
 import ThemeEngine from "./ThemeEngine";
 import TitleBar from "./TitleBar";
 import LandingView from "./LandingView";
 import LoginView from "./LoginView";
 import OnboardingView from "./views/OnboardingView";
-import { isOnboardingComplete } from "./onboarding";
+import { isOnboardingComplete, type OnboardingMode } from "./onboarding";
 import PlayerOverlay, { VOLUME_MAX } from "./PlayerOverlay";
 import AmbientAura from "./AmbientAura";
 import ContextMenuHost, { openContextMenu } from "./ContextMenu";
 import { CatalogHoverHost } from "./CatalogHoverCard";
 import AppToastHost, { showAppToast } from "./AppToast";
+import { isStaleStreamUrl, pickRefreshedSource, linkRefreshKey, repeatsLinkRefresh, type LinkRefreshPending } from "./streamFreshness";
 import ScrobbleRunBar from "./ScrobbleRunBar";
 import ScrobbleClosePrompt from "./ScrobbleClosePrompt";
 import DownloadsClosePrompt from "./DownloadsClosePrompt";
@@ -39,7 +40,7 @@ import DownloadsPanelHost from "./DownloadsPanelHost";
 import DownloadsRelinkBridge from "./DownloadsRelinkBridge";
 import { startDownloadsStore } from "./downloadsStore";
 import { useDownloadsPanelPhase } from "./downloadsPanel";
-import { ConfirmDialogHost } from "./ConfirmDialog";
+import { ConfirmDialogHost, askConfirm } from "./ConfirmDialog";
 import { safeSetItem } from "./storageQuota";
 import FlyUpToastHost, { showFlyUpToast } from "./FlyUpToast";
 import { runtimeDepPresent, ensureRuntimeDep, ensureRuntimeDepOnce } from "./runtimeDeps";
@@ -53,11 +54,15 @@ import ResumePrompt, { type PendingResume } from "./ResumePrompt";
 import { isNewer } from "./updater";
 import { checkForUpdatePlugin, downloadAndInstallUpdatePlugin, type UpdateInfo } from "./updaterPlugin";
 import { advanceWatchedAfter } from "./autoAdvance";
-import { clearAutoBumped, clearAutoBumpedForVideo } from "./autoBumped";
+import { clearAutoBumped, clearAutoBumpedForVideo, setAutoBumpedScope } from "./autoBumped";
 import { mirrorWatchedFromCloud, pushItemWatched } from "./watchedSync";
 import { onWatchedSync } from "./manualWatched";
 import { useScrobble, type ActiveScrobbleTarget } from "./useScrobble";
 import { useScrobbleAuthAlerts } from "./useScrobbleAuthAlerts";
+import { useHdrPassthroughOffer } from "./useHdrPassthroughOffer";
+import { useMaterialNotice } from "./useMaterialNotice";
+import { useAudioOrderNotice } from "./useAudioOrderNotice";
+import { scheduleHdrOffMigration } from "./hdrMode";
 import { useKeybindings } from "./useKeybindings";
 import { libraryToggle, libraryRemoveAll, libraryRemoveMany, libraryWriteProgress, libraryClearProgress, seriesFinishCheck, finishedSeriesOf } from "./libraryActions";
 import { libraryItemSeriesId } from "./libraryNormalize";
@@ -66,6 +71,7 @@ import { sourcesForMeta, openSourceLink } from "./externalSources";
 import { setManualWatchedScope, getManualWatchedState, setManualWatchedState, setManualWatchedMany, getPlannedQueue } from "./manualWatched";
 import { reconcileLibraryReleaseSignals, clearReleaseSignalStore, getReleaseSignal } from "./releaseSignalStore";
 import { syncPullAll, installSyncTriggers, startBackgroundPull, clearSyncEtags, setSyncActiveScope } from "./sync";
+import { runLegacyAudioPriorityRepair } from "./audioPriorityRepair";
 import { setHistoryScope, addHistoryEntry } from "./historyStore";
 import { setAutoBackupScope, startAutoBackup } from "./userDataBackup";
 import NextUpCta, { NextUpTailPill, StackPresence } from "./NextUpCta";
@@ -82,7 +88,6 @@ import CastMenu from "./CastMenu";
 import CastSessionBar from "./CastSessionBar";
 import { useCastSession } from "./useCastSession";
 import WatchTogetherPanel from "./WatchTogetherPanel";
-import PartyButton from "./PartyButton";
 import PlayerPartyHud from "./PlayerPartyHud";
 import PartyVotesOverlay from "./PartyVotesOverlay";
 import {
@@ -101,7 +106,7 @@ import {
   fetchIntroDbWindows, introDbImdbRoot, introDbNumberings,
 } from "./introdb";
 import {
-  CONTINUITY_SOURCE, LAYER1_PROMPT_SOURCE, LAYER1_SOURCE, LAYER1_TRANSITION_SOURCE,
+  CONTINUITY_SOURCE, LAYER1_PROMPT_SOURCE, LAYER1_SOURCE, LAYER1_SWAP_SOURCE, LAYER1_TRANSITION_SOURCE,
   applySkipModes, composeSkipWindows, fitCrowdToDuration, layer1StateFrom, releasePendingLayer1,
   nextUpEnding, skipConfidence, skipKindGroup, skipModeForKind, trustedEndingEnd, windowsFromChapters,
   type Layer1Status, type PreparedWindow, type SkipMode,
@@ -131,7 +136,9 @@ interface SkipDetectWindow {
   start: number;
   end: number;
   /** "animethemes" (Layer 1), "animethemes-early" (the provisional opening,
-   *  prompt-only until the full match replaces it) or "continuity" (Layer 3). */
+   *  prompt-only until the full match replaces it), "animethemes-swap" (the
+   *  other kind's song in this kind's place, prompt-only) or "continuity"
+   *  (Layer 3). */
   source: string;
   auto_eligible: boolean;
   /** A Layer 1 ending whose theme is Transition-only (its start is the
@@ -211,15 +218,13 @@ import { normalizeLibrary } from "./libraryNormalize";
 import { useLibraryArtRetry } from "./libraryArtRetry";
 import { LibraryProvider } from "./LibraryContext";
 import { NotificationsProvider, useNotifications } from "./NotificationsContext";
-import NotificationsBell from "./NotificationsBell";
-import AccountButton from "./AccountButton";
 import NotificationsScanner, { clearScannerState } from "./NotificationsScanner";
 import { useAiringStreamCheck } from "./useAiringStreamCheck";
 import { getTitleState, titleStateKey } from "./titleState";
 import { isAnimeMeta, markAnimeId } from "./aiometadata";
 import { setSkipMarksScope } from "./skipMarks";
 import { markEpisodesSkipped } from "./skipActions";
-import { SCROBBLE_LABELS, connectedServices, isScrobbleService, useScrobbleConnections } from "./scrobbleConn";
+import { SCROBBLE_LABELS, SCROBBLE_ONBOARDING_SUBTITLE, connectedServices, isScrobbleService, useScrobbleConnections } from "./scrobbleConn";
 import type { AnimeTheme, AnimeThemes } from "./animeExtras";
 import type {
   AddonEntry,
@@ -234,6 +239,7 @@ import type {
 import { ACCOUNT_HAS_NO_ADDONS, ADDON_LIST_NOT_LOADED, COLLECTION_CHANGED, accountChangedCopy, isVideoAired } from "./types";
 import { nextAiringEpisode } from "./releaseCountdown";
 import type { UserSession, StremioAccount } from "./LoginView";
+import { getPlaybackTime, setPlaybackTime, playbackTimeRef, usePlaybackClock, PlaybackTimeView } from "./playbackClock";
 import "./App.css";
 
 // ---------------------------------------------------------------------------
@@ -323,6 +329,11 @@ interface ChapterMerge {
  *   - more than one covers it (One Piece reuses OP1 for episode 1000, so an
  *     episode can genuinely sit inside two ranges).
  *
+ * A window holding the OTHER kind's song (`LAYER1_SWAP_SOURCE`: the opening
+ * song in the ending's place) is outside that song's listed episodes by
+ * definition, so it is named only when the cour lists exactly ONE theme of
+ * that kind.
+ *
  * Naming the wrong song is worse than naming none, which is the same rule
  * `streamMeta.ts` follows for stream chips.
  */
@@ -340,11 +351,13 @@ function stampThemeSongs(
   };
   const opening = pick(themes.openings);
   const ending  = pick(themes.endings);
+  const only = (list: AnimeTheme[]): AnimeTheme | null => (list.length === 1 ? list[0] : null);
 
   return windows.map((w) => {
+    const swapped = w.source === LAYER1_SWAP_SOURCE;
     // `mixed-op` is an opening with content mixed in; it is still the OP song.
-    const t = w.type === "op" || w.type === "mixed-op" ? opening
-            : w.type === "ed" ? ending
+    const t = w.type === "op" || w.type === "mixed-op" ? (swapped ? only(themes.endings) : opening)
+            : w.type === "ed" ? (swapped ? only(themes.openings) : ending)
             : null;
     if (!t || (!t.title && !t.artist)) return w;
     return { ...w, song_title: t.title, song_artist: t.artist };
@@ -739,7 +752,8 @@ function heightToRung(height: number): string {
 }
 
 function usePlayback(playerActive: boolean, isTrailer: boolean) {
-  const [time, setTime]           = useState(0);
+  // The playhead lives in playbackClock.tsx, not here: as state it re-rendered
+  // App on every ~30 Hz tick. setPlaybackTime below is its only writer.
   const [duration, setDuration]   = useState(0);
   const [paused, setPaused]       = useState(true);
   const [volume, setVolume]       = useState(50);
@@ -843,6 +857,11 @@ function usePlayback(playerActive: boolean, isTrailer: boolean) {
    *  re-warning + re-flipping streamBroken every 2 s forever. Reset on each
    *  fresh load (notifyNewLoad). */
   const loadWatchdogFiredRef = useRef(false);
+  /** The engine reported THIS load as undecodable (`playback-undecodable`):
+   *  the file opened but every frame failed to decode. Read by the VOD
+   *  auto-retry, which then re-reads the source at once instead of re-sending
+   *  the same url first. Reset on each fresh load (notifyNewLoad). */
+  const undecodableRef = useRef(false);
   /** Wall-clock of an unrecovered `end-file reason=error`. mpv fires that when
    *  its own reconnect (reconnect_on_network_error=1) gives up on a range
    *  request; on a flaky debrid stream that happens TRANSIENTLY while the next
@@ -1076,7 +1095,6 @@ function usePlayback(playerActive: boolean, isTrailer: boolean) {
           watchedElapsedRef.current += _dt;
         }
         watchedElapsedLastTimeRef.current = payload.time;
-        setTime(payload.time);
         // Snapshot the last position from BEFORE the stream went bad. Once
         // mpv's keep-open handling runs seek_to_last_frame() the reported
         // playhead is `duration`, and every resume path (`ownedTime()`
@@ -1145,6 +1163,11 @@ function usePlayback(playerActive: boolean, isTrailer: boolean) {
           // flags together, so a successful reload still un-latches normally.
           if (!truncatedRunoutRef.current) setStreamBroken(false);
         }
+        // Published LAST, after every ref above (lastSanePosRef, the
+        // truncation runway, the first-frame latch) took this tick: the
+        // per-tick subscribers (usePlaybackClock) run synchronously in here,
+        // where the old `time` effects ran after the whole handler.
+        setPlaybackTime(payload.time);
       }
       if (typeof payload.duration === "number") {
         if (payload.duration > 0 && !loadEventsSeenRef.current.has("duration-known")) {
@@ -1480,9 +1503,9 @@ function usePlayback(playerActive: boolean, isTrailer: boolean) {
   // (>5 s from the end) still flip `streamBroken` and surface the
   // unchanged recovery / Reload modal.
   const lastPosRef = useRef({ time: 0, duration: 0 });
-  useEffect(() => {
-    lastPosRef.current = { time, duration };
-  }, [time, duration]);
+  usePlaybackClock((t) => {
+    lastPosRef.current = { time: t, duration };
+  }, [duration]);
   /** Summed forward playback progress (s) for the CURRENT load. Mirrors
    *  useScrobble's elapsedThisSession: per-tick time deltas accumulate
    *  only when positive and below the seek cap, so seeking never inflates
@@ -1726,6 +1749,22 @@ function usePlayback(playerActive: boolean, isTrailer: boolean) {
     return () => { p.then((fn) => fn()).catch(() => {}); };
   }, [logLoadEvent]);
 
+  // The engine saw the file open and then dozens of frames fail to decode with
+  // none produced (mpv/engine.rs UNDECODABLE_ERRORS). Nothing else fires for
+  // that load: no first frame, no end-file, and the buffer keeps "progressing"
+  // because the demuxer keeps reading the packets the decoder rejects, so the
+  // load watchdog defers forever. A report that lands before this load's file
+  // opened belongs to the previous file and is ignored.
+  useEffect(() => {
+    const p = listen("playback-undecodable", () => {
+      if (!positionOwnedRef.current || undecodableRef.current) return;
+      undecodableRef.current = true;
+      console.warn("[playback] the stream opened but does not decode - treating it as broken");
+      setStreamBroken(true);
+    });
+    return () => { p.then((fn) => fn()).catch(() => {}); };
+  }, []);
+
   // Belt-and-suspenders watchdog: if loadStartedAtRef has been non-
   // zero for >LOAD_TIMEOUT_MS and firstFrameSeen is still false, the
   // load is wedged (e.g. silent network hang where no end-file event
@@ -1802,6 +1841,7 @@ function usePlayback(playerActive: boolean, isTrailer: boolean) {
   const notifyNewLoad = useCallback(() => {
     loadStartedAtRef.current = Date.now();
     loadWatchdogFiredRef.current = false;
+    undecodableRef.current = false;
     // A fresh load supersedes any pending error grace from the previous file,
     // so an error stamped just before the episode advance can't flag the NEW
     // stream broken 20 s in.
@@ -1842,7 +1882,7 @@ function usePlayback(playerActive: boolean, isTrailer: boolean) {
     console.info("[load] +0ms notifyNewLoad — fresh load sequence begins");
     setBuffering(true);
     setFirstFrameSeen(false);
-    setTime(0);
+    setPlaybackTime(0);
     setDuration(0);
     setEof(false);
     setDemuxEof(false);
@@ -1917,7 +1957,7 @@ function usePlayback(playerActive: boolean, isTrailer: boolean) {
   }, []);
 
   return {
-    time, duration, paused, volume, speed, buffering, bufferPct, cacheSeconds, seekLoading, eof, firstFrameSeen,
+    duration, paused, volume, speed, buffering, bufferPct, cacheSeconds, seekLoading, eof, firstFrameSeen,
     demuxEof, seeking, cacheSampleAtRef, loadEpochRef,
     streamBroken, setStreamBroken,
     togglePause, seekRelative, seekAbsolute, commitVolume, commitSpeed,
@@ -1929,6 +1969,7 @@ function usePlayback(playerActive: boolean, isTrailer: boolean) {
     // needs the state to react to and the ref to resume from.
     streamTruncated, streamTruncatedRef, lastSanePosRef,
     truncatedRunout, cacheEndRef,
+    undecodableRef,
   };
 }
 
@@ -2087,10 +2128,13 @@ export default function App() {
   const [showLogin, setShowLogin] = useState(false);
   /** First-run wizard: dismisses to false once the user finishes/skips the
    *  flow OR if a completed flag was already on disk from a prior install.
-   *  `onboardingStartAddons` flips true when AddonsView fires the
-   *  "Reopen onboarding addons" event so the wizard remounts at step 2. */
+   *  `onboardingMode` says which wizard to show: the first run, just the
+   *  suggested addons (AddonsView's "Suggested addons") or the whole setup
+   *  again (Settings' "Run setup again"). `onboardingKey` remounts the wizard
+   *  when one of those opens it, so it starts fresh. */
   const [onboardingActive, setOnboardingActive] = useState<boolean>(() => !isOnboardingComplete());
-  const [onboardingStartAddons, setOnboardingStartAddons] = useState(false);
+  const [onboardingMode, setOnboardingMode] = useState<OnboardingMode>("first-run");
+  const [onboardingKey, setOnboardingKey] = useState(0);
 
   // ── Addons ──
   const [addons, setAddons] = useState<AddonEntry[]>([]);
@@ -2120,6 +2164,14 @@ export default function App() {
   const addonsGenRef = useRef(0);
   const reorderInFlightRef = useRef(0);
   const syncedAccountRef = useRef<string | null>(null);
+  // The same answer as render-safe state, for the onboarding addon cards
+  // (isAddonListSynced starts a sync, so it must not be called in render).
+  // Every write to the ref goes through setSyncedAccount.
+  const [syncedAccount, setSyncedAccountState] = useState<string | null>(null);
+  const setSyncedAccount = useCallback((key: string | null) => {
+    syncedAccountRef.current = key;
+    setSyncedAccountState(key);
+  }, []);
   // The title-bar service monitor probes each installed addon; it sits far
   // from this state, so the list is published to its store rather than
   // threaded through TitleBar (src/serviceStatusStore.ts).
@@ -2340,7 +2392,7 @@ export default function App() {
   // ── Playback hook — gated on activeTarget so the polling fallback only
   //     runs while a stream is loaded.
   const {
-    time, duration, paused, volume, speed, buffering, bufferPct, seekLoading, firstFrameSeen,
+    duration, paused, volume, speed, buffering, bufferPct, seekLoading, firstFrameSeen,
     cacheSeconds, demuxEof, seeking: playbackSeeking, cacheSampleAtRef, loadEpochRef,
     streamBroken, setStreamBroken,
     togglePause, seekRelative, seekAbsolute, commitVolume, commitSpeed,
@@ -2349,8 +2401,31 @@ export default function App() {
     positionOwnedRef,
     streamTruncated, streamTruncatedRef, lastSanePosRef,
     truncatedRunout, cacheEndRef,
+    undecodableRef,
   } = usePlayback(isPlayerActive, isTrailerPlayback);
+  /** Bumped by every handlePlayStream call and by exit, so a play that is
+   *  still re-reading a stale source (below) stands down when anything newer
+   *  happened meanwhile. */
+  const playRequestRef = useRef(0);
+  /** The play re-reading an old link right now (handlePlayStream), with the
+   *  play request that owns it. The state drives the stream row's pending
+   *  look (DetailView); the ref is what a repeat click is checked against.
+   *  Cleared by its owner when the re-read ends, by any newer play and by
+   *  exit, so it can never outlive the play it describes. */
+  const linkRefreshRef = useRef<(LinkRefreshPending & { playRequest: number }) | null>(null);
+  const [linkRefresh, setLinkRefresh] = useState<LinkRefreshPending | null>(null);
+  const clearLinkRefresh = useCallback((owner?: number) => {
+    const cur = linkRefreshRef.current;
+    if (!cur || (owner != null && cur.playRequest !== owner)) return;
+    linkRefreshRef.current = null;
+    setLinkRefresh(null);
+  }, []);
 
+  // Live view of the playhead (playbackClock.tsx). ownedTime (below) and the
+  // Watch-Together bridge read it rather than closing over a value, so their
+  // identities stay stable.
+  const wtTimeRef = playbackTimeRef;
+  const durationLiveRef = useRef(duration); durationLiveRef.current = duration;
   /** `time`, but only when it is known to belong to the file currently loaded
    *  - null during a load, before mpv has confirmed the new file is open.
    *
@@ -2370,9 +2445,9 @@ export default function App() {
    *  resume sites and forgotten at the fourth (the source switcher). */
   const ownedTime = useCallback(
     () => (positionOwnedRef.current
-      ? (streamTruncatedRef.current ? lastSanePosRef.current : time)
+      ? (streamTruncatedRef.current ? lastSanePosRef.current : wtTimeRef.current)
       : null),
-    [positionOwnedRef, streamTruncatedRef, lastSanePosRef, time],
+    [positionOwnedRef, streamTruncatedRef, lastSanePosRef],
   );
 
   // ── Watch-Together ──────────────────────────────────────────────────────
@@ -2381,7 +2456,6 @@ export default function App() {
   // the existing seek/pause controls (raw → no re-broadcast). See
   // src/watchTogether/. The broadcast-wrapped controls below are what the
   // on-screen controls + keybindings call (NOT programmatic/internal pauses).
-  const wtTimeRef = useRef(time); wtTimeRef.current = time;
   const wtPausedRef = useRef(paused); wtPausedRef.current = paused;
   const wtSpeedRef = useRef(speed); wtSpeedRef.current = speed;
   const wtTargetRef = useRef(activeTarget); wtTargetRef.current = activeTarget;
@@ -2637,6 +2711,18 @@ export default function App() {
     () => loadSessionRoute()?.detail ?? null,
   );
   const [selectedRect, setSelectedRect] = useState<DOMRect | null>(null);
+  // Exit fade: closeDetail nulls selectedMeta at once (the Escape chain, the
+  // session route and everything else see "closed" immediately), while
+  // `detailExit` keeps the SAME DetailView instance mounted for
+  // DETAIL_EXIT_MS with `closing` set so it can fade over the page beneath.
+  // `detailGenRef` is the open generation, part of DetailView's key: the
+  // leaving copy keeps its generation (no remount through the fade), and any
+  // open after a close gets a fresh one, so reopening the same title during
+  // the fade mounts a NEW instance rather than reviving the leaving one.
+  const selectedMetaRef = useRef(selectedMeta);
+  selectedMetaRef.current = selectedMeta;
+  const detailGenRef = useRef(0);
+  const [detailExit, setDetailExit] = useState<{ meta: MetaPreview; gen: number } | null>(null);
 
   // Persist the browse route (active tab + open detail) on every change so a
   // webview reload can restore it. Cheap — a small JSON write to sessionStorage.
@@ -2710,12 +2796,37 @@ export default function App() {
 
   /** Dismiss the detail page. There is no navigation trail to unwind: a Related
    *  tile searches for the title it names rather than opening it in place, so
-   *  the detail page is only ever one level deep. */
+   *  the detail page is only ever one level deep.
+   *
+   *  This is the ONLY place selectedMeta goes null, and the exit fade relies
+   *  on it: a path that nulls it elsewhere simply gets no fade. */
   const closeDetail = useCallback(() => {
+    const leaving = selectedMetaRef.current;
+    if (leaving) {
+      setDetailExit({ meta: leaving, gen: detailGenRef.current });
+      detailGenRef.current += 1;
+    }
     setSelectedMeta(null);
     setSelectedRect(null);
     setIgnoreResumeOnNextOpen(true);
   }, []);
+
+  // Drop the leaving copy once its fade is done. A timer, not transitionend,
+  // so a missed event (Play started, window hidden, reduced motion) can never
+  // strand it.
+  useEffect(() => {
+    if (!detailExit) return;
+    const t = window.setTimeout(() => setDetailExit(null), DETAIL_EXIT_MS + 80);
+    return () => clearTimeout(t);
+  }, [detailExit]);
+  // A new open supersedes any fade still running.
+  useEffect(() => {
+    if (selectedMeta) setDetailExit(null);
+  }, [selectedMeta]);
+  // What the detail overlay renders: the open title, else the leaving copy.
+  const detailShown = selectedMeta
+    ? { meta: selectedMeta, gen: detailGenRef.current }
+    : detailExit;
 
   /** Stream → MPV bridge: route the URL through the streaming bridge then
       load_video. Sets activeTarget so scrobble/RPC/SMTC light up.
@@ -2731,7 +2842,7 @@ export default function App() {
       capped to 5 tracks with the non-blocking `auto` flag. */
   const handlePlayStream = useCallback(
     async (
-      stream: StreamEntry,
+      requested: StreamEntry,
       target: {
         id: string;
         series_id?: string;
@@ -2759,6 +2870,17 @@ export default function App() {
       // undefined plays direct (and clears any proxy left by a prior stream).
       opts?: { forceStartSeconds?: number; proxyUrl?: string | null; audioFileUrl?: string | null },
     ) => {
+      // The same play is already re-reading its old link (a second click on
+      // the row while every addon is asked again): let that one finish. Any
+      // other play goes on and supersedes it below.
+      if (repeatsLinkRefresh(linkRefreshRef.current, target.id, requested)) {
+        console.info("[playback] this play is already refreshing its link - ignoring the repeat");
+        return;
+      }
+      const playRequest = ++playRequestRef.current;
+      clearLinkRefresh();
+      // Reassigned once, below, when the url is too old to trust.
+      let stream = requested;
       try {
         if (!stream.url && !stream.info_hash) return;
         // Live TV (and trailer) carve-out, computed from `target`
@@ -2862,6 +2984,51 @@ export default function App() {
         // chosen position (the resume-prompt computation was skipped above).
         if (forceStart != null) {
           resumeAt = forceStart;
+        }
+
+        // ── A url too old to trust ──
+        // Checked AFTER the resume prompt, which can sit unanswered. Every
+        // place that holds a pick (a Next-Up / end-screen pick made halfway
+        // through the previous episode, a detail page's list, this prompt) can
+        // hold it across a day in the tray, and an old addon url can serve two
+        // files (see streamFreshness.ts). Read the source again and play the
+        // SAME source (sameStreamSource: info hash, else addon + filename) at
+        // its fresh url; with no match, the old one plays as before.
+        if (!isLiveTarget && isStaleStreamUrl(stream, Date.now())) {
+          const ageMin = Math.round((Date.now() - (stream.resolved_at_ms ?? 0)) / 60000);
+          console.info(`[playback] the picked stream's link is ${ageMin} min old - reading the source again`);
+          showAppToast("Refreshing the stream link");
+          // Pending until the re-read settles: the row that started it shows
+          // it is working, and a repeat click is ignored (top of this call).
+          const pending: LinkRefreshPending = { targetId: target.id, key: linkRefreshKey(requested) };
+          linkRefreshRef.current = { ...pending, playRequest };
+          setLinkRefresh(pending);
+          try {
+            const r = await invoke<StreamFetchResult>("fetch_streams", {
+              // The ref: this callback's deps do not include `addons`.
+              addons:    streamQueryAddons(addonsRef.current),
+              mediaType: target.media_type,
+              id:        target.id,
+            });
+            if (playRequestRef.current !== playRequest) {
+              console.info("[playback] a newer play or an exit superseded the link refresh - standing down");
+              return;
+            }
+            const rows = Array.isArray(r) ? (r as StreamEntry[]) : (r?.streams ?? []);
+            const match = pickRefreshedSource(rows, stream, sameStreamSource);
+            if (match) {
+              stream = match;
+            } else {
+              console.warn("[playback] the refreshed list no longer has this source - playing the old link");
+            }
+          } catch (e) {
+            if (playRequestRef.current !== playRequest) return;
+            console.warn("[playback] link refresh failed - playing the old link", e);
+          } finally {
+            // Only this play's own entry: a newer play already cleared it, or
+            // set its own.
+            clearLinkRefresh(playRequest);
+          }
         }
 
         // ── Watch-Together: remember which stream this is (for broadcasting to
@@ -3515,7 +3682,12 @@ export default function App() {
                     setDetectedMediaEnd(s.media_end_probe);
                     det.mediaEndMeasured = s.media_end_probe;
                   }
-                  skipMatchVerdicts(s.generation, s.op_l1, s.ed_l1);
+                  // A swap (the other kind's song in a kind's place) leaves the
+                  // kind informative for its OWN themes, but the readout found
+                  // a song there.
+                  const shown = (w: SkipDetectWindow | null | undefined, l1: string | null | undefined) =>
+                    (w?.source === LAYER1_SWAP_SOURCE ? "matched" : l1);
+                  skipMatchVerdicts(s.generation, shown(s.op, s.op_l1), shown(s.ed, s.ed_l1));
                   void stamp(note);
                 };
                 // Every exit of a detect releases a kind it left undecided (no
@@ -4129,27 +4301,43 @@ export default function App() {
         // through 127.0.0.1 makes no sense for those utilities.
         setActiveStreamUrl(stream.url ?? null);
         setCurrentStream(stream); // drives the source switcher's "Now Playing" match
-        // Look up the logo for the buffering overlay. Try the selected meta
-        // (the exact card the user clicked) first, falling back to the
-        // selected library item.
+        // Look up the logo for the buffering overlay, in the order the detail
+        // page resolves its own hero logo (DetailView heroArtFrom: the META
+        // DETAIL's logo before the catalog preview's):
+        //   1. the caller's explicit logo (DetailView passes the hero's
+        //      latched logo; Live TV the channel logo),
+        //   2. the logo already showing for this title (a Next-Up advance, a
+        //      retry, a source switch and a party sync rebuild the target
+        //      from activeTarget without one),
+        //   3. the richest cached meta detail (a play from Continue Watching
+        //      or the Next-Up card, where no detail page is open),
+        //   4. the selected catalog preview and the library row.
+        // Before 2026-11-19 it started at 4: a catalog row often carries no
+        // `logo` while the meta addon's detail does (The Odyssey through
+        // AIOMetadata), so the overlay showed the text title for a film whose
+        // detail page showed a logo. selectedMeta now counts only for the
+        // same title, so a party sync onto another title cannot borrow the
+        // open page's logo.
         //
-        // The library lookup keys on the SERIES ROOT, not `target.id`.
+        // The lookups key on the SERIES ROOT, not `target.id`.
         // libraryNormalize collapses every per-episode row into one
         // series-rooted record, so an episode id (`tt123:1:5`) can never match
         // a library row and this fallback silently never fired for series.
+        const logoRoot = target.series_id ?? target.id;
+        const prevTarget = activeTargetRef.current;
         const logo =
           target.logo ??
-          selectedMeta?.logo ??
-          library.find((i) => i.id === (target.series_id ?? target.id))?.logo ??
+          (prevTarget && (prevTarget.series_id ?? prevTarget.id) === logoRoot ? prevTarget.logo ?? null : null) ??
+          peekRichestCachedDetailById(logoRoot)?.logo ??
+          (selectedMeta && (selectedMeta.id === logoRoot || selectedMeta.id === target.id) ? selectedMeta.logo : null) ??
+          library.find((i) => i.id === logoRoot)?.logo ??
           null;
         // absolute_episode_num is patched in by the async effect
         // below — computing it inline would require awaiting the meta
         // detail BEFORE we can flip activeTarget, which would block
         // the play flow on a potentially slow (cold-cache) fetch.
         // The effect resolves it within milliseconds when the cache
-        // is warm; on cold-cache it lands well before the 120-second
-        // scrobble_start warmup, so the Trakt absolute fallback has
-        // the value it needs.
+        // is warm.
         setActiveTarget({
           id:            target.id,
           series_id:     target.series_id,
@@ -4158,8 +4346,8 @@ export default function App() {
           episode:       target.episode,
           episode_title: target.episode_title,
           // Authoritative numeric S/E from the picker — thread through
-          // so scrobble.rs's Trakt payload uses the same numbers the
-          // user clicked on, sidestepping ID-string parse mismatches.
+          // so the scrobble payloads use the same numbers the user
+          // clicked on, sidestepping ID-string parse mismatches.
           season:        target.season,
           episode_num:   target.episode_num,
           logo,
@@ -4663,32 +4851,25 @@ export default function App() {
     return () => window.removeEventListener("aura:show-login", onShow);
   }, []);
 
-  // ── Reopen-onboarding-addons event listener ──
-  // AddonsView's "Reopen onboarding addons" button fires
-  // `aura:onboarding-reopen-addons`; remount the wizard at step 2 so the
-  // user can revisit just the suggested-addons page without re-running
-  // steps 0 (import) and 1 (settings).
+  // ── Reopen the onboarding wizard ──
+  // AddonsView's "Suggested addons" button fires
+  // `aura:onboarding-reopen-addons` (just the addon list), and Settings'
+  // "Run setup again" fires `aura:onboarding-rerun` (every step again).
+  // Either remounts the wizard in that mode.
   useEffect(() => {
-    const onReopen = () => {
-      setOnboardingStartAddons(true);
+    const open = (mode: OnboardingMode) => {
+      setOnboardingMode(mode);
+      setOnboardingKey((k) => k + 1);
       setOnboardingActive(true);
     };
+    const onReopen = () => open("addons-only");
+    const onRerun = () => open("rerun");
     window.addEventListener("aura:onboarding-reopen-addons", onReopen);
-    return () => window.removeEventListener("aura:onboarding-reopen-addons", onReopen);
-  }, []);
-
-  // ── Finish-onboarding event listener ──
-  // The wizard's "Open Trakt & AniList settings" jump finishes the
-  // wizard outright (markOnboardingComplete already fired in the
-  // button) and dispatches this event so we unmount the OnboardingView
-  // and let the settings-deep-link router land the user on Settings.
-  useEffect(() => {
-    const onFinish = () => {
-      setOnboardingActive(false);
-      setOnboardingStartAddons(false);
+    window.addEventListener("aura:onboarding-rerun", onRerun);
+    return () => {
+      window.removeEventListener("aura:onboarding-reopen-addons", onReopen);
+      window.removeEventListener("aura:onboarding-rerun", onRerun);
     };
-    window.addEventListener("aura:onboarding-finish", onFinish);
-    return () => window.removeEventListener("aura:onboarding-finish", onFinish);
   }, []);
 
   // ── Session-changed broadcast ──
@@ -5179,7 +5360,7 @@ export default function App() {
     })().catch((e) => console.warn(`[skipdetect] next-episode theme prefetch failed: ${String(e)}`));
   }, []);
 
-  useEffect(() => {
+  usePlaybackClock((time) => {
     if (!activeTarget) return;
     if (nextUpLeadSeconds <= 0) return; // user disabled the feature
     if (!duration || duration <= 0) return;
@@ -5285,7 +5466,7 @@ export default function App() {
         setNextUpInfo({ episode: next.next, stream, canon, detail: next.detail });
       }
     })();
-  }, [activeTarget, time, duration, addons, nextUpLeadSeconds, prefetchNextThemes, skipDetectSettledTick]);
+  }, [activeTarget, duration, addons, nextUpLeadSeconds, prefetchNextThemes, skipDetectSettledTick]);
 
   // ── Next-episode pre-scan ──
   // While an anime episode plays, the REAL skip detector runs on the stream
@@ -5628,7 +5809,7 @@ export default function App() {
   // unattended advance only happens at end of stream, after any after-credits
   // scene or preview. The countdown that used to start here is what skipped
   // them.
-  useEffect(() => {
+  usePlaybackClock((time) => {
     if (!activeTarget) {
       if (nextUpVisible) setNextUpVisible(false);
       return;
@@ -5660,7 +5841,7 @@ export default function App() {
     ) {
       setNextUpVisible(false);
     }
-  }, [activeTarget, time, duration, nextUpInfo, nextUpLeadSeconds, nextUpVisible,
+  }, [activeTarget, duration, nextUpInfo, nextUpLeadSeconds, nextUpVisible,
       streamTruncated, streamTruncatedRef]);
 
   // Tear down a Next-Up card when a stream is proven truncated. Dispatched
@@ -5781,7 +5962,6 @@ export default function App() {
           season,
           episode,
           episode_title: activeTarget.episode_title ?? null,
-          episode_released: activeTarget.episode_released ?? null,
           played_at:     new Date().toISOString(),
           duration:      dur || undefined,
           watched_seconds: watched,
@@ -5866,8 +6046,8 @@ export default function App() {
     if (skippedEps.length > 0 && activeTarget) {
       // `userInitiated` is the scrobble gate, and an UNATTENDED countdown is
       // not user-initiated. Falling asleep through a filler run should leave
-      // purple tags you can clear, not a dozen Trakt plays you have to undo on
-      // their website one at a time. The marks are written either way, so the
+      // purple tags you can clear, not a dozen scrobbled plays you have to undo
+      // on another website one at a time. The marks are written either way, so the
       // local record is the same however the skip fired.
       void markEpisodesSkipped(
         skippedEps.map((v: VideoEntry) => ({
@@ -6360,6 +6540,8 @@ export default function App() {
 
   // ── Deep-link query (set from the Tauri deep-link event below) ──
   const [deepLinkSearch, setDeepLinkSearch] = useState<string | null>(null);
+  // Stable so PageColumn's memo holds (it was an inline closure in the JSX).
+  const onDeepLinkConsumed = useCallback(() => setDeepLinkSearch(null), []);
 
   // Recently-cleared CW items. Stremio's datastore is eventually consistent
   // on `_mtime` — even after a successful libraryClearProgress, a refetch
@@ -6523,7 +6705,7 @@ export default function App() {
         invalidateLibraryLoads();
         await invoke("logout").catch(() => {});
         invalidateLibraryLoads();
-        syncedAccountRef.current = null;
+        setSyncedAccount(null);
         refreshedAddonsRef.current.clear();
         addonsGenRef.current += 1;
         setSession(null);
@@ -6643,7 +6825,7 @@ export default function App() {
     await invoke("logout").catch(() => {});
     // Again: the old session's listeners can start a refetch until setSession lands.
     invalidateLibraryLoads();
-    syncedAccountRef.current = null;
+    setSyncedAccount(null);
     refreshedAddonsRef.current.clear();
     addonsGenRef.current += 1;
     setSession(null);
@@ -6949,16 +7131,22 @@ export default function App() {
     return () => { cancelled = true; };
   }, [activeView, isPlayerActive]);
 
-  // Continue-Watching ✕ button → clear playback state in Stremio cloud.
+  // Continue-Watching ✕ button (and the card menu's "Reset Progress") → clear
+  // playback state in Stremio cloud.
   // Card dispatches `aura:cw-clear` with the LibraryItem; we resolve the
-  // auth_key here and round-trip through library_put. libraryClearProgress
-  // dispatches `aura:library-changed` on success which re-fetches the row.
+  // auth_key here, re-read the account (library_get) and rewind the title's
+  // FRESH raw records through library_put (libraryClearProgress). No
+  // `aura:library-changed` on success (see libraryClearProgress); a failure
+  // rolls back and fires one.
   //
   // Using a ref for the session keeps the listener stable — without it,
   // re-mounting the listener on every session change can race a click
   // event that fires while session is briefly null during a re-fetch.
   const sessionRef = useRef<UserSession | null>(session);
   useEffect(() => { sessionRef.current = session; }, [session]);
+  // The listener below is registered once; read the current handler at call time.
+  const handleSessionExpiredRef = useRef(handleSessionExpired);
+  useEffect(() => { handleSessionExpiredRef.current = handleSessionExpired; }, [handleSessionExpired]);
   useEffect(() => {
     const onClear = async (e: Event) => {
       const detail = (e as CustomEvent<{ item: LibraryItem }>).detail;
@@ -6968,6 +7156,13 @@ export default function App() {
         return;
       }
       console.info("[cw-clear] clearing", detail.item.id);
+      const auth = sess.auth_key;
+      const id = detail.item.id;
+      // The offsets the optimistic zero replaces, for the rollback on failure.
+      const prevOffset = libraryRef.current.find((i) => i.id === id)?.state?.timeOffset;
+      const prevRawOffsets = new Map(rawLibraryRef.current
+        .filter((i) => libraryItemSeriesId(i.id) === id)
+        .map((i) => [i.id, i.state?.timeOffset] as const));
       // Register the id in the recent-clear set IMMEDIATELY. Even if
       // a focus-driven refetch races our cloud write and brings back
       // the non-zero timeOffset, overlayRecentClears() will re-zero it
@@ -6995,11 +7190,61 @@ export default function App() {
             : i
         ));
         window.dispatchEvent(new CustomEvent("aura:library-write"));
-        // Then push to the cloud — fire-and-forget so a slow network
-        // doesn't keep the row visible.
-        await libraryClearProgress(sess.auth_key, detail.item, rawLibraryRef.current);
+        // Then the cloud, from a FRESH read of the account, never the local
+        // snapshot: that can be up to 5 minutes old, so writing it back could
+        // bring back a title another device removed or put back progress
+        // written since. library_get leaves removed records out, so a title
+        // with no record left was removed (or dropped) elsewhere: it is dropped
+        // here too and nothing is written. A failed or empty read writes
+        // nothing and rolls back like a failed write (the catch below).
+        const fresh = await invoke<LibraryItem[]>("library_get", { authKey: auth });
+        if (sessionRef.current?.auth_key !== auth) return;
+        if (!Array.isArray(fresh) || fresh.length === 0) {
+          throw new Error("library read came back empty");
+        }
+        const group = fresh.filter((i) => i && i.id && libraryItemSeriesId(i.id) === id);
+        if (group.length === 0) {
+          console.info("[cw-clear] no record left on the account (removed elsewhere) - dropping it here, nothing written", id);
+          recentlyCleared.current.delete(id);
+          setLibrary((curr) => curr.filter((i) => i.id !== id));
+          setRawLibrary((curr) => curr.filter((i) => libraryItemSeriesId(i.id) !== id));
+          return;
+        }
+        // RAW records straight from library_get: their millisecond progress
+        // and every other state key go back untouched but timeOffset.
+        await libraryClearProgress(auth, detail.item, group);
+        if (sessionRef.current?.auth_key !== auth) return;
+        // The raw snapshot now holds what was just written (the fresh records,
+        // rewound), so a later raw-sourced write echoes nothing older.
+        const freshById = new Map(group.map((r) => [r.id, { ...r, state: { ...r.state, timeOffset: 0 } }] as const));
+        setRawLibrary((curr) => {
+          const kept = curr
+            .filter((i) => libraryItemSeriesId(i.id) !== id || freshById.has(i.id))
+            .map((i) => freshById.get(i.id) ?? i);
+          const known = new Set(kept.map((i) => i.id));
+          return [...kept, ...[...freshById.values()].filter((r) => !known.has(r.id))];
+        });
       } catch (err) {
         console.warn("[cw-clear] failed", err);
+        // A stale 401 is an old key's: it must not sign out the next account.
+        if (String(err) === SESSION_EXPIRED) {
+          if (sessionRef.current?.auth_key === auth) await handleSessionExpiredRef.current();
+          return;
+        }
+        if (sessionRef.current?.auth_key !== auth) return;
+        // Nothing reached the account: put the position back (only where it is
+        // still the optimistic zero, so progress written since is kept), and
+        // stop the overlay re-zeroing the cloud's unchanged copy.
+        recentlyCleared.current.delete(id);
+        const restore = (i: LibraryItem, prev: number | undefined) =>
+          prev && i.state && i.state.timeOffset === 0
+            ? { ...i, state: { ...i.state, timeOffset: prev } }
+            : i;
+        setLibrary((curr) => curr.map((i) => (i.id === id ? restore(i, prevOffset) : i)));
+        setRawLibrary((curr) => curr.map((i) => (prevRawOffsets.has(i.id) ? restore(i, prevRawOffsets.get(i.id)) : i)));
+        showAppToast(`Could not reset progress for "${detail.item.name}"`, { tone: "danger" });
+        // library_put threw, so no `aura:library-changed` fired: re-read the row.
+        window.dispatchEvent(new CustomEvent("aura:library-changed"));
       }
     };
     window.addEventListener("aura:cw-clear", onClear);
@@ -7016,11 +7261,11 @@ export default function App() {
       if (!detail || typeof detail.seriesId !== "string" || typeof detail.episodeId !== "string") return;
       const mt = detail.mediaType ?? "";
       // History parity. The 80 % auto-complete is the definitive
-      // "watched" signal that already drives Trakt/AniList — but the
+      // "watched" signal that already drives AniList / Simkl, but the
       // History tab is written ONLY by handleExitPlayback / onNextUpPlay,
       // and a binge / auto-advance / resume-at-end teardown can skip BOTH
       // for the just-finished episode (observed: WHA EP01 scrobbled to
-      // Trakt+AniList yet never appeared in History). Write it here too,
+      // AniList yet never appeared in History). Write it here too,
       // for the episode that's actually active. `autoHistoryWrittenId`
       // is the per-play slot handleExitPlayback consults so it skips its
       // own duplicate append (addHistoryEntry only dedups exact
@@ -7055,7 +7300,6 @@ export default function App() {
           season,
           episode,
           episode_title: at.episode_title ?? null,
-          episode_released: at.episode_released ?? null,
           played_at:     new Date().toISOString(),
           duration:      dur || undefined,
           watched_seconds: watched || undefined,
@@ -7511,7 +7755,7 @@ export default function App() {
       // ── "Open in…" submenu ─────────────────────────────────────────
       // Collapses every external-source link into one parent row that
       // expands on hover. Anime metas surface AniList / MAL / Kitsu;
-      // everything else surfaces IMDb / TMDB / Trakt / RT / Metacritic
+      // everything else surfaces IMDb / TMDB / RT / Metacritic
       // / Letterboxd (movies-only).
       // Hand the richer anime verdict AND the cached detail down: the detail
       // carries mal / kitsu / tmdb ids, which is what turns most of these rows
@@ -7680,6 +7924,81 @@ export default function App() {
       // in muscle memory — you have to consciously skip past the
       // mark-watched group to reach the remove button.
       items.push({ kind: "divider" });
+      // ── Reset Progress (round 12) ──────────────────────────────────
+      // Stremio's "Rewind" on any card with a saved position (the poster's
+      // progress bar, a CW member: CW membership IS timeOffset > 0). The
+      // same `aura:cw-clear` path as the CW card's X: an optimistic zero in
+      // `library` (LibraryContext, so every bar and mark drops at once) and
+      // the raw snapshot, then libraryClearProgress writes the RAW records
+      // with only timeOffset zeroed (video_id kept), so it syncs to every
+      // Stremio client. A CW card already offers this as "Remove from
+      // Continue Watching" below, so it is not offered twice there.
+      // A removed record is skipped (LibraryContext drops it, so no bar or
+      // mark shows for it). A finished position (ratio >= 0.9, the
+      // LibraryContext watched rule) shows a watched check instead of a
+      // bar, and the reset clears that check too (unless a hand-set watched
+      // mark holds it): the hint says so.
+      //
+      // Gated behind askConfirm (user's call: the consequences reach past the
+      // card). Every line of that dialog states what libraryClearProgress
+      // really does: it zeroes ONLY state.timeOffset on the raw records and
+      // writes them to the Stremio account (library_put), so `removed`,
+      // `temp`, `video_id` (the episode the user was on, which also drives the
+      // watched checks inferred for earlier episodes) and the hand-set
+      // watched marks (manualWatched) all survive, and watch history is never
+      // touched. Cancel takes focus, so Enter alone cancels; the event fires
+      // only on an explicit confirm, once.
+      const progressItem = item && !item.removed ? item : library.find((i) => i.id === meta.id && !i.removed);
+      const savedOffset = progressItem?.state?.timeOffset;
+      if (source !== "cw" && progressItem && typeof savedOffset === "number" && savedOffset > 0) {
+        const savedDur = progressItem.state?.duration;
+        const finished = typeof savedDur === "number" && savedDur > 0 && savedOffset / savedDur >= 0.9;
+        const checkGoes = finished && !isWatched;
+        const isSeries = progressItem.media_type !== "movie";
+        const onEpisode = isSeries && typeof progressItem.state?.video_id === "string" && progressItem.state.video_id.length > 0;
+        const points = [
+          checkGoes
+            ? "The saved playback position is cleared. You had reached the end, so the watched check on its art goes too."
+            : finished
+              ? "The saved playback position is cleared."
+              : "The saved playback position is cleared and the progress bar disappears from its art.",
+          "It leaves Continue Watching.",
+          "The change is saved to your Stremio account, so the official Stremio apps and your other signed-in devices update too.",
+        ];
+        if (onEpisode) {
+          points.push("Kept: watched episodes stay watched, and the episode you were on stays your place in the series. It will play from the start.");
+        } else if (isSeries) {
+          points.push("Kept: episodes you marked as watched stay watched.");
+        }
+        items.push({
+          kind: "action",
+          label: "Reset Progress",
+          hint: checkGoes
+            ? "Clears the saved position (Stremio's Rewind): the watched check goes and the title leaves Continue Watching."
+            : "Clears the saved position (Stremio's Rewind): the progress bar goes and the title leaves Continue Watching.",
+          disabled: !session,
+          icon: (
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+              <path d="M12 5V1L7 6l5 5V7c3.31 0 6 2.69 6 6s-2.69 6-6 6-6-2.69-6-6H4c0 4.42 3.58 8 8 8s8-3.58 8-8-3.58-8-8-8z" />
+            </svg>
+          ),
+          onClick: () => {
+            void askConfirm({
+              title: `Reset progress for ${meta.name}?`,
+              message: "Aura forgets where you stopped watching. Here is what happens:",
+              points,
+              detail: "Your Library and watch history are not changed. The cleared position cannot be brought back.",
+              confirmLabel: "Reset Progress",
+              tone: "danger",
+              defaultFocus: "cancel",
+            }).then((ok) => {
+              if (!ok) return;
+              window.dispatchEvent(new CustomEvent("aura:cw-clear", { detail: { item: progressItem } }));
+              showFlyUpToast(`Progress reset · ${meta.name}`, { x, y, tone: "success" });
+            });
+          },
+        });
+      }
       if (source === "cw" && item) {
         items.push({
           kind: "action",
@@ -7789,7 +8108,7 @@ export default function App() {
     const read = () => invoke<AddonEntry[]>("get_synced_addons", { authKey: sess.auth_key });
     // Still the account, and the list, this sync started from.
     const unchanged = () => addonsGenRef.current === generation && reorderInFlightRef.current === 0;
-    const open = () => { syncedAccountRef.current = sess.auth_key; };
+    const open = () => { setSyncedAccount(sess.auth_key); };
     const adopt = (read: AddonEntry[]) => {
       const synced = withRefreshesSince(read, 0);
       setAddons(synced);
@@ -7938,7 +8257,7 @@ export default function App() {
         if (addonsGenRef.current !== generation || reorderInFlightRef.current > 0) return false;
         const adopted = withRefreshesSince(synced, refreshSeq);
         setAddons(adopted);
-        syncedAccountRef.current = sess.auth_key;
+        setSyncedAccount(sess.auth_key);
         try {
           localStorage.setItem(cloudAddonCacheKey(sess.auth_key), JSON.stringify(adopted));
         } catch { /* quota */ }
@@ -8053,6 +8372,9 @@ export default function App() {
     // Skip annotations follow the watched marks they annotate; a skip whose
     // watched mark lives in another scope would be a ghost.
     setSkipMarksScope(scope);
+    // The Continue Watching suppression set is per account too: one account's
+    // auto-bump must not hide the show from another's Continue Watching.
+    setAutoBumpedScope(scope);
     setHistoryScope(newHistoryScope, { legacyScope: legacyAuthScope });
     // Backups follow the same scope so a sign-out / sign-in cycle's
     // auto-snapshots land under the right user-<hash> directory and
@@ -8070,15 +8392,20 @@ export default function App() {
     // transition to guest doesn't leak prior-account state.
     clearSyncEtags();
     setSyncActiveScope(scope);
-    if (authKey && authKey.trim()) {
-      void syncPullAll();
-    }
+    const pulled = authKey && authKey.trim() ? syncPullAll() : Promise.resolve();
     try {
       await invoke("set_settings_scope", { authKey });
     } catch {
       // Best-effort: a failure here just means the previous scope keeps
       // serving; we don't want to block sign-in or surface an error.
     }
+    // Once per account (a synced flag), after its first pull: put back the
+    // "original" audio token the old setup wizard dropped.
+    void runLegacyAudioPriorityRepair(scope, pulled);
+    // The retired HDR "Off" moves to Convert (hdrMode.ts says why), after
+    // the pull so its write cannot land over this one. Machine-local, and a
+    // no-op on any other mode.
+    scheduleHdrOffMigration(pulled);
   }, []);
 
   // ── Cloud sync orchestration (Aura Cloud) ──
@@ -8180,7 +8507,7 @@ export default function App() {
   // ── Auth handlers ──
   const handleLoginSuccess = useCallback(async (sess: UserSession) => {
     invalidateLibraryLoads();
-    syncedAccountRef.current = null;
+    setSyncedAccount(null);
     refreshedAddonsRef.current.clear();
     addonsGenRef.current += 1;
     await applySettingsScope(sess);
@@ -8203,7 +8530,7 @@ export default function App() {
   const handleLogout = useCallback(async () => {
     invalidateLibraryLoads();
     await invoke("logout").catch(() => {});
-    syncedAccountRef.current = null;
+    setSyncedAccount(null);
     refreshedAddonsRef.current.clear();
     addonsGenRef.current += 1;
     await applySettingsScope(null);
@@ -8368,9 +8695,8 @@ export default function App() {
   // activeTarget is set. handlePlayStream can't await the meta detail
   // before flipping activeTarget (would block the play flow on a cold
   // cache); this effect fetches in the background and patches the
-  // target with the absolute number once detail resolves. Lands well
-  // before the 120 s scrobble_start warmup so the Trakt absolute-
-  // numbering fallback target has the value it needs.
+  // target with the absolute number once detail resolves (the player's
+  // episode label and the story-arc lookup read it).
   //
   // Only fires for episodes with season > 1 (S1 cour-relative ==
   // absolute, no conversion needed) AND when absolute_episode_num
@@ -8396,10 +8722,7 @@ export default function App() {
     // non-AIOMetadata sources, where the resolver falls back to the Fribb id-map
     // / SEQUEL-walk / title search.
     const needAnilist = activeTarget.anilist_id == null && e != null;
-    // Air date (and the title when the target lacks one) for Trakt's title +
-    // air-date fallback. Stamped once: `null` records "the VideoEntry has none".
-    const needRelease = activeTarget.episode_released === undefined && e != null;
-    if (!needAbsolute && !needAnilist && !needRelease) return;
+    if (!needAbsolute && !needAnilist) return;
     const targetId = activeTarget.id;
     const mediaType = activeTarget.media_type;
     const seriesId = activeTarget.series_id ?? targetId;
@@ -8417,13 +8740,14 @@ export default function App() {
         absoluteEp = priorCourEps + e;
       }
       // Embedded AniList pair from the VideoEntry the user is actually playing.
-      const vid = needAnilist || needRelease
+      // Also the episode title, when the target lacks one (History rows and the
+      // player read it).
+      const vid = needAnilist
         ? detail.videos.find((v) => v.id === targetId)
         : undefined;
       const aid = needAnilist ? vid?.anilist_id ?? null : null;
       const aep = needAnilist ? vid?.anilist_episode ?? null : null;
-      const released = needRelease ? (vid?.released ?? null) : undefined;
-      const vidTitle = needRelease ? (vid?.title || undefined) : undefined;
+      const vidTitle = needAnilist ? (vid?.title || undefined) : undefined;
       // Patch via functional setState — if the user has already swapped to a
       // different episode by the time the meta resolves, the id check refuses
       // to overwrite the new target with stale data.
@@ -8439,11 +8763,8 @@ export default function App() {
         ) {
           next = { ...next, anilist_id: aid, anilist_episode: aep };
         }
-        if (released !== undefined && prev.episode_released === undefined) {
-          next = { ...next, episode_released: released };
-          if (!prev.episode_title && vidTitle) {
-            next = { ...next, episode_title: vidTitle };
-          }
+        if (!prev.episode_title && vidTitle) {
+          next = { ...next, episode_title: vidTitle };
         }
         return next;
       });
@@ -8452,26 +8773,30 @@ export default function App() {
   }, [activeTarget, addons]);
 
   // ── Scrobble lifecycle (no-ops while activeTarget is null) ──
-  // `scope` keys the per-account Trakt token in the keyring, matching
+  // `scope` keys the per-account scrobble tokens in the keyring, matching
   // the layout in scrobble_auth.rs (first 12 chars of auth_key, or
   // "guest" when signed out). scrobble.rs reads this off the session
   // it receives at scrobble_start time.
   const scrobbleScope = session?.auth_key ? session.auth_key.slice(0, 12) : "guest";
   // Hand the scrobbler the last HONEST position. A truncated origin parks
   // `time` at `duration` (mpv keep-open `seek_to_last_frame`), and
-  // `scrobble_end` treats >= 80% as an unconditional "mark watched" on Trakt /
-  // AniList. `positionTrusted` below stops the auto-complete branch, but every
+  // `scrobble_end` treats >= 80% as an unconditional "mark watched" on AniList /
+  // Simkl. `positionTrusted` below stops the auto-complete branch, but every
   // TEARDOWN route into scrobble_end (exiting the player, switching episode,
   // beforeunload, unmount) reads the playback snapshot instead - so sanitizing
   // it here is what actually stops a dropped stream reporting a finished
   // episode.
-  const scrobbleTime = streamTruncated ? (lastSanePosRef.current ?? 0) : time;
+  const readScrobbleTime = useCallback(
+    () => (streamTruncatedRef.current ? (lastSanePosRef.current ?? 0) : getPlaybackTime()),
+    [streamTruncatedRef, lastSanePosRef],
+  );
   useScrobble({
     // Live TV channels / trailers never scrobble — there's no episode or
     // completion to report. Passing null keeps the hook fully inert for
     // `iptv:` and `trailer:` targets.
     active: isLivePlayback || isTrailerPlayback ? null : activeTarget,
-    playback: { time: scrobbleTime, duration, paused },
+    playback: { duration, paused },
+    readTime: readScrobbleTime,
     scope: scrobbleScope,
     // Belt to the sanitized playhead's braces: this gates the auto-complete
     // branch itself, so a truncation can never satisfy the 80% ratio even if
@@ -8499,7 +8824,6 @@ export default function App() {
     }
     interface RustResult {
       session_active: boolean;
-      trakt_fired: boolean;
       anilist_fired: boolean;
       simkl_fired: boolean;
       message: string;
@@ -8524,7 +8848,7 @@ export default function App() {
           is_anime:   isAnimeMeta(activeTarget),
           scope:      scrobbleScope,
           // Authoritative numeric S/E from the VideoEntry. scrobble.rs
-          // prefers these over the ID-string parse so the Trakt payload
+          // prefers these over the ID-string parse so the payload
           // matches what the user actually clicked in the picker — the
           // critical disambiguation for dual-numbered anime.
           season:      activeTarget.season ?? null,
@@ -8532,33 +8856,22 @@ export default function App() {
           // Series-root IMDb id, kept separate from imdb_id (which now
           // carries the kitsu/mal/anidb-shaped video id after the
           // AIOMetadata IMDb-anime patch). Mirrors the shape useScrobble
-          // sends for the live-playback path — without it, Trakt
-          // scrobble bails on "id format unsupported" because
-          // parse_trakt_target can't extract a show anchor from a
-          // non-tt video id, and the series_imdb_id fallback in
-          // scrobble.rs::trakt_targets has nothing to work with.
+          // sends for the live-playback path, so a non-tt video id still
+          // has a show anchor.
           series_imdb_id:
             activeTarget.series_id && activeTarget.series_id.startsWith("tt")
               ? activeTarget.series_id
               : (activeTarget.id.startsWith("tt")
                   ? activeTarget.id.split(":")[0]
                   : null),
-          // Absolute episode for Trakt's S1-absolute fallback. Stamped
-          // on activeTarget at handlePlayStream time from
-          // detail.videos prior-cour sums; the test fire reads it
-          // directly so DevConsole test runs cover the same retry
-          // path as live playback.
-          absolute_episode_num: activeTarget.absolute_episode_num ?? null,
-          episode_title:    activeTarget.episode_title ?? null,
-          episode_released: activeTarget.episode_released ?? null,
         };
         const r = await invoke<RustResult>("scrobble_test_fire", {
           session,
-          time,
-          duration,
+          time: wtTimeRef.current,
+          duration: durationLiveRef.current,
         });
         // Any provider firing is a pass; `message` carries each one's leg.
-        const fired = r.trakt_fired || r.anilist_fired || r.simkl_fired;
+        const fired = r.anilist_fired || r.simkl_fired;
         detail.respond({
           ok: fired,
           level: fired ? "info" : "warn",
@@ -8574,7 +8887,9 @@ export default function App() {
     };
     window.addEventListener("aura:devlogs-scrobble-test", handler);
     return () => window.removeEventListener("aura:devlogs-scrobble-test", handler);
-  }, [activeTarget, scrobbleScope, time, duration]);
+    // The playhead is read through refs at fire time: with `time` as a dep this
+    // listener was removed and re-added on every playback tick (~30x/sec).
+  }, [activeTarget, scrobbleScope]);
   // Scrobble-auth bell alerts run inside NotificationsBridge — see
   // its useScrobbleAuthAlerts(authKey) call below. Mounting them here
   // would crash because useNotifications() requires being inside the
@@ -9023,7 +9338,7 @@ export default function App() {
   const cast = useCastSession({
     streamUrl: activeStreamUrl,
     title: castTitle,
-    currentTime: time,
+    getCurrentTime: getPlaybackTime,
     paused,
   });
   // The next-episode pre-scan's cast gate (declared above, before `cast`
@@ -9083,14 +9398,14 @@ export default function App() {
   // (this was firing an invoke per time-pos event — a chunk of the live-
   // playback UI lag, where the position is meaningless anyway).
   const lastSmtcRef = useRef<string>("");
-  useEffect(() => {
+  usePlaybackClock((position) => {
     if (!activeTarget) return;
-    const payload = { playing: duration > 0, paused, position: Math.round(time) };
+    const payload = { playing: duration > 0, paused, position };
     const sig = `${payload.playing}|${payload.paused}|${payload.position}`;
     if (sig === lastSmtcRef.current) return;
     lastSmtcRef.current = sig;
     invoke("smtc_set_playback", payload).catch(() => {});
-  }, [activeTarget, paused, duration, time]);
+  }, [activeTarget, paused, duration], Math.round);
 
   // Wheel-to-volume lives in PlayerOverlay's own window wheel listener (it adds
   // the on-screen toast and honors VOLUME_MAX = 150). A duplicate handler used
@@ -9129,7 +9444,7 @@ export default function App() {
   const lastLoadedRef   = useRef<{
     time: number; duration: number; watched: number; targetId: string | null;
   }>({ time: 0, duration: 0, watched: 0, targetId: null });
-  useEffect(() => {
+  usePlaybackClock((time) => {
     playbackRef.current = { time, duration };
     // Never stamp a position the demuxer cannot actually hold. `flushProgress`
     // exempts this snapshot from its truncation guard on the grounds that it
@@ -9154,7 +9469,7 @@ export default function App() {
         targetId: activeTargetRef.current?.id ?? null,
       };
     }
-  }, [time, duration, watchedElapsedRef]);
+  }, [duration, watchedElapsedRef]);
   /** Episode id whose History row was already written by the 80 %
    *  auto-complete path (onAdvance) for the CURRENT play. Lets
    *  handleExitPlayback skip its duplicate append (addHistoryEntry
@@ -9244,6 +9559,10 @@ export default function App() {
           const recordId  = target.series_id ?? target.id;
           const isEpisode = target.series_id != null && target.series_id !== target.id;
           const stamp     = new Date().toISOString();
+          // A position written after a Reset Progress / CW clear supersedes
+          // that clear: drop the id from the post-clear overlay, or the next
+          // loadLibrary inside its 5-minute window re-zeroes this new position.
+          recentlyCleared.current.delete(recordId);
           setLibrary((prev) => {
             const idx = prev.findIndex((i) => i.id === recordId);
             if (idx < 0) {
@@ -9428,7 +9747,26 @@ export default function App() {
   // ── Exit playback ────────────────────────────────────────────────────
   // Flushes progress, stops MPV, clears the active target. Triggered by the
   // PlayerOverlay's "Exit playback" button (and keybinding if configured).
+  // Bumped by any caller that sets its own episode hint while an exit is in
+  // flight (the EOS Episodes panel). The exit's trailing "just played" hint
+  // lands after two awaits, in the same batch as setActiveTarget(null), so it
+  // would otherwise overwrite the clicked episode before DetailView mounts.
+  const episodeHintSeqRef = useRef(0);
   const handleExitPlayback = useCallback(async () => {
+    const hintSeq = episodeHintSeqRef.current;
+    // Read through refs rather than closed over: `time` and `duration` change
+    // ~30x/sec during playback, and as deps they re-created this callback on
+    // every tick, which re-subscribed the app-wide Escape listener and every
+    // callback built on this one at the same rate. Each ref mirrors the latest
+    // render, which is what the re-created closure used to hold.
+    const time = wtTimeRef.current;
+    const duration = durationLiveRef.current;
+    const library = libraryRef.current;
+    const selectedMeta = selectedMetaRef.current;
+    playRequestRef.current += 1;
+    // A link re-read in flight stands down with the play (above), so its
+    // pending row clears now rather than when the fetch returns.
+    clearLinkRefresh();
     liveSkipStampRef.current = null;
     autoAdvanceStreakRef.current = 0; // fresh start: reset the still-watching streak (#5)
     // Stop the skip detector with the playback: retire this load's skip chain
@@ -9519,7 +9857,6 @@ export default function App() {
           season,
           episode,
           episode_title: activeTarget.episode_title ?? null,
-          episode_released: activeTarget.episode_released ?? null,
           played_at:     new Date().toISOString(),
           duration:      dur || undefined,
           watched_seconds: watched,
@@ -9615,7 +9952,7 @@ export default function App() {
     // player exits, independent of the activeTarget-reset effect's
     // ordering (the Spotlight's own Exit button routes here).
     setEosActive(false);
-    if (isSeriesEpisode && playedEpisodeId) {
+    if (isSeriesEpisode && playedEpisodeId && episodeHintSeqRef.current === hintSeq) {
       // DetailView reads this once on mount, opens the episode panel,
       // selects the right season, and scrolls the matching row to the
       // top of the list (or highlights it if the list can't scroll
@@ -9623,7 +9960,7 @@ export default function App() {
       // unrelated DetailView open doesn't inherit the hint.
       setLastPlayedEpisodeId(playedEpisodeId);
     }
-  }, [session, flushProgress, activeTarget, isLivePlayback, isTrailerPlayback, time, duration, library, selectedMeta]);
+  }, [session, flushProgress, activeTarget, isLivePlayback, isTrailerPlayback]);
 
   // ── Live channel auto-retry (leeway before the broken-stream modal) ──
   // IPTV channels hiccup constantly on the provider side (transient 5xx,
@@ -9767,6 +10104,9 @@ export default function App() {
     if (vodRetryRef.current >= VOD_MAX_RETRIES) { setVodReconnecting(false); return; }
     const attempt = vodRetryRef.current + 1;
     vodRetryRef.current = attempt;
+    // A stream that opened but does not decode is not a transient: re-sending
+    // the same url gets the same bytes. Go straight to re-reading the source.
+    const undecodable = undecodableRef.current;
     // Resume where the break happened. `ownedTime()` is null when no frame
     // ever arrived for THIS file, which is precisely when the ORIGINAL
     // requested offset is the right answer - without the fallback, retrying a
@@ -9804,7 +10144,7 @@ export default function App() {
     // debrid, a fresh upstream link), which is the ONLY client-side move with
     // a real chance. Falls back to the plain reload whenever it cannot find
     // the same source again - a wrong source is worse than a retry that fails.
-    const reResolve = attempt >= 2 && !isTrailerPlayback && !!activeTarget && !!currentStream;
+    const reResolve = (attempt >= 2 || undecodable) && !isTrailerPlayback && !!activeTarget && !!currentStream;
     // Everything below the timeout is fire-and-forget, and `fetch_streams` can
     // run for tens of seconds while the UI stays interactive (the reconnect
     // pill is pointer-events-none; Escape still exits the player). Without a
@@ -9844,7 +10184,7 @@ export default function App() {
       // re-sends the url that just died and burns the last retry. An embedded
       // source the fan-out does not offer finds no match below and takes the
       // plain reload, which is the most it could have had anyway.
-      console.info("[playback] auto-retry 2 - re-resolving the source for a fresh link");
+      console.info(`[playback] auto-retry ${attempt} - re-resolving the source for a fresh link${undecodable ? " (the stream did not decode)" : ""}`);
       invoke<StreamFetchResult>("fetch_streams", {
         addons: queryAddons,
         mediaType: tgt.media_type,
@@ -9861,7 +10201,7 @@ export default function App() {
           // Same identity test the source switcher uses (info_hash, else
           // addon + filename). Matching on url would defeat the point: the
           // whole reason for re-resolving is that the url has changed.
-          const match = rows.find((row) => sameStreamSource(row, currentStream));
+          const match = pickRefreshedSource(rows, currentStream!, sameStreamSource);
           if (!match) {
             console.warn("[playback] re-resolve found no matching source - falling back to a plain reload");
             plainReload();
@@ -10088,6 +10428,9 @@ export default function App() {
     // openInStreamsMode hint takes precedence in DetailView's panelMode
     // init; without it the user would land on the episodes-list view
     // and have to click the episode again to reach the streams panel.
+    // The bump stops the exit above (still awaiting stop_video) from
+    // replacing this hint with the episode that just finished.
+    episodeHintSeqRef.current += 1;
     setLastPlayedEpisodeId(video.id);
     setIgnoreResumeOnNextOpen(false);
     setOpenInStreamsMode(true);
@@ -10509,6 +10852,7 @@ export default function App() {
     // dep array deliberately doesn't include `time`, otherwise Discord
     // would get spammed every second.
     let startedAt = presenceStartedAt.current ?? 0;
+    const time = getPlaybackTime();
     if (isPlayback && useTimestamp && time > 0 && !isLivePlayback) {
       startedAt = Math.floor(Date.now() / 1000) - Math.floor(time);
     }
@@ -10559,14 +10903,14 @@ export default function App() {
         // OAuth callback from the VPS proxy at aura.animasec.dev. The
         // proxy exchanges the provider's authorization code for an
         // access_token (using the client_secret it holds), then
-        // redirects the browser at `aura://oauth/{trakt,anilist}?...`
+        // redirects the browser at `aura://oauth/anilist?...`
         // with the token + refresh + expires + username in query
         // params. We persist the token via the Tauri command and
         // surface a toast so the user knows the connection landed.
         // Simkl arrives here too, as `aura://oauth/simkl?...`, re-emitted
         // by the loopback listener after IT exchanged the code (PKCE, no
         // proxy). Its `expires` is absolute unix seconds, the same unit
-        // the proxy sends for Trakt / AniList, so it is stored as is.
+        // the proxy sends for AniList, so it is stored as is.
         if (url.hostname === "oauth") {
           const service = url.pathname.replace(/^\//, "").toLowerCase();
           if (!isScrobbleService(service)) return;
@@ -10689,6 +11033,12 @@ export default function App() {
       markReady();
       return;
     }
+    // The onboarding wizard replaces Home, so `aura:home-ready` would never
+    // come and a restored session would wait out the whole hard timeout.
+    if (onboardingActive) {
+      markReady();
+      return;
+    }
 
     const onHomeReady = () => markReady();
     window.addEventListener("aura:home-ready", onHomeReady, { once: true });
@@ -10700,7 +11050,59 @@ export default function App() {
       window.removeEventListener("aura:home-ready", onHomeReady);
       clearTimeout(hardTimeout);
     };
-  }, [authChecked, session, landingDismissed]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [authChecked, session, landingDismissed, onboardingActive]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // A notification row click (NotificationsBridge's `aura:open-meta`). A stable
+  // callback reading the library through libraryRef: as an inline closure in
+  // the JSX it changed on every App render, so the bridge removed and re-added
+  // its window listener on every playback tick (~30x/sec).
+  const openMetaFromNotification = useCallback((metaId: string, mediaType?: string, videoId?: string) => {
+    // Reconstruct a MetaPreview from the LibraryItem when available
+    // (covers the scanner's episode notifications since they always
+    // refer to a series the user has in their library). Falls back to
+    // a minimal stub when not: DetailView's own meta-fetch will
+    // still resolve poster / background once it mounts.
+    const lib = libraryRef.current.find((i) => i.id === metaId);
+    const stub: MetaPreview = lib
+      ? {
+          id:           lib.id,
+          name:         lib.name,
+          media_type:   lib.media_type,
+          poster:       lib.poster,
+          background:   lib.background,
+          fanart:       null,
+          backdrop:     null,
+          logo:         lib.logo,
+          release_info: lib.year,
+          description:  null,
+          imdb_rating:  null,
+          genres:       [],
+        }
+      : {
+          id:           metaId,
+          name:         metaId,
+          media_type:   mediaType ?? "series",
+          poster:       null,
+          background:   null,
+          fanart:       null,
+          backdrop:     null,
+          logo:         null,
+          release_info: null,
+          description:  null,
+          imdb_rating:  null,
+          genres:       [],
+        };
+    // Force-route to Home so the detail overlay anchors over the home
+    // backdrop: Library or other views also work but Home is the
+    // bell's host so the user expects to land there on a click.
+    setActiveCatalog(null);
+    setActiveView("home");
+    if (videoId) {
+      setLastPlayedEpisodeId(videoId); // season select + scroll-to-row
+      setDeepLinkEpisodeId(videoId);   // selection ring (notification only)
+    }
+    openDetail(stub);
+  }, [openDetail]);
 
   // Show landing when no session AND user hasn't yet chosen guest mode.
   const showLanding = !session && !landingDismissed;
@@ -10718,55 +11120,13 @@ export default function App() {
       // bubble would either be hidden (playback unmounts the bell)
       // or distracting (over the DetailView's tech-noir layout).
       // The most-recently-suppressed candidate is shown the next
-      // time the user navigates back to a bell-visible surface.
-      popupSuppressed={isPlayerActive || selectedMeta != null}
-      onOpenMeta={(metaId, mediaType, videoId) => {
-        // Reconstruct a MetaPreview from the LibraryItem when available
-        // (covers the scanner's episode notifications since they always
-        // refer to a series the user has in their library). Falls back to
-        // a minimal stub when not — DetailView's own meta-fetch will
-        // still resolve poster / background once it mounts.
-        const lib = library.find((i) => i.id === metaId);
-        const stub: MetaPreview = lib
-          ? {
-              id:           lib.id,
-              name:         lib.name,
-              media_type:   lib.media_type,
-              poster:       lib.poster,
-              background:   lib.background,
-              fanart:       null,
-              backdrop:     null,
-              logo:         lib.logo,
-              release_info: lib.year,
-              description:  null,
-              imdb_rating:  null,
-              genres:       [],
-            }
-          : {
-              id:           metaId,
-              name:         metaId,
-              media_type:   mediaType ?? "series",
-              poster:       null,
-              background:   null,
-              fanart:       null,
-              backdrop:     null,
-              logo:         null,
-              release_info: null,
-              description:  null,
-              imdb_rating:  null,
-              genres:       [],
-            };
-        // Force-route to Home so the detail overlay anchors over the home
-        // backdrop — Library or other views also work but Home is the
-        // bell's host so the user expects to land there on a click.
-        setActiveCatalog(null);
-        setActiveView("home");
-        if (videoId) {
-          setLastPlayedEpisodeId(videoId); // season select + scroll-to-row
-          setDeepLinkEpisodeId(videoId);   // selection ring (notification only)
-        }
-        openDetail(stub);
-      }}
+      // time the user navigates back to a bell-visible surface. The
+      // onboarding wizard holds it too (entries still reach the bell).
+      popupSuppressed={isPlayerActive || selectedMeta != null || onboardingActive}
+      // The one-time "Send HDR?" offer: never on the landing screen or
+      // under the setup wizard (a first run gets the default instead).
+      hdrOfferEligible={authChecked && !showLanding && !onboardingActive}
+      onOpenMeta={openMetaFromNotification}
     />
     {/* Boot splash — stays up until bootReady (all catalog rows settled +
         HeroCarousel stable) so the hero doesn't flicker on first paint.
@@ -10805,11 +11165,13 @@ export default function App() {
         />
       ) : onboardingActive && !isPlayerActive ? (
         <OnboardingView
+          key={onboardingKey}
+          mode={onboardingMode}
           session={session}
           addons={addons}
+          addonListReady={!session?.auth_key || syncedAccount === session.auth_key}
           onAccountChanged={handleAccountChanged}
           isAddonListSynced={isAddonListSynced}
-          startAtAddons={onboardingStartAddons}
           onAddonInstalled={(entry) => {
             addonsGenRef.current += 1;
             setAddons((prev) =>
@@ -10818,10 +11180,7 @@ export default function App() {
             patchCloudAddonCache((cached) =>
               cached.some((a) => a.url === entry.url) ? null : [...cached, entry]);
           }}
-          onComplete={() => {
-            setOnboardingActive(false);
-            setOnboardingStartAddons(false);
-          }}
+          onComplete={() => setOnboardingActive(false)}
         />
       ) : (
       <div
@@ -10833,7 +11192,11 @@ export default function App() {
           isPlayerActive ? "hidden" : ""
         }`}
       >
-      {/* ── Nav sidebar (floating glass island) ── */}
+      {/* ── Left rail (Direction A): ONE floating glass surface holding the
+          User Panel, Watch Party, the nav and Notifications. An in-flow flex
+          item (204 px), so the page column starts at 12 + 204 + 12 = 228 px
+          and nothing scrolls under it; it hides with the body during
+          playback. Its popups portal into a host beside it (RailRow). ── */}
       <NavSidebar
         active={activeView}
         onNavigate={(view) => {
@@ -10851,112 +11214,50 @@ export default function App() {
         userEmail={session?.email ?? null}
         onLoginRequest={() => setShowLogin(true)}
         onLogout={handleLogout}
+        library={library}
+        covered={!!selectedMeta && !isPlayerActive}
       />
 
       {/* ── Main content area ── */}
-      {/* `key={activeView}` is what makes the fade replay: only one view is
-          mounted at a time and switching already unmounts the old one, so the
-          key changes nothing structurally, it just gives the wrapper a fresh
-          identity per view so the enter animation re-triggers.
-          .aura-view-enter is opacity-only ON PURPOSE - see the note on it in
-          App.css before adding any transform here. */}
-      <div
-        key={activeView}
-        className="aura-view-enter flex-1 flex flex-col min-w-0 overflow-hidden"
-      >
-        {activeView === "home" && (
-          <HomeView
-            addons={addons}
-            session={session}
-            library={library}
-            onSelectMeta={openDetail}
-            onSelectFromCW={openDetailFromCW}
-            resetKey={homeResetKey}
-            externalQuery={deepLinkSearch}
-            onExternalQueryConsumed={() => setDeepLinkSearch(null)}
-          />
-        )}
-        {activeView === "library" && (
-          <LibraryView
-            library={libraryKnown ? library : undefined}
-            loadFailed={libraryLoadFailed}
-            onRetryLoad={retryLibraryLoad}
-            session={session}
-            onSelectMeta={openDetail}
-            onRemoveItem={handleLibraryRemove}
-            onAutoRemoveSweep={handleAutoRemoveSweep}
-          />
-        )}
-        {activeView === "addons" && (
-          <AddonsView
-            addons={addons}
-            session={session}
-            onAdd={handleAddonAdded}
-            onRemove={handleAddonRemoved}
-            onRefreshed={handleAddonRefreshed}
-            onReorder={handleAddonsReorder}
-            onAccountChanged={handleAccountChanged}
-            isAddonListSynced={isAddonListSynced}
-            currentSession={currentSession}
-            onLoginSuccess={handleLoginSuccess}
-            onLogout={handleLogout}
-            onSessionExpired={handleSessionExpired}
-          />
-        )}
-        {activeView === "discover" && (
-          <DiscoverView addons={addons} onSelectMeta={openDetail} />
-        )}
-        {activeView === "live" && (
-          <LiveView
-            active={activeView === "live"}
-            playerActive={isPlayerActive}
-            onPlayChannel={handlePlayChannel}
-          />
-        )}
-        {activeView === "calendar" && (
-          <CalendarView library={library} addons={addons} onSelectMeta={openDetail} />
-        )}
-        {activeView === "history" && (
-          <HistoryView onSelectMeta={openDetail} />
-        )}
-        {activeView === "queue" && (
-          <QueueView
-            library={library}
-            libraryLoaded={libraryKnown && !libraryLoadFailed}
-            loadFailed={libraryLoadFailed}
-            onRetryLoad={retryLibraryLoad}
-            addons={addons}
-            onSelectMeta={openDetail}
-          />
-        )}
-        {activeView === "airing" && (
-          <AiringView library={library} addons={addons} onSelectMeta={openDetail} />
-        )}
-        {activeView === "settings" && (
-          <SettingsView addons={addons} session={session} />
-        )}
-      </div>
-
-      {/* Account button — top-left, below the title bar's
-          ServiceStatusChip. Same body-level placement as the bell /
-          refresh below so all three floating account/notification
-          affordances inherit the `hidden` class during playback. */}
-      <AccountButton
-        loggedIn={!!session?.auth_key}
-        email={session?.email ?? null}
-        onLoginRequest={() => setShowLogin(true)}
+      {/* PageColumn is memoized for playback: the page stays mounted (hidden)
+          under the player, and App re-renders on every playback position
+          tick. See PageColumn below. */}
+      <PageColumn
+        activeView={activeView}
+        // An open Detail page covers this view: the cursor light skips it.
+        // selectedMeta, not detailShown, so the page lights again during
+        // the exit fade.
+        covered={!!selectedMeta && !isPlayerActive}
+        playerActive={isPlayerActive}
+        // Home stays mounted under a Detail page and under playback:
+        // the hero holds its slide there instead of auto-advancing.
+        heroPaused={selectedMeta != null || isPlayerActive}
+        addons={addons}
+        session={session}
+        library={library}
+        libraryKnown={libraryKnown}
+        libraryLoadFailed={libraryLoadFailed}
+        homeResetKey={homeResetKey}
+        deepLinkSearch={deepLinkSearch}
+        onDeepLinkConsumed={onDeepLinkConsumed}
+        onSelectMeta={openDetail}
+        onSelectFromCW={openDetailFromCW}
+        onRetryLoad={retryLibraryLoad}
+        onRemoveItem={handleLibraryRemove}
+        onAutoRemoveSweep={handleAutoRemoveSweep}
+        onAddonAdd={handleAddonAdded}
+        onAddonRemove={handleAddonRemoved}
+        onAddonRefreshed={handleAddonRefreshed}
+        onAddonsReorder={handleAddonsReorder}
+        onAccountChanged={handleAccountChanged}
+        isAddonListSynced={isAddonListSynced}
+        currentSession={currentSession}
+        onLoginSuccess={handleLoginSuccess}
         onLogout={handleLogout}
+        onSessionExpired={handleSessionExpired}
+        onPlayChannel={handlePlayChannel}
       />
-      {/* Notifications bell — fixed bottom-3 left-3, rendered INSIDE
-          the app body so it inherits the `hidden` class during
-          playback and unmounts visually when the player owns the
-          screen. Living here (rather than inside HomeView) lets the
-          bell appear on every main tab (Home, Library, Calendar,
-          Addons, Settings); the NotificationsProvider above keeps
-          state continuous. The manual library-refresh control now
-          lives inside this bell's popup header. */}
-      <NotificationsBell library={library} />
-      <PartyButton />
+
       {/* "Vote to Watch" stack — active polls + won winners + cap errors.
           Renders nothing unless in a party with something to show. Suppressed
           on detail pages / during playback so it never overlaps the
@@ -11013,10 +11314,16 @@ export default function App() {
           // clicks on the Reload / Exit buttons pass through to
           // PlayerOverlay's video-click handler (togglePause) instead
           // of landing on the modal.
-          className="fixed inset-0 z-[10500] flex items-center justify-center
-                     bg-black/75 backdrop-blur-md animate-[fade-in_120ms_ease-out]"
+          className="fixed inset-0 z-[10500] flex items-center justify-center"
         >
-          <div className="aura-glass-menu rounded-2xl max-w-[420px] w-[92%] p-6 text-white">
+          {/* The dim is a SIBLING layer (the ConfirmDialog pattern), and the
+              card is a PLAYER surface: it floats over the mpv video, which no
+              backdrop pass can sample, so it takes the player material. */}
+          <div aria-hidden className="aura-modal-backdrop-in absolute inset-0 bg-black/75 backdrop-blur-md" />
+          <div
+            className="aura-glass-player aura-glass-pop-in relative rounded-2xl max-w-[420px] w-[92%] p-6 text-white"
+            style={{ "--lg-origin": "50% 50%" } as React.CSSProperties}
+          >
             <h2 className="text-[16px] font-semibold tracking-tight mb-2">
               {isLivePlayback
                 ? (firstFrameSeen ? "Channel connection lost" : "Channel unavailable")
@@ -11045,9 +11352,8 @@ export default function App() {
               <button
                 type="button"
                 onClick={() => { setStreamBroken(false); handleExitPlayback(); }}
-                className="px-4 py-2 rounded-lg text-[13px] font-medium tracking-wide
-                           text-white/85 bg-white/[0.06] border border-white/12
-                           hover:bg-white/[0.10] hover:text-white transition-colors"
+                className="aura-glass-flat aura-glass-press px-4 py-2 rounded-lg text-[13px] font-medium tracking-wide
+                           text-white/85 hover:text-white"
               >
                 Exit player
               </button>
@@ -11066,9 +11372,8 @@ export default function App() {
                     setStreamBroken(false);
                     window.dispatchEvent(new CustomEvent("aura:open-source-switcher"));
                   }}
-                  className="px-4 py-2 rounded-lg text-[13px] font-medium tracking-wide
-                             text-white/85 bg-white/[0.06] border border-white/12
-                             hover:bg-white/[0.10] hover:text-white transition-colors"
+                  className="aura-glass-flat aura-glass-press px-4 py-2 rounded-lg text-[13px] font-medium tracking-wide
+                             text-white/85 hover:text-white"
                 >
                   Switch source
                 </button>
@@ -11149,10 +11454,8 @@ export default function App() {
                     console.error("Reload failed", e);
                   }
                 }}
-                className="px-4 py-2 rounded-lg text-[13px] font-medium tracking-wide
-                           text-ln-accent bg-ln-accent/15 border border-ln-accent/35
-                           hover:bg-ln-accent/25 hover:border-ln-accent/55
-                           transition-colors"
+                className="aura-glass-flat is-primary aura-glass-press px-4 py-2 rounded-lg text-[13px]
+                           font-medium tracking-wide"
               >
                 {isTrailerPlayback ? "Reload trailer" : "Reload stream"}
               </button>
@@ -11172,7 +11475,6 @@ export default function App() {
           trailerMaxHeight={trailerMaxHeight}
           isTrailerResolving={isTrailerResolving}
           onSetTrailerQuality={handleSetTrailerQuality}
-          time={time}
           duration={duration}
           paused={paused}
           volume={volume}
@@ -11186,6 +11488,7 @@ export default function App() {
           // controls playback" hint; local-only controls stay live.
           partyFollower={reactiveParty.status === "connected" && !reactiveParty.isLeader && reactiveParty.inSync}
           onControlsVisibleChange={setPlayerControlsVisible}
+          castActive={castBusy}
           togglePause={wtTogglePause}
           seekRelative={wtSeekRelative}
           seekAbsolute={wtSeekAbsolute}
@@ -11212,8 +11515,9 @@ export default function App() {
             titleOverrides?.audio_lang ?? null
           }
           preferredSubLang={
-            // Per-title sub_lang override beats the global default.
-            titleOverrides?.sub_lang ?? subtitleLanguage
+            // Per-title sub_lang override beats the global default. An empty
+            // one (PlayerOverlay clears a per-title Off that way) is no override.
+            titleOverrides?.sub_lang || subtitleLanguage
           }
           selectableSubLangs={selectableSubLangs}
           scoringMeta={activeScoringMeta}
@@ -11296,7 +11600,11 @@ export default function App() {
       {/* Watch-Together room panel — opened from the More menu. Available
           whenever the app is up (you can set the relay URL / create a room
           before playback), so it's not gated on activeTarget. */}
-      <WatchTogetherPanel open={watchPanelOpen} onClose={() => setWatchPanelOpen(false)} />
+      <WatchTogetherPanel
+        open={watchPanelOpen}
+        onClose={() => setWatchPanelOpen(false)}
+        overPlayer={isPlayerActive}
+      />
       {cast.activeDevice && (
         <CastSessionBar
           deviceName={cast.activeDevice.name}
@@ -11322,6 +11630,9 @@ export default function App() {
           the click. */}
       {/* StackPresence fades the card out instead of dropping it (a Play, a
           dismiss, the end screen taking over); not when leaving the player. */}
+      {/* PlaybackTimeView: the card's notes follow the playhead, so this piece
+          (not App) re-renders per tick. Refs read inside it are read per tick. */}
+      <PlaybackTimeView>{(time) => (
       <StackPresence animate={isPlayerActive}>
       {!eosActive && isPlayerActive && nextUpInfo && nextUpVisible && (
         <NextUpCta
@@ -11368,12 +11679,14 @@ export default function App() {
         />
       )}
       </StackPresence>
+      )}</PlaybackTimeView>
 
       {/* The card's banner on its own, for an episode with no card to carry it
           (no next episode: the latest aired one, a finale; or the lookup
           failed). Same gate as the card, so it is not shown with the Next-Up
           lead time at 0 or after the card was dismissed, and it goes with the
           note once the ending is over. */}
+      <PlaybackTimeView>{(time) => (
       <StackPresence animate={isPlayerActive}>
       {!eosActive && isPlayerActive && !nextUpInfo && activeTarget
         && nextUpDismissedFor.current !== activeTarget.id
@@ -11394,6 +11707,7 @@ export default function App() {
           ) : null;
         })()}
       </StackPresence>
+      )}</PlaybackTimeView>
 
       {/* ── EOS Spotlight — full-screen end-of-stream surface (spec
           2026-05-19). App-level sibling like NextUpCta / the recovery
@@ -11485,8 +11799,10 @@ export default function App() {
       )}
 
       {/* Detail view — shared-element open from the clicked card.
-          Strictly unmounted while a stream is active. */}
-      {selectedMeta && !isPlayerActive && (
+          Strictly unmounted while a stream is active (Play drops it at once,
+          with no exit fade over the mpv load). After a close it stays mounted
+          for DETAIL_EXIT_MS as `detailExit`, inert, fading over the page. */}
+      {detailShown && !isPlayerActive && (
         <DetailView
           // KEYED, and this is load-bearing rather than a micro-optimisation in
           // reverse. Swapping `selectedMeta` in place (a Related-tab click, a
@@ -11501,14 +11817,20 @@ export default function App() {
           // them live in a child this component cannot reach, and the next
           // field anyone adds would silently miss the list. `media_type` is in
           // the key because isEpisodic, the meta URL and the stream fetch all
-          // fork on it, so a same-id type change has to remount too.
-          key={`${selectedMeta.media_type}:${selectedMeta.id}`}
-          meta={selectedMeta}
+          // fork on it, so a same-id type change has to remount too. The
+          // trailing open generation keeps the key steady through the exit
+          // fade and gives any reopen (even of the same title, e.g. from
+          // Continue Watching, which must re-read the resume hint) a fresh
+          // instance instead of the leaving one.
+          key={`${detailShown.meta.media_type}:${detailShown.meta.id}:${detailShown.gen}`}
+          closing={!selectedMeta}
+          meta={detailShown.meta}
           addons={addons}
           fromRect={selectedRect}
           partyStreamKey={reactiveParty.status === "connected" ? reactiveParty.roomStreamKey : null}
           onClose={closeDetail}
           onPlayStream={handlePlayStream}
+          linkRefresh={linkRefresh}
           onSearchByName={(name) => {
             // Cast / crew / staff / related-title click: flip to Home and queue
             // the name as the search query. DetailView calls onClose() right
@@ -11518,30 +11840,30 @@ export default function App() {
             setActiveCatalog(null);
             setDeepLinkSearch(name);
           }}
-          inLibrary={library.some((i) => i.id === selectedMeta.id && !i.removed)}
-          onLibraryToggle={(origin) => handleLibraryToggle(selectedMeta, origin)}
+          inLibrary={library.some((i) => i.id === detailShown.meta.id && !i.removed)}
+          onLibraryToggle={(origin) => handleLibraryToggle(detailShown.meta, origin)}
           onQueueToggle={(origin) => {
             // Same behaviour as the catalog context menu's Mark as Planned, on
             // purpose: the queue has ONE rule set and two entry points, rather
             // than two implementations that can drift. Auto-add to library on
             // queue is part of that rule set, skipped when already in the
             // library so the toggle's own confirm toast does not fire twice.
-            const isPlanned = getManualWatchedState(selectedMeta.id) === "planned";
+            const isPlanned = getManualWatchedState(detailShown.meta.id) === "planned";
             const next = isPlanned ? null : "planned";
-            setManualWatchedState(selectedMeta.id, next);
+            setManualWatchedState(detailShown.meta.id, next);
             showFlyUpToast(
               next
-                ? `Added to Queue · ${selectedMeta.name}`
-                : `Removed from Queue · ${selectedMeta.name}`,
+                ? `Added to Queue · ${detailShown.meta.name}`
+                : `Removed from Queue · ${detailShown.meta.name}`,
               {
                 x: origin?.x ?? window.innerWidth / 2,
                 y: origin?.y ?? window.innerHeight / 2,
                 tone: next ? "success" : "default",
               },
             );
-            const inLib = library.some((i) => i.id === selectedMeta.id && !i.removed);
+            const inLib = library.some((i) => i.id === detailShown.meta.id && !i.removed);
             if (next === "planned" && session?.auth_key && !inLib) {
-              handleLibraryToggle(selectedMeta);
+              handleLibraryToggle(detailShown.meta);
             }
           }}
           onPlayTrailer={handlePlayTrailer}
@@ -11675,8 +11997,11 @@ export default function App() {
 
       {/* First-run crash reporting consent dialog. Renders only when the
           persisted `crash_reporting_consent` setting is `null` (the user
-          has never been asked). Self-dismisses on either choice. */}
-      <CrashReportingConsent />
+          has never been asked). Self-dismisses on either choice. Held off
+          the landing screen and the setup wizard (the wizard's Welcome step
+          asks the same question inline); a wizard closed without an answer
+          leaves consent null, so the dialog shows once it is gone. */}
+      {!showLanding && !onboardingActive && <CrashReportingConsent />}
 
       {/* Resume-from-progress prompt. Set by handlePlayStream when the
           target has a non-trivial saved timeOffset; the user picks
@@ -11703,8 +12028,10 @@ export default function App() {
 //      so its useNotifications() hook can resolve the context.
 // ---------------------------------------------------------------------------
 
-function NotificationsBridge({
-  library, authKey, popupSuppressed,
+// Memoized: rendered by App, which re-renders on every playback tick, while
+// every prop it takes is stable through playback.
+const NotificationsBridge = memo(function NotificationsBridge({
+  library, authKey, popupSuppressed, hdrOfferEligible,
   onOpenMeta,
 }: {
   library: LibraryItem[];
@@ -11715,6 +12042,11 @@ function NotificationsBridge({
    *  to NotificationsContext so the popup bubble is held until the
    *  user navigates back to a bell-visible surface. */
   popupSuppressed: boolean;
+  /** The app is past the landing screen and the setup wizard, so the
+   *  one-time HDR offer (useHdrPassthroughOffer), the new look options
+   *  notice (useMaterialNotice) and the audio order notice
+   *  (useAudioOrderNotice) may run. */
+  hdrOfferEligible: boolean;
   onOpenMeta: (metaId: string, mediaType?: string, videoId?: string) => void;
 }) {
   const { addNotification, setPopupSuppressed, notifications, dismissNotification } = useNotifications();
@@ -11747,12 +12079,16 @@ function NotificationsBridge({
   useEffect(() => {
     setPopupSuppressed(popupSuppressed);
   }, [popupSuppressed, setPopupSuppressed]);
-  // Scrobble-auth bell alerts: surfaces expired Trakt / AniList tokens
+  // Scrobble-auth bell alerts: surfaces expired AniList / Simkl tokens
   // in the bell so the user notices without opening Settings. Mounted
   // here (inside NotificationsProvider) so its useNotifications() call
   // resolves the context. The earlier App-body placement crashed at
   // first render — the provider hadn't been entered yet.
   useScrobbleAuthAlerts(authKey);
+  useHdrPassthroughOffer(hdrOfferEligible);
+  useMaterialNotice(hdrOfferEligible);
+  // The one-time audio order repair's notice (with Undo), same gate.
+  useAudioOrderNotice(hdrOfferEligible);
 
   // aura:update-dismissed-to-bell — owned by another agent's auto-updater.
   // Detail shape is documented in NotificationsContext: { tagName, htmlUrl,
@@ -11786,26 +12122,35 @@ function NotificationsBridge({
     return () => window.removeEventListener("aura:update-dismissed-to-bell", handler);
   }, [addNotification]);
 
-  // aura:notify-scrobble-onboarding — fired by OnboardingView.handleFinish
-  // ONLY on the FIRST completion (markOnboardingComplete returns true).
-  // Replaces the in-wizard "Track what you watch" section that was
-  // routinely skipped past; surfacing scrobble support as a one-time
-  // bell-badge entry after the user lands on the home view gets
-  // discovered more reliably. Stable id makes a re-fire on rapid
-  // remount idempotent.
+  // aura:notify-scrobble-onboarding: fired by OnboardingView's finish ONLY
+  // on the FIRST completion, when the wizard's tracking step was never
+  // reached and no scrobble service is connected (guests included). A
+  // one-time bell entry pointing at Settings > Scrobbling. Stable id makes
+  // a re-fire on rapid remount idempotent.
   useEffect(() => {
     const onPing = () => {
       addNotification({
         id: "notice:scrobble-onboarding",
         kind: "notice",
         title: "Track your watch history",
-        subtitle: "Connect Trakt and AniList to sync watch progress automatically. Click to open the scrobble settings.",
+        subtitle: SCROBBLE_ONBOARDING_SUBTITLE,
         data: { settingsSection: "sec-scrobble" },
       });
     };
     window.addEventListener("aura:notify-scrobble-onboarding", onPing);
     return () => window.removeEventListener("aura:notify-scrobble-onboarding", onPing);
   }, [addNotification]);
+  // ...and it goes away once any service is connected: a sign-in still
+  // pending when the wizard finished, a connection snapshot that had not
+  // resolved yet at Finish, or a connection made later from Settings.
+  const scrobbleConn = useScrobbleConnections();
+  const anyScrobbleConnected = connectedServices(scrobbleConn).length > 0;
+  useEffect(() => {
+    if (!anyScrobbleConnected) return;
+    if (notifications.some((n) => n.id === "notice:scrobble-onboarding")) {
+      dismissNotification("notice:scrobble-onboarding");
+    }
+  }, [anyScrobbleConnected, notifications, dismissNotification]);
 
   // aura:script-fallback — fired by the Rust player::init_mpv when its
   // first init attempt fails and the retry-without-script succeeds. We
@@ -11890,4 +12235,150 @@ function NotificationsBridge({
       library={library}
     />
   );
+});
+
+type PageViewProps<C> = C extends (props: infer P) => unknown ? P : never;
+
+interface PageColumnProps {
+  activeView: NavView;
+  covered: boolean;
+  playerActive: boolean;
+  heroPaused: boolean;
+  addons: AddonEntry[];
+  session: UserSession | null;
+  library: LibraryItem[];
+  libraryKnown: boolean;
+  libraryLoadFailed: boolean;
+  homeResetKey: number;
+  deepLinkSearch: string | null;
+  onDeepLinkConsumed: () => void;
+  onSelectMeta: (meta: MetaPreview) => void;
+  onSelectFromCW: (meta: MetaPreview) => void;
+  onRetryLoad: () => void;
+  onRemoveItem: PageViewProps<typeof LibraryView>["onRemoveItem"];
+  onAutoRemoveSweep: PageViewProps<typeof LibraryView>["onAutoRemoveSweep"];
+  onAddonAdd: PageViewProps<typeof AddonsView>["onAdd"];
+  onAddonRemove: PageViewProps<typeof AddonsView>["onRemove"];
+  onAddonRefreshed: PageViewProps<typeof AddonsView>["onRefreshed"];
+  onAddonsReorder: PageViewProps<typeof AddonsView>["onReorder"];
+  onAccountChanged: PageViewProps<typeof AddonsView>["onAccountChanged"];
+  isAddonListSynced: PageViewProps<typeof AddonsView>["isAddonListSynced"];
+  currentSession: PageViewProps<typeof AddonsView>["currentSession"];
+  onLoginSuccess: PageViewProps<typeof AddonsView>["onLoginSuccess"];
+  onLogout: PageViewProps<typeof AddonsView>["onLogout"];
+  onSessionExpired: PageViewProps<typeof AddonsView>["onSessionExpired"];
+  onPlayChannel: PageViewProps<typeof LiveView>["onPlayChannel"];
 }
+
+/** While a video plays, the page column stays mounted (hidden) under the
+ *  player, and App re-renders on every playback position tick (~30x/sec,
+ *  usePlayback's `time`). Every page but Home re-rendered with it, so playing
+ *  something opened from Library, Calendar, Queue, Discover or Live re-ran
+ *  that whole page for the length of the video. Skipped ONLY while playing
+ *  and only when every prop is identical (the callbacks App passes are
+ *  stable); outside playback it re-renders exactly as before, so nothing a
+ *  page shows can go stale. A page's own state, contexts and stores still
+ *  re-render it directly. */
+function samePageColumnProps(a: PageColumnProps, b: PageColumnProps): boolean {
+  if (!a.playerActive || !b.playerActive) return false;
+  for (const k of Object.keys(b) as (keyof PageColumnProps)[]) {
+    if (!Object.is(a[k], b[k])) return false;
+  }
+  return true;
+}
+
+const PageColumn = memo(function PageColumn({
+  activeView, covered, playerActive, heroPaused, addons, session, library,
+  libraryKnown, libraryLoadFailed, homeResetKey, deepLinkSearch, onDeepLinkConsumed,
+  onSelectMeta, onSelectFromCW, onRetryLoad, onRemoveItem, onAutoRemoveSweep,
+  onAddonAdd, onAddonRemove, onAddonRefreshed, onAddonsReorder, onAccountChanged,
+  isAddonListSynced, currentSession, onLoginSuccess, onLogout, onSessionExpired,
+  onPlayChannel,
+}: PageColumnProps) {
+  // `key={activeView}` is what makes the fade replay: only one view is
+  // mounted at a time and switching already unmounts the old one, so the key
+  // changes nothing structurally, it just gives the wrapper a fresh identity
+  // per view so the enter animation re-triggers. .aura-view-enter is
+  // opacity-only ON PURPOSE - see the note on it in App.css before adding any
+  // transform here.
+  return (
+    <div
+      key={activeView}
+      className="aura-view-enter flex-1 flex flex-col min-w-0 overflow-hidden"
+      data-glass-covered={covered ? "" : undefined}
+    >
+      {activeView === "home" && (
+        <HomeView
+          addons={addons}
+          session={session}
+          library={library}
+          onSelectMeta={onSelectMeta}
+          onSelectFromCW={onSelectFromCW}
+          resetKey={homeResetKey}
+          externalQuery={deepLinkSearch}
+          onExternalQueryConsumed={onDeepLinkConsumed}
+          heroPaused={heroPaused}
+        />
+      )}
+      {activeView === "library" && (
+        <LibraryView
+          library={libraryKnown ? library : undefined}
+          loadFailed={libraryLoadFailed}
+          onRetryLoad={onRetryLoad}
+          session={session}
+          onSelectMeta={onSelectMeta}
+          onRemoveItem={onRemoveItem}
+          onAutoRemoveSweep={onAutoRemoveSweep}
+        />
+      )}
+      {activeView === "addons" && (
+        <AddonsView
+          addons={addons}
+          session={session}
+          onAdd={onAddonAdd}
+          onRemove={onAddonRemove}
+          onRefreshed={onAddonRefreshed}
+          onReorder={onAddonsReorder}
+          onAccountChanged={onAccountChanged}
+          isAddonListSynced={isAddonListSynced}
+          currentSession={currentSession}
+          onLoginSuccess={onLoginSuccess}
+          onLogout={onLogout}
+          onSessionExpired={onSessionExpired}
+        />
+      )}
+      {activeView === "discover" && (
+        <DiscoverView addons={addons} onSelectMeta={onSelectMeta} />
+      )}
+      {activeView === "live" && (
+        <LiveView
+          active={activeView === "live"}
+          playerActive={playerActive}
+          onPlayChannel={onPlayChannel}
+        />
+      )}
+      {activeView === "calendar" && (
+        <CalendarView library={library} addons={addons} onSelectMeta={onSelectMeta} />
+      )}
+      {activeView === "history" && (
+        <HistoryView onSelectMeta={onSelectMeta} />
+      )}
+      {activeView === "queue" && (
+        <QueueView
+          library={library}
+          libraryLoaded={libraryKnown && !libraryLoadFailed}
+          loadFailed={libraryLoadFailed}
+          onRetryLoad={onRetryLoad}
+          addons={addons}
+          onSelectMeta={onSelectMeta}
+        />
+      )}
+      {activeView === "airing" && (
+        <AiringView library={library} addons={addons} onSelectMeta={onSelectMeta} />
+      )}
+      {activeView === "settings" && (
+        <SettingsView addons={addons} session={session} />
+      )}
+    </div>
+  );
+}, samePageColumnProps);

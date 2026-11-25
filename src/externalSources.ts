@@ -93,7 +93,7 @@ function resolveBucket(
  *  databases (AniList / MAL / Kitsu). Live-action review sites
  *  (RT / Metacritic / Letterboxd) don't index anime well and the
  *  results are uniformly poor quality.
- *  EVERYTHING ELSE — surface IMDb / TMDB / Trakt / RT / Metacritic /
+ *  EVERYTHING ELSE: surface IMDb / TMDB / RT / Metacritic /
  *  Letterboxd (movies only). */
 export function sourcesForMeta(
   meta: MetaPreview,
@@ -176,34 +176,13 @@ export function sourcesForMeta(
   // it is a real unrelated title: /movie/603 is The Matrix, /tv/603 is
   // "Veronica's Closet". Defaulting an unlabelled meta to "tv" would therefore
   // emit a confidently wrong link, and in a QueueView stub (media_type
-  // "other") it would be the only direct-title row in the menu. Same rule as
-  // Trakt below: no reliable bucket, no entry.
+  // "other") it would be the only direct-title row in the menu. No reliable
+  // bucket, no entry.
   if (ids.tmdb != null && bucket) {
     out.push({
       label:  "Open in TMDB",
       source: "TMDB",
       url:    `https://www.themoviedb.org/${bucket === "movie" ? "movie" : "tv"}/${ids.tmdb}`,
-    });
-  }
-
-  // Trakt. The old `/search/imdb/{id}` route is GONE - it 301s to app.trakt.tv
-  // and serves a hard 404 ("404: Nothingness. The void."), so every non-anime
-  // right-click was offering a dead link. The live shapes are /movies/{imdb}
-  // and /shows/{imdb}, which the SPA resolves from a tt id.
-  //
-  // TWO RULES, both load-bearing:
-  //   1. Route by media type. A series id under /movies (or vice versa) renders
-  //      Trakt's 404 rather than falling through. That is the SAFE failure: a
-  //      visible error, never a wrong title.
-  //   2. NEVER pass a bare numeric id. Trakt reads a numeric path segment as
-  //      its OWN internal id, so handing it a TMDB id lands on a real but
-  //      unrelated title with no error at all (trakt.tv/movies/603 is "The Mad
-  //      Adventures of Rabbi Jacob", not The Matrix). No IMDb id, no entry.
-  if (ids.imdb) {
-    out.push({
-      label:  "Open in Trakt",
-      source: "Trakt",
-      url:    `https://trakt.tv/${isMovie ? "movies" : "shows"}/${ids.imdb}`,
     });
   }
 

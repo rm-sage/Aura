@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { useEffect, useRef, useState } from "react";
+import { useListDroplet } from "./glassListDroplet";
 
 // ---------------------------------------------------------------------------
 // SeasonSelect — custom popover dropdown for the episode panel's season
@@ -35,7 +36,7 @@ import { useEffect, useRef, useState } from "react";
 const SEASON_VISIBLE_CAP = 10;
 
 export default function SeasonSelect({
-  seasons, value, onChange, names,
+  seasons, value, onChange, names, overPlayer = false,
 }: {
   seasons: number[];
   value: number;
@@ -46,9 +47,16 @@ export default function SeasonSelect({
    *  ("Season 2 · Stone Wars"). Redundant names are suppressed so a
    *  plain "Season 1" doesn't render as "Season 1 · Season 1". */
   names?: Record<string, string>;
+  /** Inside the player's episode drawer: the popover floats over the mpv
+   *  video, so it takes the player material (no backdrop pass). */
+  overPlayer?: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const [highlight, setHighlight] = useState<number>(value);
+  // The highlight is SHOWN only after keyboard navigation: under the mouse the
+  // row's own hover (Frosted) or the shared droplet (Liquid) marks it.
+  const [kbdNav, setKbdNav] = useState(false);
+  const droplet = useListDroplet();
   const triggerRef = useRef<HTMLButtonElement>(null);
   const popoverRef = useRef<HTMLDivElement>(null);
   const itemsRef = useRef<Map<number, HTMLButtonElement>>(new Map());
@@ -85,6 +93,8 @@ export default function SeasonSelect({
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "ArrowDown") {
         e.preventDefault();
+        setKbdNav(true);
+        droplet.hide();
         setHighlight((h) => {
           const idx = seasons.indexOf(h);
           const next = seasons[(idx + 1) % seasons.length];
@@ -94,6 +104,8 @@ export default function SeasonSelect({
       }
       if (e.key === "ArrowUp") {
         e.preventDefault();
+        setKbdNav(true);
+        droplet.hide();
         setHighlight((h) => {
           const idx = seasons.indexOf(h);
           const prev = seasons[(idx - 1 + seasons.length) % seasons.length];
@@ -114,7 +126,7 @@ export default function SeasonSelect({
       window.removeEventListener("mousedown", onDoc);
       window.removeEventListener("keydown", onKey);
     };
-  }, [open, seasons, highlight, onChange]);
+  }, [open, seasons, highlight, onChange, droplet.hide]);
 
   // Capture phase, and stopped there: the window-level Escape handlers (App's,
   // EpisodePanel's) would otherwise close the page or drawer under the dropdown.
@@ -135,6 +147,7 @@ export default function SeasonSelect({
   useEffect(() => {
     if (!open) return;
     setHighlight(value);
+    setKbdNav(false);
     // Defer the scroll until the popover has actually mounted with the
     // current item visible — without this, scrollIntoView runs against
     // the just-mounted container before its height is final.
@@ -185,16 +198,12 @@ export default function SeasonSelect({
         onClick={() => setOpen((o) => !o)}
         aria-haspopup="listbox"
         aria-expanded={open}
-        className="bg-black/45 border border-white/16 rounded-lg px-5 py-2.5
-                   text-[16px] font-mono tracking-wide outline-none
-                   focus:border-ln-accent/45 transition-colors cursor-pointer
-                   appearance-none pr-10 inline-flex items-center max-w-[340px] min-w-0"
-        style={{
-          color: "var(--text-primary)",
-          backgroundImage: `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 24 24' fill='rgba(255,255,255,0.55)'%3E%3Cpath d='M7 10l5 5 5-5z'/%3E%3C/svg%3E")`,
-          backgroundRepeat: "no-repeat",
-          backgroundPosition: "right 10px center",
-        }}
+        // A flat glass select: the chevron rides --lg-deco (.aura-glass-select),
+        // since an inline backgroundImage would erase the glass layers.
+        className="aura-glass-flat aura-glass-select rounded-lg pl-5 py-2.5
+                   text-[16px] font-mono tracking-wide outline-none cursor-pointer
+                   appearance-none inline-flex items-center max-w-[340px] min-w-0"
+        style={{ color: "var(--text-primary)" }}
       >
         <span className="truncate min-w-0">
           {baseLabel(value)}
@@ -208,14 +217,21 @@ export default function SeasonSelect({
           ref={popoverRef}
           data-season-select-popover=""
           role="listbox"
-          className="absolute left-0 z-40 overflow-y-auto
-                     bg-black/85 backdrop-blur-2xl
-                     border border-white/15 rounded-lg
-                     shadow-[0_18px_48px_-12px_rgba(0,0,0,0.85)]
-                     py-1"
+          // Floating glass that grows from the trigger; over the player the
+          // player material (material only, nothing behind it to sample).
+          className={`${overPlayer ? "aura-glass-player" : "aura-float-glass"} aura-glass-pop-in
+                     absolute left-0 z-40 overflow-y-auto rounded-lg py-1`}
           style={{ ...popoverStyle, scrollbarWidth: "thin",
-                   scrollbarColor: "rgba(255,255,255,0.08) transparent" }}
+                   scrollbarColor: "rgba(255,255,255,0.08) transparent",
+                   "--lg-origin": direction === "down" ? "top left" : "bottom left" } as React.CSSProperties}
+          {...droplet.listProps}
         >
+          <span
+            ref={droplet.ref}
+            aria-hidden
+            className="aura-glass-hl"
+            style={{ left: 4, right: 4, borderRadius: 8 }}
+          />
           {seasons.map((s) => {
             const isActive    = s === value;
             const isHighlight = s === highlight;
@@ -233,16 +249,16 @@ export default function SeasonSelect({
                   setOpen(false);
                   triggerRef.current?.focus();
                 }}
-                onMouseEnter={() => setHighlight(s)}
-                className={`block w-full text-left px-4 py-2 text-[14px] font-mono tracking-wide
-                            truncate transition-colors
+                onMouseEnter={() => { setHighlight(s); setKbdNav(false); }}
+                className={`aura-glass-row relative block w-full text-left px-4 py-2 text-[14px] font-mono tracking-wide
+                            truncate
                             ${isActive ? "text-ln-accent" : "text-white/85"}
-                            ${isHighlight ? "bg-white/10" : "hover:bg-white/8"}`}
+                            ${isHighlight && kbdNav && !isActive ? "is-match" : ""}`}
                 title={extraName(s) ? `${baseLabel(s)} · ${extraName(s)}` : baseLabel(s)}
               >
                 {baseLabel(s)}
                 {extraName(s) && (
-                  <span className={isActive ? "text-ln-accent/70" : "text-white/50"}>
+                  <span className={isActive ? "opacity-70" : "text-white/50"}>
                     {" "}· {extraName(s)}
                   </span>
                 )}

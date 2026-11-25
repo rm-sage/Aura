@@ -28,35 +28,25 @@ import LoginView from "../LoginView";
 import { openContextMenu } from "../ContextMenu";
 import { showAppToast } from "../AppToast";
 import Tooltip from "../Tooltip";
+import { normalizeManifestInput } from "../manifestUrl";
 import { requestReopenAddons } from "../onboarding";
 import { copyTextToClipboard } from "../clipboard";
 import { overriddenJobs, OVERRIDE_SETTING_KEYS, type OverridableJob } from "../addonElection";
 import { settingsChangeIncludes } from "../auraSettings";
+import { sheet } from "../glassSheet";
 
 /** Glass icon-button styling shared by the addon-row action cluster.
  *  ACCENT = Copy/Configure/Refresh (blue accent hover); DESTRUCTIVE =
  *  Remove (rose hover). Extracted so the cluster reads as one set and
  *  the four buttons can't drift apart. */
+// Flat glass icon buttons (glass-settings.css draws the hover tint through
+// the glass hooks, so both glass materials agree and nothing glows).
 const ACCENT_ICON_BTN =
-  "w-10 h-10 flex items-center justify-center rounded-xl " +
-  "bg-white/[0.04] border border-white/10 " +
-  "text-white/65 hover:text-ln-accent " +
-  "hover:bg-ln-accent/12 hover:border-ln-accent/40 " +
-  "hover:shadow-[0_0_0_3px_rgba(91,164,255,0.08),0_4px_14px_-6px_rgba(91,164,255,0.45)] " +
-  "transition-all duration-150 " +
-  "disabled:opacity-40 disabled:hover:bg-white/[0.04] " +
-  "disabled:hover:border-white/10 disabled:hover:shadow-none " +
-  "active:scale-95 active:bg-ln-accent/18";
+  "aura-glass-flat aura-glass-press is-accent-hover w-10 h-10 flex items-center justify-center rounded-xl " +
+  "text-white/65 hover:text-ln-accent disabled:opacity-40";
 const DESTRUCTIVE_ICON_BTN =
-  "w-10 h-10 flex items-center justify-center rounded-xl " +
-  "bg-white/[0.04] border border-white/10 " +
-  "text-white/65 hover:text-rose-300 " +
-  "hover:bg-rose-500/12 hover:border-rose-400/40 " +
-  "hover:shadow-[0_0_0_3px_rgba(244,63,94,0.08),0_4px_14px_-6px_rgba(244,63,94,0.45)] " +
-  "transition-all duration-150 " +
-  "disabled:opacity-40 disabled:hover:bg-white/[0.04] " +
-  "disabled:hover:border-white/10 disabled:hover:shadow-none " +
-  "active:scale-95 active:bg-rose-500/20";
+  "aura-glass-flat aura-glass-press is-danger-hover w-10 h-10 flex items-center justify-center rounded-xl " +
+  "text-white/65 hover:text-rose-300 disabled:opacity-40";
 
 /** What the Installed list's override line calls each overridden job, and the
  *  Settings section its link opens. The deep link reveals that section's
@@ -208,19 +198,17 @@ function AuthCard({
 }) {
   if (session) {
     return (
-      <div className="flex items-center justify-between px-4 py-3 rounded-xl
-                      bg-white/5 border border-white/10">
+      <div {...sheet("flex items-center justify-between px-4 py-3 rounded-[20px]")}>
         <div className="flex items-center gap-2.5">
           <span className="w-2 h-2 rounded-full bg-green-400 flex-shrink-0" />
           <div>
             <p className="text-white/80 text-sm font-medium">{session.email}</p>
-            <p className="text-white/35 text-xs">Synced to Stremio cloud</p>
+            <p className="text-white/55 text-xs">Synced to Stremio cloud</p>
           </div>
         </div>
         <button
           onClick={onLogout}
-          className="text-white/35 hover:text-white/60 text-xs transition-colors px-2 py-1
-                     rounded-lg hover:bg-white/8"
+          className="aura-glass-item text-white/60 hover:text-white/85 text-xs px-2 py-1 rounded-lg"
         >
           Sign Out
         </button>
@@ -229,19 +217,17 @@ function AuthCard({
   }
 
   return (
-    <div className="flex items-center justify-between px-4 py-3 rounded-xl
-                    bg-white/4 border border-white/8">
+    <div {...sheet("flex items-center justify-between px-4 py-3 rounded-[20px]")}>
       <div className="flex items-center gap-2.5">
         <span className="w-2 h-2 rounded-full bg-white/20 flex-shrink-0" />
         <div>
           <p className="text-white/60 text-sm font-medium">Guest Mode</p>
-          <p className="text-white/30 text-xs">Addons saved locally</p>
+          <p className="text-white/55 text-xs">Addons saved locally</p>
         </div>
       </div>
       <button
         onClick={onLoginClick}
-        className="text-ln-accent/80 hover:text-ln-accent text-xs font-medium
-                   transition-colors px-2 py-1 rounded-lg hover:bg-ln-accent/10"
+        className="aura-glass-item text-[color:var(--ln-accent-mark-text)] text-xs font-medium px-2 py-1 rounded-lg"
       >
         Sign In →
       </button>
@@ -276,7 +262,8 @@ function AddAddonForm({
   const [error, setError] = useState<string | null>(null);
 
   const handleAdd = async () => {
-    const trimmed = url.trim();
+    // Trimmed, and a pasted stremio:// Install link becomes https://.
+    const trimmed = normalizeManifestInput(url);
     if (!trimmed) return;
     // No account write until the list `shownUrls` comes from has loaded
     // from that account (App.isAddonListSynced).
@@ -327,25 +314,24 @@ function AddAddonForm({
           placeholder="https://…/manifest.json"
           spellCheck={false}
           disabled={adding}
-          className="flex-1 bg-white/5 border border-white/10 rounded-xl px-4 py-2.5
+          className="aura-glass-field flex-1 rounded-xl px-4 py-2.5
                      text-white/85 text-sm font-mono placeholder:text-white/20 outline-none
-                     focus:border-white/25 transition-colors disabled:opacity-40"
+                     disabled:opacity-40"
         />
         <button
           onClick={handleAdd}
           disabled={adding || !url.trim()}
-          className="px-5 py-2.5 rounded-xl text-sm font-medium transition-all flex-shrink-0
-                     bg-ln-accent/70 hover:bg-ln-accent/90 text-white
-                     disabled:opacity-30 disabled:cursor-not-allowed"
+          className="aura-glass-flat aura-glass-press is-cta px-5 py-2.5 rounded-xl text-sm font-medium flex-shrink-0
+                     text-ln-accent-ink disabled:opacity-30 disabled:cursor-not-allowed"
         >
           {adding ? "Adding…" : "Add"}
         </button>
       </div>
       {session && (
-        <p className="text-white/25 text-xs">Added addons will sync to your Stremio cloud.</p>
+        <p className="text-white/55 text-xs">Added addons will sync to your Stremio cloud.</p>
       )}
       {error && (
-        <div className="bg-red-500/10 border border-red-500/20 rounded-xl px-4 py-2.5">
+        <div {...sheet("rounded-[14px] px-4 py-2.5", { tone: "danger" })}>
           <p className="text-red-400/80 text-xs leading-relaxed break-all">{error}</p>
         </div>
       )}
@@ -509,7 +495,7 @@ function AddonRow({
         detail: { url: addon.url, catalogCount: count },
       }));
       if (!silent) {
-        showAppToast(`Refreshed ${addon.name} — ${count} catalog${count === 1 ? "" : "s"}`, { duration: 2500 });
+        showAppToast(`Refreshed ${addon.name}: ${count} catalog${count === 1 ? "" : "s"}`, { duration: 2500 });
         const notice = accountKey && !writeKey
           ? `${addon.name} was not saved to your Stremio account: your addon list hasn't loaded from Stremio yet (Aura is loading it now). The refresh applies to this session only; refresh again in a moment to save it.`
           : collectionWriteNotice(addon.name, manifest.collection);
@@ -610,9 +596,8 @@ function AddonRow({
     <div
       ref={setNodeRef}
       style={rowStyle}
-      className="group relative flex items-center gap-3 px-4 py-3 rounded-xl
-                 bg-white/3 border border-white/6 hover:bg-white/5
-                 transition-colors"
+      className={`aura-content-row group relative flex items-center gap-3 px-4 py-3 rounded-[12px]
+                 ${isDragging ? "is-dragging" : ""}`}
       onContextMenu={(e) => {
         e.preventDefault();
         openContextMenu(e.clientX, e.clientY, [
@@ -647,7 +632,7 @@ function AddonRow({
           <p className="text-white/85 text-sm font-medium leading-tight">{addon.name}</p>
           {addon.has_search && <SearchBadge />}
         </div>
-        <p className="text-white/30 text-xs font-mono truncate">
+        <p className="text-white/55 text-xs font-mono truncate">
           {addon.url.replace(/^https?:\/\//, "")}
         </p>
         {(addon.types?.length || addon.resources?.length) ? (
@@ -960,8 +945,8 @@ export default function AddonsView({
         >
         {/* Page header */}
         <div>
-          <h1 className="text-white/85 text-xl font-light tracking-wide">Addons</h1>
-          <p className="text-white/35 text-sm mt-1">
+          <h1 data-glass-light="text" className="aura-row-title text-3xl font-semibold tracking-tight">Addons</h1>
+          <p className="text-white/60 text-sm mt-1">
             Manage your Stremio-compatible addon sources.
           </p>
         </div>
@@ -976,20 +961,17 @@ export default function AddonsView({
         {/* Add new */}
         <section className="space-y-3">
           <div className="flex items-center justify-between gap-3">
-            <h2 className="text-white/40 text-xs font-semibold tracking-[0.1em] uppercase">
+            <h2 className="text-white/55 text-xs font-semibold tracking-[0.1em] uppercase">
               Add Addon
             </h2>
-            {/* Lets users revisit just the recommended-addons step of
-                the first-run wizard without re-running import / settings.
-                Fires `aura:onboarding-reopen-addons`; App.tsx remounts
-                OnboardingView at step 2. */}
+            {/* Shows just the recommended-addons list again: fires
+                `aura:onboarding-reopen-addons`, and App.tsx remounts
+                OnboardingView in "addons-only" mode. */}
             <button
               type="button"
               onClick={() => requestReopenAddons()}
-              className="text-[10px] font-medium tracking-wide uppercase
-                         text-white/45 hover:text-ln-accent
-                         transition-colors px-2 py-1 rounded
-                         hover:bg-ln-accent/10"
+              className="aura-glass-item text-[10px] font-medium tracking-wide uppercase
+                         text-white/60 hover:text-[color:var(--ln-accent-mark-text)] px-2 py-1 rounded"
               title="Reopen the recommended-addons step of the first-run wizard"
             >
               Suggested addons
@@ -1012,16 +994,16 @@ export default function AddonsView({
             Settings override takes a job out of that rule. */}
         <section className="space-y-3">
           <div>
-            <h2 className="text-white/40 text-xs font-semibold tracking-[0.1em] uppercase">
+            <h2 className="text-white/55 text-xs font-semibold tracking-[0.1em] uppercase">
               Installed · {addons.length}
             </h2>
             {addons.length > 1 && (
-              <p className="text-white/35 text-xs mt-1">
+              <p className="text-white/55 text-xs mt-1">
                 The topmost addon that can do a job does it first. Drag addons to change that.
               </p>
             )}
             {addons.length > 0 && overridden.length > 0 && (
-              <p className="text-white/35 text-xs mt-1">
+              <p className="text-white/55 text-xs mt-1">
                 Some jobs are pinned in Settings, under Show advanced settings:{" "}
                 {overridden.map((job, i) => (
                   <Fragment key={job}>
@@ -1031,7 +1013,7 @@ export default function AddonsView({
                       onClick={() => window.dispatchEvent(new CustomEvent("aura:open-settings", {
                         detail: { section: OVERRIDE_LINKS[job].section },
                       }))}
-                      className="text-ln-accent/80 hover:text-ln-accent font-medium transition-colors"
+                      className="text-[color:var(--ln-accent-mark-text)] hover:underline font-medium"
                     >
                       {OVERRIDE_LINKS[job].label}
                     </button>
@@ -1042,7 +1024,7 @@ export default function AddonsView({
             )}
           </div>
           {addons.length === 0 ? (
-            <p className="text-white/25 text-sm">No addons installed yet.</p>
+            <p className="text-white/55 text-sm">No addons installed yet.</p>
           ) : (
             <DndContext
               sensors={sensors}
@@ -1053,7 +1035,7 @@ export default function AddonsView({
                 items={addons.map((a) => a.url)}
                 strategy={verticalListSortingStrategy}
               >
-                <div className="space-y-2">
+                <div {...sheet("aura-sheet-list rounded-[20px] p-1.5")}>
                   {addons.map((addon) => (
                     <AddonRow
                       key={addon.url}

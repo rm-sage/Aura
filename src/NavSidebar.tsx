@@ -1,44 +1,78 @@
-// Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
+// Aura - (c) 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useEffect, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
-import { openUrl } from "@tauri-apps/plugin-opener";
-import type { StremioAccount } from "./LoginView";
-import AuraLogoA from "./AuraLogoA";
-import { anchorFromRect, type PartyAnchor } from "./partyAnchor";
+// ---------------------------------------------------------------------------
+// NavSidebar: the LEFT RAIL (Direction A, "Obsidian rail").
+//
+// ONE floating glass surface (`.aura-rail`, styles/glass-rail.css; the shared
+// `.aura-float-glass.aura-glass-control` material, so Liquid and Frosted both
+// apply), 204 px wide, 22 px corners, 12 px from the window edge. It is an
+// in-flow flex item of the app body (App.tsx `flex gap-3 p-3`), hugs its
+// content and centres vertically in the body under the title bar, so the page
+// column starts at 228 px and nothing scrolls under it. Top to bottom
+// (round 12: Notifications moved from the bottom to the very top):
+//
+//   - the Notifications row (NotificationsBell)
+//   - hairline
+//   - User Panel and Watch Party rows (AccountButton, PartyButton)
+//   - hairline
+//   - the nav: Home, Library (Queue and Airing sub-rows), Discover, Live TV,
+//     Calendar, History, a divider, Addons, Settings
+//
+// Rows are list rows on the rail's one surface, never separate glass pills.
+// ONE hover droplet (`.aura-glass-hl`, Liquid only) serves EVERY row on the
+// rail (useRailDroplet), so it slides across the hairlines and the divider in
+// both directions (it used to be one droplet per section: a move between two
+// sections faded out in one and snapped in in the other). The nav's active row
+// wears a nested inner pill (`.aura-rail-pill`, no backdrop pass: a backdrop
+// inside the rail would sample only the rail). Popups opened from rows portal
+// into a host beside the rail (RailRow `RailPopup`).
+//
+// The cursor-light system registers the rail by `data-glass-light="panel"`
+// and the active pill by `data-glass-light="rim"`.
+//
+// Short windows: the row heights step down at two max-height breakpoints
+// (glass-rail.css) and below those the nav section scrolls inside the rail, so
+// the section rows above it always stay in view. Row geometry is MEASURED
+// (offsetTop / offsetHeight for the pill, rects for the droplet), never
+// derived from constants.
+// ---------------------------------------------------------------------------
+
+import { createContext, memo, useCallback, useContext, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { animateSpan, cancelSpan } from "./liquidGlass";
+import { liquidActive, reducedMotionActive } from "./glassStyle";
+import AccountButton from "./AccountButton";
+import PartyButton from "./PartyButton";
+import NotificationsBell from "./NotificationsBell";
+import { RailPopupHostContext } from "./RailRow";
+import type { LibraryItem } from "./types";
 
 export type NavView = "home" | "library" | "queue" | "airing" | "addons" | "discover" | "live" | "calendar" | "history" | "settings";
 
 interface Props {
   active: NavView;
   onNavigate: (view: NavView) => void;
-  /** Email of signed-in user; null when guest. May be empty string when
-   *  the user has a valid auth_key but the email field wasn't persisted
-   *  (older Aura builds saved only auth_key) — the popover falls back
-   *  to a placeholder in that case. */
+  /** Email of the signed-in user; null when guest. May be an empty string
+   *  when the user has a valid auth_key but the email was never persisted
+   *  (older Aura builds saved only auth_key): the popover falls back to a
+   *  placeholder then. */
   userEmail?: string | null;
-  /** Authoritative "is the user signed in to a Stremio account" flag.
-   *  Driven by the presence of `session.auth_key`, not by `email`,
-   *  because at least one historical save shape persisted only the
-   *  auth_key. When this is true but email is empty/null, the popover
-   *  shows "Stremio account" as the identity placeholder. */
+  /** Authoritative "signed in to a Stremio account" flag, driven by the
+   *  presence of `session.auth_key`, not by `email`. */
   loggedIn?: boolean;
   /** Optional Stremio account nickname. Wins over the email initial. */
   userNickname?: string | null;
-  /** Open the LoginView (called from the popover when guest clicks "Sign in"). */
+  /** Open the LoginView (the popover's "Sign in" for a guest). */
   onLoginRequest?: () => void;
   /** Sign the user out. */
   onLogout?: () => void;
+  /** The library, for the Notifications panel's manual refresh. */
+  library: LibraryItem[];
+  /** A page covers the rail (an open Detail page): the cursor light skips
+   *  it (`data-glass-covered`). Only the rail itself: its popups host stays
+   *  lit (the notifications sheet sits above the Detail page). */
+  covered?: boolean;
 }
-
-// ---------------------------------------------------------------------------
-// Geometry — each row is ROW_H_PX tall, groups use ROW_GAP_PX between rows.
-// SLOT_PX is the stride used by the .aura-glow pill's translateY offset.
-// ---------------------------------------------------------------------------
-const ROW_H_PX   = 48;
-const ROW_GAP_PX = 6;
-const SLOT_PX    = ROW_H_PX + ROW_GAP_PX;
 
 // ---------------------------------------------------------------------------
 // Icons
@@ -70,14 +104,14 @@ const HistoryIcon = () => (
   </svg>
 );
 const QueueIcon = () => (
-  // Bookmark glyph — same shape the planned-state badge uses, so the
+  // Bookmark glyph: same shape the planned-state badge uses, so the
   // Queue tab's icon visually corresponds to the per-item badge.
   <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
     <path d="M17 3H7c-1.1 0-2 .9-2 2v16l7-3 7 3V5c0-1.1-.9-2-2-2z" />
   </svg>
 );
 const AiringIcon = () => (
-  // Broadcast / on-air signal — a centre dot with concentric arcs, reading as
+  // Broadcast / on-air signal: a centre dot with concentric arcs, reading as
   // "currently airing". Stroke-drawn arcs (the sibling icons are filled; a
   // filled broadcast glyph reads muddy at this size).
   <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor"
@@ -87,7 +121,7 @@ const AiringIcon = () => (
   </svg>
 );
 const DiscoverIcon = () => (
-  // Compass glyph — discover/explore convention. Distinct from the
+  // Compass glyph: discover/explore convention. Distinct from the
   // Library "books" icon so the two browseable surfaces don't blur
   // visually in the sidebar.
   <svg width="22" height="22" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
@@ -95,7 +129,7 @@ const DiscoverIcon = () => (
   </svg>
 );
 const LiveIcon = () => (
-  // TV/broadcast glyph — distinct from the Calendar and Library marks so
+  // TV/broadcast glyph: distinct from the Calendar and Library marks so
   // the live surface reads clearly in the sidebar.
   <svg width="22" height="22" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
     <path d="M21 6h-7.59l3.29-3.29L16 2l-4 4-4-4-.71.71L10.59 6H3c-1.1 0-2 .89-2 2v12c0 1.1.9 2 2 2h18c1.1 0 2-.9 2-2V8c0-1.11-.9-2-2-2zm0 14H3V8h18v12z" />
@@ -107,678 +141,438 @@ const SettingsIcon = () => (
   </svg>
 );
 
-const LogOutIcon = () => (
-  <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
-    <path d="M17 7l-1.41 1.41L18.17 11H8v2h10.17l-2.58 2.58L17 17l5-5zM4 5h8V3H4c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h8v-2H4V5z" />
-  </svg>
-);
-const SignInIcon = () => (
-  <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
-    <path d="M11 7L9.6 8.4l2.6 2.6H2v2h10.2l-2.6 2.6L11 17l5-5-5-5zm9 12h-8v2h8c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2h-8v2h8v14z" />
-  </svg>
-);
-// (CogIconSm removed — the popover's "Account settings" button it
-//  iconed was replaced by inline account details + a "Manage on
-//  Stremio" link in ProfilePopover.)
-
 // ---------------------------------------------------------------------------
-// Item groups
+// Nav items, top to bottom. Sub-rows nest under Library (indented, with a tree
+// connector); "divider" is the hairline between the browse group and
+// Addons / Settings. All of them are ONE list with one pill and one droplet.
 // ---------------------------------------------------------------------------
 
-interface ItemMeta { id: NavView; label: string; icon: React.ReactNode }
+interface ItemMeta { id: NavView; label: string; icon: React.ReactNode; sub?: boolean }
 
-const TOP_ITEMS: ItemMeta[] = [
+const NAV_ITEMS: (ItemMeta | "divider")[] = [
   { id: "home",     label: "Home",     icon: <HomeIcon /> },
   { id: "library",  label: "Library",  icon: <LibraryIcon /> },
+  { id: "queue",    label: "Queue",    icon: <QueueIcon />,  sub: true },
+  { id: "airing",   label: "Airing",   icon: <AiringIcon />, sub: true },
   { id: "discover", label: "Discover", icon: <DiscoverIcon /> },
   { id: "live",     label: "Live TV",  icon: <LiveIcon /> },
   { id: "calendar", label: "Calendar", icon: <CalendarIcon /> },
   { id: "history",  label: "History",  icon: <HistoryIcon /> },
-];
-const BOTTOM_ITEMS: ItemMeta[] = [
+  "divider",
   { id: "addons",   label: "Addons",   icon: <AddonsIcon /> },
   { id: "settings", label: "Settings", icon: <SettingsIcon /> },
 ];
 
-// Sub-tabs nested under Library (indented, rendered directly below the Library
-// row, top to bottom). Each consumes one pill SLOT_PX below Library.
-const LIBRARY_SUBROWS: ItemMeta[] = [
-  { id: "queue",  label: "Queue",  icon: <QueueIcon /> },
-  { id: "airing", label: "Airing", icon: <AiringIcon /> },
-];
+/** Library's sub-views: the Library row reads as the lit PARENT while one of
+ *  them is the page (accent label), the pill sits on the sub-row. */
+const LIBRARY_SUBS: NavView[] = ["queue", "airing"];
 
-// ---------------------------------------------------------------------------
-// NavSidebar
-//
-// Layout (top to bottom):
-//   • A compact AuraLogoA + status dot — clicking opens the profile popover
-//     (this is also the "home / brand" mark, replacing the bulky two-line
-//     profile-card from earlier).
-//   • A thin separator
-//   • TOP_ITEMS (Home / Library / Calendar) — pill glow tracks active row
-//   • flex-1 spacer
-//   • BOTTOM_ITEMS (Addons / Settings)
-// ---------------------------------------------------------------------------
+// The rail renders as a child of App, which re-renders on every
+// playback-update tick (the rail stays mounted, hidden, during playback) and
+// passes fresh inline closures each time. The wrapper below hands the body
+// stable callbacks that call the latest props, so the memoized body (the
+// Notifications row and its open sheet, the account and party rows, every nav
+// row) renders only when what it shows changes. Contexts and stores the rows
+// subscribe to still re-render them directly.
+export default function NavSidebar(props: Props) {
+  const latest = useRef(props);
+  useLayoutEffect(() => { latest.current = props; });
+  const onNavigate = useCallback((view: NavView) => latest.current.onNavigate(view), []);
+  const onLoginRequest = useCallback(() => latest.current.onLoginRequest?.(), []);
+  const onLogout = useCallback(() => latest.current.onLogout?.(), []);
+  return (
+    <RailBody
+      {...props}
+      onNavigate={onNavigate}
+      onLoginRequest={onLoginRequest}
+      onLogout={onLogout}
+    />
+  );
+}
 
-export default function NavSidebar({
+const RailBody = memo(function RailBody({
   active,
   onNavigate,
   userEmail,
-  loggedIn: loggedInProp,
+  loggedIn,
   userNickname,
   onLoginRequest,
   onLogout,
+  library,
+  covered,
 }: Props) {
-  // Profile popover state and identity derivation moved to
-  // <AccountButton /> in 0.6.18 — see src/AccountButton.tsx.
-  // NavSidebar no longer needs loggedIn / email / nickname /
-  // callbacks; those props remain on the Props interface only for
-  // backward-compat with call sites that still pass them. They're
-  // ignored here.
-  void loggedInProp; void userEmail; void userNickname; void onLoginRequest; void onLogout;
-
-  // Queue is a Library sub-tab — when it's the active view, the Library
-  // pill should stay lit (Queue is conceptually nested under Library).
-  // We transform `active` for index/highlight purposes only; the Queue
-  // button itself still uses the raw active value to know it's the
-  // selected sub-tab.
-  const navActive: NavView = (active === "queue" || active === "airing") ? "library" : active;
-  const bottomIdx = BOTTOM_ITEMS.findIndex((i) => i.id === navActive);
-
-  // Bumped each time Queue is clicked — drives a brief shrink-then-
-  // restore animation on the Queue row's pill so the click reads as a
-  // distinct event (Queue is visually smaller than the other rows, so
-  // a regular pill slide-in alone reads as muted).
-  const [subClickPulse, setSubClickPulse] = useState<Record<string, number>>({});
-
-  // Queue is a permanent visual child of Library — always rendered
-  // directly below the Library row. The L-shape connector + indented
-  // QueueSubRow signals the parent/child relationship.
-  //
-  // Pill index: the Queue row always occupies the slot immediately
-  // after Library, so items below Library always shift +1.
-  const libraryFlatIdx = TOP_ITEMS.findIndex((i) => i.id === "library");
-  const flatIdxFor = (id: NavView): number => {
-    const baseIdx = TOP_ITEMS.findIndex((i) => i.id === id);
-    if (baseIdx < 0) return -1;
-    if (baseIdx <= libraryFlatIdx) return baseIdx;
-    return baseIdx + LIBRARY_SUBROWS.length;
-  };
-  const topIdx = flatIdxFor(navActive);
-
-  // When Queue is the active view, the standard active-pill needs to
-  // sit on the Queue row instead of Library. Queue's button starts at
-  // (libraryY + ROW_H_PX + QUEUE_TOP_GAP_PX), which doesn't align with
-  // the regular SLOT_PX stride — so we override the pill's translateY
-  // with this absolute pixel value when Queue is active.
-  // A sub-row's active pill sits below the Library row: Library top + one row +
-  // the tight top-gap, then one SLOT_PX per preceding sub-row.
-  const subRowPillY = (subIndex: number): number =>
-    libraryFlatIdx * SLOT_PX + ROW_H_PX + QUEUE_TOP_GAP_PX + subIndex * SLOT_PX;
-  const activeSubIndex = LIBRARY_SUBROWS.findIndex((s) => s.id === active);
+  // Where the rows' popups render: a host BESIDE the rail (see RailRow).
+  const [popupHost, setPopupHost] = useState<HTMLDivElement | null>(null);
+  // ONE Liquid hover droplet for every row on the rail (inert in Frosted).
+  const railRef = useRef<HTMLElement>(null);
+  const navRef = useRef<HTMLElement>(null);
+  const droplet = useRailDroplet(railRef, navRef);
 
   return (
-    <aside
-      // `z-20` keeps the sidebar above content-area backgrounds (hero
-      // carousel art, catalog cards). `relative` is required so the
-      // absolutely-positioned decoration layer and profile popover are
-      // scoped to this stacking context.
-      // `aura-nav-rail` carries the SHORT-WINDOW reflow only. The rail centres
-      // itself in the whole body, but the User Panel / Watch Party pills are
-      // `fixed z-30` over x 20..184, y 44..130 - directly on top of this rail's
-      // x-range and above its z-20. Once the window is short enough that
-      // centring pushes the first nav rows up into that band, the Watch Party
-      // pill sits on the Home row and eats its clicks. The rule is scoped to a
-      // max-height media query so the layout above the threshold is unchanged.
-      className="aura-nav-rail relative z-20 self-center flex-shrink-0 flex flex-col w-[180px] px-2 py-3"
-      aria-label="Navigation"
-    >
-      {/* Profile button + popover moved out of the sidebar in
-          0.6.18 — the Aura logo / account affordance now lives at
-          the top-left of the app body via <AccountButton />,
-          rendered alongside the bell + refresh from App.tsx. The
-          sidebar starts at the nav cluster. */}
+    <RailPopupHostContext.Provider value={popupHost}>
+      <aside
+        ref={railRef}
+        className="aura-rail aura-float-glass aura-glass-control"
+        data-aura-rail=""
+        data-glass-light="panel"
+        data-glass-covered={covered ? "" : undefined}
+        // Liquid drops every row's own hover fill inside (App.css): the one
+        // droplet below is the hover.
+        data-glass-droplet=""
+        aria-label="Navigation"
+      >
+        {/* The droplet: first, so the nav's active pill and every row paint
+            over it. Positioned in the rail's own box (left and width inline),
+            inside a clip of the rail's rounded padding box: a long slide
+            overshoots its target row, and at the rail's ends that would
+            poke out past the rail's edge. */}
+        <span aria-hidden className="aura-rail-hlclip">
+          <span ref={droplet.ref} className="aura-glass-hl aura-rail-hl" />
+        </span>
 
-      {/* ── Nav cluster ────────────────────────────────────────────── */}
-      {/* TOP group with the Queue sub-row permanently in-flow directly
-          below Library. The L-shape connector + indented row signals
-          the parent/child relationship; no hover-to-reveal animation. */}
-      <NavGroupWithSub
-        items={TOP_ITEMS}
-        active={navActive}
-        activeIdx={topIdx}
-        // When Queue is the active view, override the pill's y-offset
-        // so it sits on the Queue row instead of Library. Otherwise
-        // null, and the pill follows the regular activeIdx*SLOT_PX
-        // stride for whichever top item is active.
-        pillYOverride={activeSubIndex >= 0 ? subRowPillY(activeSubIndex) : null}
-        onNavigate={onNavigate}
-        renderSubAfter={(item) => {
-          if (item.id !== "library") return null;
-          return (
-            <>
-              {LIBRARY_SUBROWS.map((sub, i) => (
-                <SubRow
-                  key={sub.id}
-                  label={sub.label}
-                  icon={sub.icon}
-                  active={active === sub.id}
-                  isLast={i === LIBRARY_SUBROWS.length - 1}
-                  clickPulseId={subClickPulse[sub.id] ?? 0}
-                  onClick={() => {
-                    setSubClickPulse((p) => ({ ...p, [sub.id]: (p[sub.id] ?? 0) + 1 }));
-                    onNavigate(sub.id);
-                  }}
-                />
-              ))}
-            </>
-          );
-        }}
-      />
+        <div className="aura-rail-sec">
+          <NotificationsBell library={library} />
+        </div>
 
-      {/* Hairline divider between groups */}
-      <div className="h-px bg-white/10 my-3 mx-2" />
+        <div className="aura-rail-hair" aria-hidden />
 
-      {/* BOTTOM group */}
-      <NavGroup
-        items={BOTTOM_ITEMS}
-        active={active}
-        activeIdx={bottomIdx}
-        onNavigate={onNavigate}
-      />
-
-      {/* ProfilePopover invocation moved to <AccountButton />. */}
-    </aside>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// NavGroup — single glowing pill tracks the active row.
-//
-// One absolutely-positioned `.aura-glow` pill slides to the active row
-// via CSS transform. The buttons themselves are fully transparent at rest;
-// hover gets a subtle bg-white/8 tint; active state is provided entirely
-// by the pill behind — no button-level background change on active.
-// ---------------------------------------------------------------------------
-
-function NavGroup({
-  items, active, activeIdx, onNavigate,
-}: {
-  items: ItemMeta[];
-  active: NavView;
-  activeIdx: number;
-  onNavigate: (view: NavView) => void;
-}) {
-  return (
-    <div className="relative">
-      {/* ── Glowing pill — slides to whichever row is active ── */}
-      <span
-        aria-hidden
-        className="aura-glow"
-        style={{
-          height: ROW_H_PX,
-          opacity: activeIdx >= 0 ? 1 : 0,
-          transform: `translateY(${Math.max(0, activeIdx) * SLOT_PX}px)`,
-        }}
-      />
-
-      {/* ── Interactive buttons ── */}
-      <div className="flex flex-col" style={{ gap: ROW_GAP_PX }}>
-        {items.map((item) => (
-          <NavRow
-            key={item.id}
-            label={item.label}
-            icon={item.icon}
-            active={active === item.id}
-            onClick={() => onNavigate(item.id)}
+        <div className="aura-rail-sec">
+          <AccountButton
+            loggedIn={!!loggedIn}
+            email={userEmail ?? null}
+            nickname={userNickname ?? null}
+            onLoginRequest={onLoginRequest}
+            onLogout={onLogout}
           />
-        ))}
-      </div>
-    </div>
+          <PartyButton />
+        </div>
+
+        <div className="aura-rail-hair" aria-hidden />
+
+        <nav ref={navRef} className="aura-rail-nav" aria-label="Main">
+          <NavList active={active} onNavigate={onNavigate} handoff={droplet.handoff} />
+        </nav>
+      </aside>
+      {/* The popup host. `display: contents` and only fixed children, so it
+          is never a flex item of the body (no extra gap), and it stays inside
+          the body: hidden with it during playback, under the detail page. */}
+      <div ref={setPopupHost} className="contents" data-rail-popups="" />
+    </RailPopupHostContext.Provider>
   );
-}
+});
 
 // ---------------------------------------------------------------------------
-// NavGroupWithSub — variant of NavGroup that allows injecting a sub-row
-// after a specific item. Used by the Queue tab to render directly below
-// Library. The pill index has to be adjusted by the caller to match the
-// extra slot the sub-row consumes.
+// NavList: the nav rows with the active pill and the hover droplet.
 // ---------------------------------------------------------------------------
 
-function NavGroupWithSub({
-  items, active, activeIdx, onNavigate,
-  renderSubAfter, pillYOverride,
-}: {
-  items: ItemMeta[];
+/** Bumped when the list's box changes size (a breakpoint changed the row
+ *  heights, a font loaded), so the pill re-measures and snaps. */
+const ListLayoutContext = createContext(0);
+
+function NavList({ active, onNavigate, handoff }: {
   active: NavView;
-  activeIdx: number;
   onNavigate: (view: NavView) => void;
-  /** Optional sub-row to inject AFTER the given item. Return null /
-   *  undefined to skip injection (no flex slot, no spacing). */
-  renderSubAfter?: (item: ItemMeta) => React.ReactNode | null;
-  /** Absolute pixel y-offset for the active pill, overriding the
-   *  default activeIdx * SLOT_PX stride. Used when the active row is
-   *  a sub-row (Queue) whose y-position doesn't fall on the regular
-   *  stride boundary. Null means "use the default stride". */
-  pillYOverride?: number | null;
+  /** performance.now() of the last click on the droplet's row (useRailDroplet). */
+  handoff: React.MutableRefObject<number>;
 }) {
-  const pillY = pillYOverride ?? Math.max(0, activeIdx) * SLOT_PX;
-  return (
-    <div className="relative">
-      <span
-        aria-hidden
-        className="aura-glow"
-        style={{
-          height: ROW_H_PX,
-          opacity: (activeIdx >= 0 || pillYOverride != null) ? 1 : 0,
-          transform: `translateY(${pillY}px)`,
-        }}
-      />
+  const listRef = useRef<HTMLDivElement>(null);
+  const [layoutGen, setLayoutGen] = useState(0);
+  useEffect(() => {
+    const list = listRef.current;
+    if (!list || typeof ResizeObserver === "undefined") return;
+    // The list (row heights stepped at a breakpoint) and the nav scroller (a
+    // shorter window: the active row may need scrolling back into view).
+    // Only fires on a real size change; the pill re-measures, it never polls.
+    const ro = new ResizeObserver(() => setLayoutGen((g) => g + 1));
+    ro.observe(list);
+    if (list.parentElement) ro.observe(list.parentElement);
+    return () => ro.disconnect();
+  }, []);
+  const parentLit = LIBRARY_SUBS.includes(active);
 
-      <div className="flex flex-col" style={{ gap: ROW_GAP_PX }}>
-        {items.map((item) => {
-          const sub = renderSubAfter?.(item);
+  return (
+    <ListLayoutContext.Provider value={layoutGen}>
+      <div ref={listRef} className="aura-rail-list">
+        {/* The active pill, under the rows (the rail's one hover droplet is
+            NavSidebar's, under this pill). */}
+        <NavPill listRef={listRef} activeId={active} handoff={handoff} />
+        {NAV_ITEMS.map((item, i) => {
+          if (item === "divider") return <div key={`div-${i}`} className="aura-rail-div" aria-hidden />;
+          const next = NAV_ITEMS[i + 1];
+          const lastSub = !!item.sub && !(next && next !== "divider" && next.sub);
           return (
-            <div key={item.id}>
-              <NavRow
-                label={item.label}
-                icon={item.icon}
-                active={active === item.id}
-                onClick={() => onNavigate(item.id)}
-              />
-              {sub}
-            </div>
+            <NavRow
+              key={item.id}
+              item={item}
+              active={active === item.id}
+              parentLit={item.id === "library" && parentLit}
+              lastSub={lastSub}
+              onClick={() => onNavigate(item.id)}
+            />
           );
         })}
       </div>
-    </div>
+    </ListLayoutContext.Provider>
   );
 }
 
 // ---------------------------------------------------------------------------
-// NavRow — transparent background; the .aura-glow pill behind supplies the
-// active indicator. Active text/icon colour uses ln-accent so it reads
-// cleanly against the pill's gradient.
+// NavPill: the active-row indicator (`.aura-rail-pill`, the nested inner glass
+// pill: a faint raised face with no backdrop pass, rim-lit by the cursor-light
+// system through data-glass-light="rim"). Moved by liquidGlass.animateSpan,
+// which writes translate + height inline: in Frosted a single write that the
+// CSS transition animates (with the spatial overshoot), in Liquid two springs
+// (leading edge fast, trailing edge slow) so the pill stretches toward the new
+// row and settles. A re-layout (a breakpoint changing the row heights) snaps.
+//
+// Two twin pills, shown by `.is-on` (opacity + visibility). A pointer click on
+// the row under the Liquid hover droplet HANDS OFF instead of flying: the
+// spare twin snaps to the clicked row and fades in while the droplet and the
+// old pill fade out, so the selection materialises where the pointer is.
+// Keyboard and programmatic route changes keep the slide.
 // ---------------------------------------------------------------------------
 
-interface RowProps {
-  label: string;
-  icon: React.ReactNode;
-  active: boolean;
-  onClick: () => void;
-}
+/** A route change this soon after a pointer click on the droplet's row is a hand-off. */
+const HANDOFF_MS = 400;
 
-// ---------------------------------------------------------------------------
-// QueueSubRow — sub-tab nested under Library in the navigation. Renders
-// indented to signal hierarchy, animates open from collapsed height
-// when the parent group is hovered or Queue itself is the active view.
-// Has its own active styling (background tint instead of the pill,
-// since the pill belongs to the top group's index math).
-// ---------------------------------------------------------------------------
-
-// Vertical gap between Library and the Queue child row — slightly
-// tighter than the standard inter-row gap to visually reinforce the
-// parent/child relationship (about 10 % less vertical space).
-const QUEUE_TOP_GAP_PX = Math.max(0, Math.round(ROW_GAP_PX * 0.9));
-
-function SubRow({
-  label, icon, active, isLast, onClick, clickPulseId,
-}: {
-  label: string;
-  icon: React.ReactNode;
-  active: boolean;
-  /** Last child under Library — its connector is a rounded L that stops
-   *  at the icon. Earlier children draw a straight trunk that runs to the
-   *  container edge so the whole spine reads as one continuous line. */
-  isLast: boolean;
-  onClick: () => void;
-  /** Bumped on every click — drives the brief shrink-then-restore
-   *  pulse on the Queue button. Re-keying the inner element via
-   *  `key={clickPulseId}` re-mounts it so the keyframes replay even
-   *  on rapid consecutive clicks. */
-  clickPulseId: number;
+function NavPill({ listRef, activeId, handoff }: {
+  listRef: React.RefObject<HTMLDivElement | null>;
+  activeId: NavView;
+  /** performance.now() of the last hand-off click (useRailDroplet), 0 when none. */
+  handoff: React.MutableRefObject<number>;
 }) {
-  return (
-    <div
-      style={{
-        height: ROW_H_PX + ROW_GAP_PX,
-        overflow: "hidden",
-      }}
-    >
-      <div
-        className="relative"
-        style={{ height: ROW_H_PX, marginTop: QUEUE_TOP_GAP_PX }}
-      >
-        {/* Tree connector into this child's icon. The vertical leg sits at
-            the same horizontal centre as the parent's icon (≈ NavRow's
-            `px-3` + half of icon width) and is anchored absolutely so it
-            doesn't shift the button's content.
-
-            The last child draws a single rounded L that stops at its icon
-            centre. Earlier children draw a straight trunk that runs past
-            the container edge (clipped by the outer `overflow: hidden`)
-            plus a horizontal tick into the icon — so the next child's
-            trunk, which starts at ITS container top, continues the same
-            line and the whole spine reads as one unbroken trunk with a
-            branch at each child instead of a stack of detached Ls. */}
-        {isLast ? (
-          <span
-            aria-hidden
-            className="absolute pointer-events-none border-l border-b border-white/20 rounded-bl-md"
-            style={{
-              left:   "1.05rem",
-              top:    -QUEUE_TOP_GAP_PX,
-              bottom: "50%",
-              width:  "0.7rem",
-            }}
-          />
-        ) : (
-          <>
-            <span
-              aria-hidden
-              className="absolute pointer-events-none border-l border-white/20"
-              style={{ left: "1.05rem", top: -QUEUE_TOP_GAP_PX, bottom: "-1rem" }}
-            />
-            <span
-              aria-hidden
-              className="absolute pointer-events-none border-t border-white/20"
-              style={{ left: "1.05rem", top: "50%", width: "0.7rem" }}
-            />
-          </>
-        )}
-        {/* The button's own background tint is dropped now that the
-            standard active-pill (.aura-glow) covers Queue when active.
-            Click animation lives on a wrapper keyed by `clickPulseId`
-            so each click remounts and replays the shrink keyframe. */}
-        <div
-          key={clickPulseId}
-          className={clickPulseId > 0 ? "aura-queue-click-pulse" : ""}
-        >
-          <button
-            onClick={onClick}
-            aria-label={label}
-            className={[
-              "nav-tap relative w-full flex items-center gap-2.5 pl-8 pr-3 rounded-xl",
-              "transition-colors duration-150",
-              active
-                ? "text-ln-accent"
-                : "text-white/55 hover:text-white/90 hover:bg-white/[0.08]",
-            ].join(" ")}
-            style={{ height: ROW_H_PX }}
-          >
-            <span className="flex-shrink-0">{icon}</span>
-            <span className="text-[12.5px] font-medium tracking-wide">{label}</span>
-          </button>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function NavRow({ label, icon, active, onClick }: RowProps) {
-  return (
-    <button
-      onClick={onClick}
-      aria-label={label}
-      // `w-full` is what makes the hover background fill the same
-      // footprint as the `.aura-glow` active pill (which is
-      // absolute-positioned left:0 right:0 across the group). Without
-      // it the hover bg only spanned the intrinsic icon+label width,
-      // so Calendar / History / Discover hover looked tighter than
-      // Queue (which has w-full in its sub-row variant).
-      className={`nav-tap relative w-full flex items-center gap-3 px-3 rounded-xl
-                  transition-all duration-150
-                  ${active
-                    ? "text-ln-accent"
-                    : "text-white/60 hover:text-white/90 hover:bg-white/[0.08]"
-                  }`}
-      style={{ height: ROW_H_PX }}
-    >
-      <span className="flex-shrink-0">{icon}</span>
-      <span className="text-[13.5px] font-medium tracking-wide">{label}</span>
-    </button>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// ProfilePopover — hangs BELOW its trigger icon. It measures the trigger's
-// box (passed as `triggerRef`) through partyAnchor's `anchorFromRect` — the
-// same helper the Watch-Together panel/toasts use — so it seats itself a hair
-// under the button, flips to the icon's side, and clamps its height to the
-// viewport (overflow-y) rather than clipping off the top edge. Exported so the
-// floating AccountButton (top-left of the app, below the title bar) reuses the
-// same panel without forking the JSX.
-// ---------------------------------------------------------------------------
-
-// Exit-animation duration — the popover stays mounted this long after `open`
-// flips false so it can collapse back into its trigger before unmounting.
-// Keep in step with the transform/opacity transition below.
-const PROFILE_EXIT_MS = 200;
-
-export function ProfilePopover({
-  open, triggerRef, loggedIn, email, nickname, onLogin, onLogout,
-}: {
-  open: boolean;
-  triggerRef: React.RefObject<HTMLButtonElement | null>;
-  loggedIn: boolean;
-  email?: string | null;
-  nickname?: string | null;
-  onLogin: () => void;
-  onLogout: () => void;
-}) {
-  // Mount + spawn/despawn lifecycle, mirrored from WatchTogetherPanel so the
-  // popover grows out of / collapses back into the account button with the
-  // SAME easing (the old CSS keyframe was a springy overshoot that read as
-  // "snappy"). `render` keeps the card alive through the exit animation;
-  // `visible` drives the enter/exit transition; `anchor` pins it under the
-  // trigger (measured via partyAnchor's anchorFromRect — top-LEFT default).
-  const [render, setRender] = useState(open);
-  const [visible, setVisible] = useState(false);
-  const [anchor, setAnchor] = useState<PartyAnchor>({ side: "left", top: 94, left: 12 });
-
-  // On open: snapshot the anchor, mount, then flip `visible` on the next
-  // frame so the transition runs from the collapsed state; re-pin on resize.
-  // On close: flip `visible` off and unmount once the exit finishes.
-  useEffect(() => {
-    if (open) {
-      const measure = () => {
-        const el = triggerRef.current;
-        if (el) setAnchor(anchorFromRect(el.getBoundingClientRect()));
-      };
-      measure();
-      setRender(true);
-      // Capture BOTH rAF handles: a close inside the ~16ms gap must not let
-      // the inner frame fire setVisible(true) after the exit already began.
-      let inner = 0;
-      const outer = requestAnimationFrame(() => {
-        inner = requestAnimationFrame(() => setVisible(true));
-      });
-      window.addEventListener("resize", measure);
-      return () => {
-        cancelAnimationFrame(outer);
-        cancelAnimationFrame(inner);
-        window.removeEventListener("resize", measure);
-      };
+  const layoutGen = useContext(ListLayoutContext);
+  const p0 = useRef<HTMLSpanElement>(null);
+  const p1 = useRef<HTMLSpanElement>(null);
+  const cur = useRef(0);
+  const placed = useRef<NavView | null>(null);
+  useLayoutEffect(() => {
+    const pills = [p0.current, p1.current];
+    const live = pills[cur.current], spare = pills[1 - cur.current];
+    const clickedAt = handoff.current;
+    handoff.current = 0;
+    const list = listRef.current;
+    if (!live || !spare || !list) return;
+    const row = list.querySelector<HTMLElement>(`[data-nav-id="${activeId}"]`);
+    if (!row) {
+      // Fade out in place; the next appearance snaps.
+      cancelSpan(live);
+      live.classList.remove("is-on");
+      placed.current = null;
+      return;
     }
-    setVisible(false);
-    const t = setTimeout(() => setRender(false), PROFILE_EXIT_MS);
-    return () => clearTimeout(t);
-  }, [open, triggerRef]);
-
-  // Read-only Stremio account snapshot, baked directly into this popover (the
-  // former separate "Account settings" panel was folded in here). Fetched on
-  // open; the Rust command is cached 24h so each open is a cache hit.
-  // Best-effort — failure just leaves the prop email.
-  const [acct, setAcct] = useState<StremioAccount | null>(null);
+    const span = { a: row.offsetTop, b: row.offsetTop + row.offsetHeight };
+    const moved = placed.current !== null && placed.current !== activeId;
+    // A window short enough that the nav section scrolls: keep the active
+    // row in view (a route change from a shortcut, or a resize).
+    const scroller = list.parentElement;
+    if (scroller && scroller.scrollHeight > scroller.clientHeight + 1) {
+      const sr = scroller.getBoundingClientRect(), rr = row.getBoundingClientRect();
+      const pad = 6;
+      if (rr.top < sr.top + pad) scroller.scrollTop -= sr.top + pad - rr.top;
+      else if (rr.bottom > sr.bottom - pad) scroller.scrollTop += rr.bottom - (sr.bottom - pad);
+    }
+    if (moved && clickedAt > 0 && performance.now() - clickedAt < HANDOFF_MS
+        && liquidActive() && !reducedMotionActive()) {
+      animateSpan(spare, "y", span, { snap: true });
+      spare.classList.add("is-on");
+      cancelSpan(live);
+      live.classList.remove("is-on");
+      cur.current = 1 - cur.current;
+    } else {
+      // First placement and a re-layout snap; a route change slides.
+      animateSpan(live, "y", span, { snap: !moved });
+      live.classList.add("is-on");
+    }
+    placed.current = activeId;
+  }, [activeId, layoutGen, listRef, handoff]);
   useEffect(() => {
-    if (!open || !loggedIn) return;
-    let cancelled = false;
-    invoke<StremioAccount>("fetch_stremio_account")
-      .then((a) => { if (!cancelled) setAcct(a); })
-      .catch(() => {});
-    return () => { cancelled = true; };
-  }, [open, loggedIn]);
-
-  if (!render) return null;
-
-  const reduced = document.documentElement.getAttribute("data-reduced-motion") === "true";
-
-  const monthYear = (iso: string | null | undefined): string | null => {
-    if (!iso) return null;
-    const t = Date.parse(iso);
-    if (Number.isNaN(t)) return null;
-    return new Date(t).toLocaleDateString(undefined, { month: "short", year: "numeric" });
-  };
-
-  const fetchedEmail = acct?.email && acct.email.length > 0 ? acct.email : null;
-  const propEmail = email && email.length > 0 ? email : null;
-  const shownEmail = fetchedEmail ?? propEmail;
-  const since = monthYear(acct?.date_registered);
-  const premium = monthYear(acct?.premium_until);
-  const id = acct?.user_id ?? "";
-  const acctId = id.length > 12 ? `${id.slice(0, 6)}…${id.slice(-4)}` : (id || null);
-
+    const a = p0.current, b = p1.current;
+    return () => {
+      if (a) cancelSpan(a);
+      if (b) cancelSpan(b);
+    };
+  }, []);
   return (
-    <div
-      data-profile-popover
-      role="dialog"
-      aria-label="Profile"
-      // bg-black/72 was bleeding the SearchBar text through the
-      // popover. Bumped to /95 + an explicit solid backdrop layer so
-      // the dialog reads cleanly at any z-stack depth without losing
-      // the glass aesthetic.
-      className="fixed w-[300px] z-[10045] overflow-y-auto
-                 rounded-2xl border border-white/15 shadow-glass-edge
-                 aura-float-glass"
-      style={{
-        top: anchor.top,
-        ...(anchor.side === "left" ? { left: anchor.left } : { right: anchor.right }),
-        maxHeight: `calc(100vh - ${anchor.top + 16}px)`,
-        transformOrigin: anchor.side === "left" ? "top left" : "top right",
-        opacity: visible ? 1 : 0,
-        // Grow out of / collapse back into the account button corner — same
-        // easing as WatchTogetherPanel.
-        transform: visible
-          ? "translateY(0) scale(1)"
-          : reduced ? "none" : "translateY(-8px) scale(0.96)",
-        transition: reduced
-          ? "opacity 160ms ease"
-          : "opacity 200ms ease, transform 240ms cubic-bezier(0.16, 1, 0.3, 1)",
-      }}
-    >
-      {/* Top — logo + identity */}
-      <div className="flex items-center gap-3 px-4 pt-4 pb-3 border-b border-white/8">
-        <span className="relative flex items-center justify-center w-12 h-12 rounded-full
-                         bg-white/5 border border-white/10
-                         shadow-[0_0_28px_rgba(91,164,255,0.25)]">
-          <AuraLogoA size={36} />
-          <span aria-hidden
-                className={`absolute -bottom-0.5 -right-0.5 w-3 h-3 rounded-full border-2 border-black/75
-                            ${loggedIn ? "bg-emerald-400" : "bg-white/30"}`}
-                style={{ boxShadow: loggedIn ? "0 0 8px rgba(110,231,183,0.65)" : undefined }} />
-        </span>
-        <div className="flex-1 min-w-0 selectable">
-          {!loggedIn ? (
-            <>
-              <p className="text-white/95 text-sm font-semibold leading-tight truncate">Guest mode</p>
-              <p className="text-white/45 text-[11px] mt-0.5 truncate font-mono">No Stremio account linked</p>
-            </>
-          ) : (
-            <>
-              <p className="text-white/95 text-sm font-semibold leading-tight truncate">
-                {nickname && nickname.length > 0 ? nickname : "Stremio account"}
-              </p>
-              <p className="text-white/45 text-[11px] mt-0.5 truncate font-mono">
-                {shownEmail ?? "Email pending sync"}
-              </p>
-            </>
-          )}
-        </div>
-      </div>
-
-      {/* Account details — baked in (replaces the old separate panel). */}
-      {loggedIn && (since || acctId || premium) && (
-        <div className="px-4 py-3 border-b border-white/8 space-y-1.5 selectable">
-          {since && (
-            <div className="flex items-center justify-between gap-3 text-[12px]">
-              <span className="text-white/40">Member since</span>
-              <span className="text-white/85">{since}</span>
-            </div>
-          )}
-          {acctId && (
-            <div className="flex items-center justify-between gap-3 text-[12px]">
-              <span className="text-white/40">Account</span>
-              <span className="text-white/85 font-mono">{acctId}</span>
-            </div>
-          )}
-          {premium && (
-            <div className="flex items-center justify-between gap-3 text-[12px]">
-              <span className="text-white/40">Stremio Premium</span>
-              <span className="text-white/85">until {premium}</span>
-            </div>
-          )}
-        </div>
-      )}
-
-      <div className="px-4 py-3 border-b border-white/8">
-        <p className="text-white/40 text-[9.5px] font-mono font-semibold tracking-[0.18em] uppercase mb-1.5">
-          Sync
-        </p>
-        <div className="flex items-center gap-2">
-          <span className={`w-2 h-2 rounded-full ${loggedIn ? "bg-emerald-400" : "bg-white/30"}`}
-                style={{ boxShadow: loggedIn ? "0 0 6px rgba(110,231,183,0.7)" : undefined }} />
-          <p className="text-white/85 text-[12.5px]">
-            {loggedIn ? "Synced to Stremio cloud" : "Local only. Sign in to sync."}
-          </p>
-        </div>
-      </div>
-
-      <div className="py-1">
-        {loggedIn && (
-          <PopoverButton
-            icon={
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
-                <path d="M14 3v2h3.59l-9.83 9.83 1.41 1.41L19 6.41V10h2V3h-7zM19 19H5V5h7V3H5c-1.11 0-2 .9-2 2v14c0 1.1.89 2 2 2h14c1.1 0 2-.9 2-2v-7h-2v7z" />
-              </svg>
-            }
-            label="Manage on Stremio"
-            onClick={() => { openUrl("https://www.stremio.com/acc-settings").catch(() => {}); }}
-          />
-        )}
-        {loggedIn ? (
-          <PopoverButton icon={<LogOutIcon />} label="Log out" danger onClick={onLogout} />
-        ) : (
-          <PopoverButton icon={<SignInIcon />} label="Sign in to Stremio" accent onClick={onLogin} />
-        )}
-      </div>
-
-    </div>
+    <>
+      <span ref={p0} aria-hidden className="aura-rail-pill" data-glass-light="rim" />
+      <span ref={p1} aria-hidden className="aura-rail-pill" data-glass-light="rim" />
+    </>
   );
 }
 
-function PopoverButton({
-  icon, label, onClick, danger, accent,
-}: {
-  icon: React.ReactNode;
-  label: string;
+// ---------------------------------------------------------------------------
+// useRailDroplet: Liquid's hover droplet (.aura-glass-hl) for the WHOLE rail.
+// One faint face under every row (Notifications, User Panel, Watch Party and
+// the nav) that slides to the row under the pointer on the hover spring,
+// across the hairlines and the nav's divider, in both directions. It used to
+// be three droplets (one per section): crossing a hairline left one list
+// (its droplet faded out) and entered another (its droplet snapped in), so
+// Settings <-> Notifications never slid while History <-> Addons did.
+//
+// Positioned in the rail's padding box (inside `.aura-rail-hlclip`, the
+// rail's first child, under the pill and the rows, which clips a slide's
+// overshoot to the rail's rounded box): `translate` + `height` through animateSpan, `left` +
+// `width` inline from the row's rect (a nav row is narrower while the nav
+// shows a scrollbar). A nav row is CLAMPED to the nav scroller's box, so the
+// droplet never paints past the scroller's clip on a short window, and it
+// follows its row while the nav scrolls.
+//
+// Over the active nav row (the pill marks it) the droplet slides there and
+// fades out under the pill; from there it slides out again to the next row,
+// so even the active row never breaks the motion. A click fades it out in
+// place (and, on the droplet's own nav row, hands off to the pill: NavPill);
+// it lights again when the pointer reaches another row. Leaving the rail
+// fades it out where it is, and the next entry snaps it in.
+//
+// Native listeners on the rail, not React handlers: the rows' popups are
+// React children portalled OUT of the rail (RailPopup), and React bubbles
+// their events (and computes pointerleave) through the React tree, so a
+// pointer on the notifications sheet would still count as "in the rail".
+// Driven by pointermove only (a closest() per move, one rect pair per row
+// CHANGE), so a pointerover from a re-layout under a still pointer never
+// lights a row. Inert in Frosted (rows keep their own hover fill there).
+// ---------------------------------------------------------------------------
+
+function useRailDroplet(
+  railRef: React.RefObject<HTMLElement | null>,
+  navRef: React.RefObject<HTMLElement | null>,
+) {
+  const ref = useRef<HTMLSpanElement>(null);
+  const handoff = useRef(0);
+  useEffect(() => {
+    const rail = railRef.current, hl = ref.current, nav = navRef.current;
+    if (!rail || !hl) return;
+    /** The row the droplet is on (lit, or faded out on it after a click or
+     *  under the pill). */
+    let row: HTMLElement | null = null;
+    /** The droplet's span sits on a real row right now, so the next row
+     *  slides from it (false after leaving the rail: the next entry snaps). */
+    let anchored = false;
+    let lastLeft = "", lastWidth = "";
+
+    const rowAt = (t: EventTarget | null): HTMLElement | null => {
+      const r = (t as Element | null)?.closest?.<HTMLElement>(".aura-nav-row") ?? null;
+      return r && rail.contains(r) ? r : null;
+    };
+    /** Moves the droplet onto `r`; false when `r` is scrolled fully out. */
+    const place = (r: HTMLElement, snap: boolean): boolean => {
+      const box = rail.getBoundingClientRect();
+      const rr = r.getBoundingClientRect();
+      let top = rr.top, bottom = rr.bottom;
+      if (nav && nav.contains(r)) {
+        const nr = nav.getBoundingClientRect();
+        top = Math.max(top, nr.top);
+        bottom = Math.min(bottom, nr.bottom);
+      }
+      if (bottom - top < 2) return false;
+      // The padding box is the containing block: offsets from the border's
+      // inner edge.
+      const left = `${(rr.left - box.left - rail.clientLeft).toFixed(2)}px`;
+      const width = `${rr.width.toFixed(2)}px`;
+      if (left !== lastLeft) { hl.style.left = left; lastLeft = left; }
+      if (width !== lastWidth) { hl.style.width = width; lastWidth = width; }
+      const a = top - box.top - rail.clientTop;
+      animateSpan(hl, "y", { a, b: a + (bottom - top) }, { snap, spring: "hover" });
+      return true;
+    };
+    const hide = () => {
+      row = null;
+      anchored = false;
+      // Stop a spring in flight where it is, so the droplet fades in place.
+      cancelSpan(hl);
+      hl.classList.remove("is-on");
+    };
+    const onMove = (e: PointerEvent) => {
+      if (!liquidActive()) return;
+      const r = rowAt(e.target);
+      if (!r || r === row) return;
+      if (!place(r, !anchored)) { hide(); return; }
+      anchored = true;
+      row = r;
+      // The active row already wears the pill: the droplet rides under it,
+      // faded out, ready to slide out to the next row.
+      hl.classList.toggle("is-on", r.getAttribute("aria-current") !== "page");
+    };
+    const onClick = (e: MouseEvent) => {
+      const r = rowAt(e.target);
+      if (!r) return;
+      // A click on the row the droplet sits on: NavPill hands the droplet off
+      // to the pill at that row instead of flying the pill from the old one.
+      if (r === row && hl.classList.contains("is-on")) handoff.current = performance.now();
+      cancelSpan(hl);
+      hl.classList.remove("is-on");
+      // Stays on this row (faded): it lights again on the next row, sliding
+      // from here.
+      row = r;
+    };
+    // The nav scrolled under the droplet: follow its row (snapped, clamped to
+    // the scroller); a row scrolled fully out hides it.
+    const onNavScroll = () => {
+      if (!row || !anchored || !nav || !nav.contains(row)) return;
+      if (!place(row, true)) hide();
+    };
+    rail.addEventListener("pointermove", onMove, { passive: true });
+    rail.addEventListener("pointerleave", hide);
+    rail.addEventListener("click", onClick);
+    nav?.addEventListener("scroll", onNavScroll, { passive: true });
+    return () => {
+      rail.removeEventListener("pointermove", onMove);
+      rail.removeEventListener("pointerleave", hide);
+      rail.removeEventListener("click", onClick);
+      nav?.removeEventListener("scroll", onNavScroll);
+      cancelSpan(hl);
+    };
+  }, [railRef, navRef]);
+  return { ref, handoff };
+}
+
+// ---------------------------------------------------------------------------
+// NavRow: transparent; the pill behind supplies the active indicator and the
+// label colour comes from glass-rail.css (accent in Frosted, accent 34% over
+// white in Liquid). A sub-row is indented under Library with a tree connector
+// (`.aura-rail-sub`, the last one an L) and plays a short shrink-and-restore on
+// click, since its smaller row makes a plain pill slide read as muted.
+// ---------------------------------------------------------------------------
+
+/** The sub-row click pulse (was the keyed `.aura-queue-click-pulse` wrapper,
+ *  which remounted the button and dropped its focus). */
+const SUB_PULSE: Keyframe[] = [
+  { transform: "scale(1)" },
+  { transform: "scale(0.92)", offset: 0.45 },
+  { transform: "scale(1)" },
+];
+
+function NavRow({ item, active, parentLit, lastSub, onClick }: {
+  item: ItemMeta;
+  active: boolean;
+  /** Library while one of its sub-views is the page. */
+  parentLit: boolean;
+  /** The last sub-row under its parent (its connector is an L). */
+  lastSub: boolean;
   onClick: () => void;
-  danger?: boolean;
-  accent?: boolean;
 }) {
   return (
     <button
-      onClick={onClick}
-      className={`w-full flex items-center gap-3 px-4 py-2.5 text-left text-[13px]
-                  transition-colors
-                  ${danger
-                    ? "text-red-300/90 hover:bg-red-400/10"
-                    : accent
-                      ? "text-ln-accent hover:bg-ln-accent/10"
-                      : "text-white/85 hover:bg-white/8"
-                  }`}
+      type="button"
+      data-nav-id={item.id}
+      onClick={(e) => {
+        if (item.sub && !reducedMotionActive()) {
+          e.currentTarget.animate?.(SUB_PULSE, { duration: 280, easing: "cubic-bezier(0.4, 0, 0.2, 1)" });
+        }
+        onClick();
+      }}
+      aria-label={item.label}
+      aria-current={active ? "page" : undefined}
+      data-parent-lit={parentLit ? "" : undefined}
+      className={[
+        "aura-rail-row aura-nav-row nav-tap",
+        item.sub ? "aura-rail-sub" : "aura-rail-navrow",
+        lastSub ? "is-last" : "",
+      ].filter(Boolean).join(" ")}
     >
-      <span className="flex-shrink-0 opacity-80">{icon}</span>
-      <span>{label}</span>
+      <span className="aura-rail-icon">{item.icon}</span>
+      <span className="aura-rail-label">{item.label}</span>
     </button>
   );
 }

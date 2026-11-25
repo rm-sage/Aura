@@ -476,6 +476,21 @@ function splitOnDot(s: string): string[] {
     .filter((t) => hasVisible(t));
 }
 
+/** An age the formatter printed unrounded. AIOStreams' `formatHours`
+ *  (packages/core/src/formatters/utils.ts) writes `${hours}h` for anything
+ *  under a day, so a release 16.89 hours old reads "16.89044138888889h".
+ *  A numeric age with a fraction is rounded down like the formatter's own
+ *  day values (and `formatAgeHours`); hours past a day become days. Any other
+ *  wording ("2 days", "352d") is kept as written. */
+function normalizeAge(raw: string | null): string | null {
+  if (raw == null) return null;
+  const m = /^(\d+)\.\d+\s*(mo|[mhdwy])$/i.exec(raw.trim());
+  if (!m) return raw;
+  const n = Number(raw.trim().match(/^\d+(?:\.\d+)?/)![0]);
+  if (m[2].toLowerCase() === "h") return formatAgeHours(n);
+  return `${Math.floor(n)}${m[2].toLowerCase()}`;
+}
+
 function parseSeederValue(raw: string): { count: number | null; age: string | null } {
   // Examples after NFKC:
   //   "245❦"               → 245 seeders, no age
@@ -495,7 +510,7 @@ function parseSeederValue(raw: string): { count: number | null; age: string | nu
     const n = parseFloat(s);
     if (isFinite(n)) count = Math.round(n * mult);
   }
-  return { count, age: tail };
+  return { count, age: normalizeAge(tail) };
 }
 
 /** Parse the size line — handles size, optional `/folderSize`, optional
@@ -524,7 +539,7 @@ function parseSizeLine(raw: string): {
     if (br && !bitrate) {
       bitrate = `${br[1]} ${br[2].slice(0, 1).toUpperCase()}${br[2].slice(1).toLowerCase()}`;
     } else if (AGE_TOKEN_RX.test(part) && !age) {
-      age = part.replace(/\s+/g, "");
+      age = normalizeAge(part.replace(/\s+/g, ""));
     } else if (!SIZE_RX.test(head)) {
       head = `${head} ${part}`;
     }

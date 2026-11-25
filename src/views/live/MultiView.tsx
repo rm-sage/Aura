@@ -2,12 +2,15 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { memo, useEffect, useMemo, useRef, useState } from "react";
+import type React from "react";
 import Hls, {
   type LoaderContext,
   type LoaderConfiguration,
   type LoaderCallbacks,
 } from "hls.js";
 import type { IptvChannel } from "../../iptv/types";
+import { useListDroplet } from "../../glassListDroplet";
+import { SegmentedControl } from "../../settingsControls";
 
 // ---------------------------------------------------------------------------
 // MultiView — a 2 / 3 / 2×2 grid of simultaneous live tiles, played with
@@ -123,26 +126,22 @@ export default function MultiView({ channels, onPlayChannel, suspended }: Props)
     <div className="flex-1 flex flex-col min-h-0">
       {/* Controls: layout selector + clear all */}
       <div className="px-6 pt-1 pb-2 flex items-center gap-2 flex-wrap">
-        <div className="flex gap-1 p-1 rounded-xl bg-white/5 border border-white/8">
-          {(["2", "3", "2x2"] as const).map((l) => (
-            <button
-              key={l}
-              type="button"
-              onClick={() => setLayout(l)}
-              className={[
-                "px-3 h-7 rounded-lg text-[12px] font-medium transition-colors",
-                layout === l ? "bg-ln-accent/20 text-ln-accent" : "text-white/55 hover:text-white/85",
-              ].join(" ")}
-            >
-              {l === "2x2" ? "2×2" : l}
-            </button>
-          ))}
-        </div>
+        {/* Layout: the shared glass segmented control. */}
+        <SegmentedControl<Layout>
+          value={layout}
+          onChange={setLayout}
+          ariaLabel="Multiview layout"
+          options={[
+            { value: "2", label: "2" },
+            { value: "3", label: "3" },
+            { value: "2x2", label: "2×2" },
+          ]}
+        />
         <button
           type="button"
           onClick={clearAll}
-          className="px-3 h-9 rounded-xl text-[12.5px] font-medium bg-white/5 border border-white/10
-                     text-white/65 hover:bg-white/10 hover:text-white/90"
+          className="aura-glass-flat aura-glass-press px-3 h-8 rounded-xl text-[12.5px] font-medium
+                     text-white/65 hover:text-white/90"
         >
           Clear all
         </button>
@@ -181,8 +180,8 @@ export default function MultiView({ channels, onPlayChannel, suspended }: Props)
             <path d="M12 2 1 21h22L12 2zm0 14a1 1 0 1 1 0 2 1 1 0 0 1 0-2zm1-7-.25 5.5h-1.5L11 9h2z" />
           </svg>
           <span>
-            Most IPTV providers cap simultaneous streams per account (commonly 1–2). If a tile drops to
-            "Stream offline" while others play, your provider may be throttling — close a stream and retry.
+            Most IPTV providers cap simultaneous streams per account (commonly 1 or 2). If a tile drops to
+            "Stream offline" while others play, your provider may be throttling: close a stream and retry.
           </span>
         </div>
       </div>
@@ -405,13 +404,13 @@ const Tile = memo(function Tile({
       {status === "error" && (
         <span className="absolute inset-0 flex flex-col items-center justify-center gap-1 text-white/55 text-[12px] px-3 text-center">
           <span className="text-red-300/80 font-medium">Stream offline</span>
-          <span className="text-white/35 text-[11px]">Provider may be throttling — try another channel.</span>
+          <span className="text-white/35 text-[11px]">Provider may be throttling. Try another channel.</span>
         </span>
       )}
       {status === "unsupported" && (
         <span className="absolute inset-0 flex flex-col items-center justify-center gap-1 text-white/55 text-[12px] px-3 text-center">
           <span className="text-white/70 font-medium">Not previewable here</span>
-          <span className="text-white/35 text-[11px]">This stream isn't HLS — double-click to open it in the player.</span>
+          <span className="text-white/35 text-[11px]">This stream isn't HLS. Double-click to open it in the player.</span>
         </span>
       )}
 
@@ -462,12 +461,23 @@ function ChannelPicker({
     const base = needle ? channels.filter((c) => c.name.toLowerCase().includes(needle)) : channels;
     return base.slice(0, 300);
   }, [channels, q]);
+  // Liquid's shared hover droplet over the channel rows (inert in Frosted).
+  const droplet = useListDroplet();
+  const hideDroplet = droplet.hide;
+  useEffect(() => { hideDroplet(); }, [list, hideDroplet]);
 
   return (
-    <div className="fixed inset-0 z-[200] flex items-center justify-center bg-black/60 backdrop-blur-sm" onClick={onClose}>
+    <div className="fixed inset-0 z-[200] flex items-center justify-center" onClick={onClose}>
+      {/* The dim + blur is a SIBLING layer, not the wrapper: a backdrop-filter
+          on an ancestor would make it the card's Backdrop Root, so the card
+          would sample only the flat scrim and never the video tiles. */}
+      <div aria-hidden className="aura-modal-backdrop-in absolute inset-0 bg-black/60 backdrop-blur-sm" />
+      {/* A dialog: the menu tier of the glass (aura-float-glass), growing
+          from the centre. Multiview tiles are <video> elements inside the
+          webview, so the backdrop pass has real pixels to blur here. */}
       <div
-        className="w-[460px] max-w-[92vw] max-h-[70vh] flex flex-col rounded-2xl border border-white/12
-                   bg-[rgba(16,16,20,0.98)] backdrop-blur-2xl shadow-glass-edge p-4"
+        className="aura-float-glass aura-glass-pop-in relative w-[460px] max-w-[92vw] max-h-[70vh] flex flex-col rounded-2xl p-4"
+        style={{ "--lg-origin": "50% 50%" } as React.CSSProperties}
         onClick={(e) => e.stopPropagation()}
       >
         <input
@@ -476,10 +486,20 @@ function ChannelPicker({
           onChange={(e) => setQ(e.target.value)}
           placeholder="Search channels to add…"
           data-aura-search
-          className="h-10 px-3 mb-3 rounded-xl bg-white/5 border border-white/10 text-[13px]
-                     text-white/90 placeholder:text-white/30 focus:outline-none focus:border-ln-accent/40"
+          className="aura-glass-field h-10 px-3 mb-3 rounded-xl text-[13px]
+                     text-white/90 placeholder:text-white/30 outline-none"
         />
-        <div className="flex-1 overflow-y-auto -mx-1 px-1" style={{ scrollbarWidth: "thin" }}>
+        <div
+          className="relative flex-1 overflow-y-auto -mx-1 px-1"
+          style={{ scrollbarWidth: "thin" }}
+          {...droplet.listProps}
+        >
+          <span
+            ref={droplet.ref}
+            aria-hidden
+            className="aura-glass-hl"
+            style={{ left: 4, right: 4, borderRadius: 8 }}
+          />
           {list.length === 0 ? (
             <p className="text-white/40 text-sm py-8 text-center">No channels match.</p>
           ) : (
@@ -488,7 +508,7 @@ function ChannelPicker({
                 key={ch.id}
                 type="button"
                 onClick={() => onPick(ch)}
-                className="w-full flex items-center gap-2.5 px-2 py-1.5 rounded-lg text-left hover:bg-white/[0.06]"
+                className="aura-glass-row relative w-full flex items-center gap-2.5 px-2 py-1.5 rounded-lg text-left"
               >
                 {ch.logo ? (
                   <img src={ch.logo} alt="" loading="lazy" className="w-7 h-7 object-contain flex-shrink-0"

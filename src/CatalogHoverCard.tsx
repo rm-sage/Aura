@@ -490,7 +490,7 @@ function HoverPanel({
   }, [meta.id, meta.media_type, addons]);
 
   // Multi-source rating enrichment — the SAME free aggregator the
-  // detail page uses (MDBList: IMDb / RT / Metacritic / TMDB / Trakt /
+  // detail page uses (MDBList: IMDb / RT / Metacritic / TMDB /
   // Letterboxd; + MAL/AniList for anime). The addon's own
   // `detail.ratings` is usually just IMDb, which is why the hover card
   // looked bare. Session-cached per id so repeat hovers don't burn the
@@ -892,9 +892,13 @@ function HoverPanel({
         data-hover-panel="true"
         onMouseEnter={() => { if (exiting) return; notePanelPointer(true); setPointerInside(true); cancelHoverClose(); }}
         onMouseLeave={() => { notePanelPointer(false); setPointerInside(false); if (!exiting) scheduleHoverClose(); }}
-        className="relative w-[360px] overflow-hidden
-                   rounded-xl border border-white/12 bg-black/85 backdrop-blur-2xl
-                   shadow-[0_28px_64px_-20px_rgba(0,0,0,0.92)]"
+        // Floating glass, menu tier (App.css GLASS SYSTEM): the material
+        // draws background, border, shadow and blur, so no utilities here.
+        // data-liquid="off": its height glides between posters on every
+        // hover, and each new height would cost a fresh filter build, so in
+        // Liquid it keeps the CSS face (no lens) rather than rebuilding maps.
+        data-liquid="off"
+        className="aura-float-glass relative w-[360px] overflow-hidden rounded-xl"
         style={{
           height: pos.ready ? pos.h : undefined,
           transition: pos.animate ? `height ${GLIDE_MS}ms ${EASE_OUT}` : "none",

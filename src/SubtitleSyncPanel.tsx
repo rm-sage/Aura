@@ -1,7 +1,7 @@
 // Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { TrackEntry } from "./types";
 // Mandatory: without this the overlay's control bar auto-hides out from under
@@ -9,6 +9,7 @@ import type { TrackEntry } from "./types";
 // can join the counter without importing back into PlayerOverlay.
 import { useMenuOpenSync } from "./menuTracker";
 import { PlayerMenuButton, PlayerMenuChip } from "./playerMenu";
+import { useListDroplet } from "./glassListDroplet";
 
 // ---------------------------------------------------------------------------
 // SubtitleSyncPanel - "Live Subtitle Sync"
@@ -238,7 +239,7 @@ interface Props {
   setFirstAnchor: (pair: SyncAnchorPair | null) => void;
 }
 
-export default function SubtitleSyncPanel({
+function SubtitleSyncPanel({
   open, onClose,
   currentTime, paused, togglePause,
   tracks, streamUrl,
@@ -266,6 +267,8 @@ export default function SubtitleSyncPanel({
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const rowRefs = useRef<Map<number, HTMLButtonElement>>(new Map());
+  // Liquid's shared hover droplet over the cue rows (inert in Frosted).
+  const droplet = useListDroplet();
   const centeredRef = useRef(false);
   const flashTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -683,7 +686,10 @@ export default function SubtitleSyncPanel({
     // of the subtitle menu it was opened from rather than a separate dialog.
     <div className="absolute inset-0 z-40 flex items-end justify-end p-6 pointer-events-none">
       <div
-        className="aura-glass-menu rounded-2xl shadow-glass-edge w-full max-w-[34rem]
+        // A PLAYER surface: .aura-glass-player, the chosen material with no
+        // backdrop pass (the video is the native mpv window under the
+        // webview, so a blur or a Liquid lens would sample nothing).
+        className="aura-glass-player rounded-2xl w-full max-w-[34rem]
                    pointer-events-auto flex flex-col max-h-[70vh] overflow-hidden"
       >
         {/* Header. The title row of the player menus (playerMenu.tsx): a 14 px
@@ -763,9 +769,8 @@ export default function SubtitleSyncPanel({
               placeholder="Search the lines… (Enter jumps to the next match)"
               data-aura-search
               spellCheck={false}
-              className="w-full h-9 bg-white/8 border border-white/12 rounded-lg px-3
-                         text-[13.5px] placeholder:text-white/55 outline-none focus:border-white/30
-                         transition-colors"
+              className="aura-glass-field w-full h-9 rounded-lg px-3
+                         text-[13.5px] placeholder:text-white/55 outline-none"
               style={{ color: "var(--text-primary)" }}
             />
           </div>
@@ -822,7 +827,14 @@ export default function SubtitleSyncPanel({
             scrollbarWidth: "thin",
             scrollbarColor: "rgba(255,255,255,0.1) transparent",
           }}
+          {...droplet.listProps}
         >
+          <span
+            ref={droplet.ref}
+            aria-hidden
+            className="aura-glass-hl"
+            style={{ left: 6, right: 6, borderRadius: 12 }}
+          />
           {status === "loading" && (
             <div className="text-white/60 text-[13px] px-3 py-8 text-center leading-relaxed">
               Reading the subtitle track…
@@ -887,20 +899,24 @@ export default function SubtitleSyncPanel({
                 }}
                 onClick={() => { void onPickCue(idx); }}
                 // Same row as the player menus (playerMenu.tsx PlayerMenuRow):
-                // rounded-xl, 13.5 px at 90% white, white/10 on hover, the
-                // accent fill for the line on screen at the anchor. No per-row
-                // borders, which is what made this list read as a list of cards
-                // rather than a menu. The search match sits a step brighter
-                // than hover so it stays visible under the pointer.
-                className={`w-full text-left rounded-xl px-3 py-2 text-[13.5px] leading-snug
-                            transition-colors focus:outline-none focus-visible:ring-1 focus-visible:ring-white/30
+                // .aura-glass-row, rounded-xl, 13.5 px at 90% white. The anchor
+                // (the line on screen at the pick) is the SELECTED row
+                // (is-selected: Frosted white bold, Liquid the raised face with
+                // an accent label, never an accent fill); a fresh pick flashes
+                // (is-flash) and the search match sits a step brighter than
+                // hover (is-match), both in src/styles/glass-search.css. No
+                // per-row borders, which is what made this list read as a list
+                // of cards rather than a menu.
+                aria-current={isAnchor || isFlash ? "true" : undefined}
+                className={`aura-glass-row relative w-full text-left rounded-xl px-3 py-2 text-[13.5px] leading-snug
+                            focus:outline-none focus-visible:ring-1 focus-visible:ring-white/30
                             ${isFlash
-                              ? "bg-ln-accent/25 text-ln-accent"
+                              ? "is-selected is-flash"
                               : isAnchor
-                                ? "bg-ln-accent/15 text-ln-accent"
+                                ? "is-selected"
                                 : isMatch
-                                  ? "bg-white/14 text-white"
-                                  : "text-white/90 hover:bg-white/10 hover:text-white"}`}
+                                  ? "is-match"
+                                  : "text-white/90 hover:text-white"}`}
               >
                 {/* Cue text only - Rust already stripped every SRT / VTT / ASS
                     markup form, so this is safe to render verbatim. */}
@@ -913,3 +929,6 @@ export default function SubtitleSyncPanel({
     </div>
   );
 }
+
+// Memoized: it is a child of PlayerOverlay, which re-renders on every playback tick.
+export default memo(SubtitleSyncPanel);

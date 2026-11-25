@@ -1,0 +1,126 @@
+/* Aura - (c) 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice. */
+/* SPDX-License-Identifier: AGPL-3.0-or-later */
+
+/* Glass surface rules for the "settings" group. Loaded once, after App.css (main.tsx),
+   so a rule here at equal specificity wins over App.css. Uses the GLASS SYSTEM
+   classes and custom properties defined in App.css; never redefine them here. */
+
+/* ------------------------------------------------------------------ */
+/* Button tones on flat glass (.aura-glass-flat), beyond the shared    */
+/* .is-primary / .is-danger:                                           */
+/*   .is-warning                amber twin of .is-danger                */
+/*   .is-danger/.is-warning + .is-strong   the confirm of a risky step */
+/*   .is-cta / .is-cta-danger   a SOLID call to action (Install,       */
+/*                              Continue, Pause and quit); the text    */
+/*                              colour stays a utility on the button   */
+/*   .is-accent-hover / .is-danger-hover   neutral at rest, tinted on  */
+/*                              hover (Frosted only; Liquid lifts)     */
+/* Everything rides the --lg-* hooks. Liquid rules never set           */
+/* --lg-border-c, so the High Contrast edge (App.css) still wins.      */
+/* ------------------------------------------------------------------ */
+.aura-glass-flat.is-warning {
+  --lg-face: linear-gradient(rgb(245 158 11 / 0.10), rgb(245 158 11 / 0.10));
+  --lg-border-c: rgb(252 211 77 / 0.35);
+  color: rgb(252 211 77);
+}
+.aura-glass-flat.is-danger.is-strong {
+  --lg-face: linear-gradient(rgb(244 63 94 / 0.28), rgb(244 63 94 / 0.28));
+  --lg-border-c: rgb(253 164 175 / 0.6);
+  color: rgb(255 241 242);
+}
+.aura-glass-flat.is-warning.is-strong {
+  --lg-face: linear-gradient(rgb(245 158 11 / 0.28), rgb(245 158 11 / 0.28));
+  --lg-border-c: rgb(252 211 77 / 0.6);
+  color: rgb(255 251 235);
+}
+.aura-glass-flat.is-cta {
+  --lg-face: linear-gradient(rgb(var(--ln-accent-rgb) / 0.86), rgb(var(--ln-accent-rgb) / 0.78));
+  --lg-border-c: rgb(var(--ln-accent-rgb) / 0.9);
+  --lg-edge: inset 0 1px 0 rgb(255 255 255 / 0.18);
+}
+.aura-glass-flat.is-cta-danger {
+  --lg-face: linear-gradient(rgb(244 63 94 / 0.86), rgb(244 63 94 / 0.78));
+  --lg-border-c: rgb(253 164 175 / 0.5);
+  --lg-edge: inset 0 1px 0 rgb(255 255 255 / 0.16);
+}
+.aura-glass-flat:is(.is-cta, .is-cta-danger):hover:where(:not(:disabled):not([aria-disabled="true"])) {
+  --lg-lift: 0.09;
+}
+html:not([data-glass="liquid"]) .aura-glass-flat.is-accent-hover:hover:where(:not(:disabled):not([aria-disabled="true"])) {
+  --lg-face: linear-gradient(rgb(var(--ln-accent-rgb) / 0.12), rgb(var(--ln-accent-rgb) / 0.12));
+  --lg-border-c: rgb(var(--ln-accent-rgb) / 0.4);
+}
+html:not([data-glass="liquid"]) .aura-glass-flat.is-danger-hover:hover:where(:not(:disabled):not([aria-disabled="true"])) {
+  --lg-face: linear-gradient(rgb(244 63 94 / 0.15), rgb(244 63 94 / 0.15));
+  --lg-border-c: rgb(253 164 175 / 0.4);
+}
+
+/* Liquid: tones sit IN the milky face (deco wash + a low inner pool, the
+   same recipe as the foundation's .is-primary / .is-danger); a CTA is the
+   milky sheen over a dense accent body, with no outer glow. */
+html[data-glass="liquid"] .aura-glass-flat.is-warning {
+  --lg-deco: linear-gradient(rgb(245 158 11 / 0.05), rgb(245 158 11 / 0.11));
+  --lg-ring: inset 0 -8px 12px -9px rgb(252 211 77 / 0.30), inset 0 0 0 1px rgb(252 211 77 / 0.14);
+}
+html[data-glass="liquid"] .aura-glass-flat.is-danger.is-strong {
+  --lg-deco: linear-gradient(rgb(244 63 94 / 0.16), rgb(244 63 94 / 0.30));
+  color: rgb(255 228 230);
+}
+html[data-glass="liquid"] .aura-glass-flat.is-warning.is-strong {
+  --lg-deco: linear-gradient(rgb(245 158 11 / 0.16), rgb(245 158 11 / 0.30));
+  color: rgb(254 243 199);
+}
+html[data-glass="liquid"] .aura-glass-flat.is-cta {
+  --lg-face:
+    linear-gradient(rgb(255 255 255 / 0.18), rgb(255 255 255 / 0.04)),
+    linear-gradient(rgb(var(--ln-accent-rgb) / 0.66), rgb(var(--ln-accent-rgb) / 0.82));
+  --lg-drop: 0 1px 1px rgb(0 0 0 / 0.40), 0 4px 12px -4px rgb(0 0 0 / 0.45);
+}
+html[data-glass="liquid"] .aura-glass-flat.is-cta-danger {
+  --lg-face:
+    linear-gradient(rgb(255 255 255 / 0.16), rgb(255 255 255 / 0.04)),
+    linear-gradient(rgb(244 63 94 / 0.66), rgb(244 63 94 / 0.82));
+  --lg-drop: 0 1px 1px rgb(0 0 0 / 0.40), 0 4px 12px -4px rgb(0 0 0 / 0.45);
+}
+/* A CTA takes the specular rim but keeps the old meniscus darkness (its two
+   dark insets, same four-entry shape as the flat edge): white on a light
+   accent is already below 4.5:1 on some themes (Haze about 3.2), and the
+   flat's lighter glow and pool lifted the accent under the label further
+   (measured 3.24 to 2.92). */
+html[data-glass="liquid"] .aura-glass-flat:is(.is-cta, .is-cta-danger) {
+  --lg-edge:
+    var(--lg-spec),
+    inset 0 10px 14px -12px rgb(0 0 0 / 0.40),
+    inset 0 -12px 18px -10px rgb(0 0 0 / 0.60);
+}
+html[data-glass="liquid"] .aura-glass-flat:is(.is-cta, .is-cta-danger):hover:where(:not(:disabled):not([aria-disabled="true"])) {
+  --lg-lift: 0.06;
+}
+
+/* ------------------------------------------------------------------ */
+/* Settings rows                                                       */
+/* ------------------------------------------------------------------ */
+/* The keybinding / mouse-button rows and the home-sources rows
+   (.aura-settings-sort-row) are CONTENT rows (.aura-content-row in App.css),
+   not glass: their capturing and drag faces live there. */
+
+/* The Settings search (a field wrapper). Its icon takes the accent on
+   focus (a utility in SettingsView); the field itself never glows. The
+   wide variant widens on focus: keep the field's own transitions beside
+   the width morph, which would otherwise replace them. */
+.aura-glass-field.aura-glass-morph-w {
+  transition: width 240ms var(--lg-cinematic), border-color 160ms ease, box-shadow 200ms ease;
+}
+html[data-glass="liquid"] .aura-glass-field.aura-glass-morph-w {
+  transition: width 360ms var(--lg-springy), border-color 160ms ease, box-shadow 200ms ease;
+}
+
+/* ------------------------------------------------------------------ */
+/* Dialog tone (Settings' warning / danger confirm): a hairline in the */
+/* tone colour through --lg-ring (a ring-* utility would be replaced   */
+/* by the glass box-shadow). Liquid keeps it inside the rim, faint.    */
+/* ------------------------------------------------------------------ */
+.aura-glass-tone-danger { --lg-ring: 0 0 0 1px rgb(251 113 133 / 0.40); }
+.aura-glass-tone-warning { --lg-ring: 0 0 0 1px rgb(251 191 36 / 0.40); }
+html[data-glass="liquid"] .aura-glass-tone-danger { --lg-ring: inset 0 0 0 1px rgb(251 113 133 / 0.22); }
+html[data-glass="liquid"] .aura-glass-tone-warning { --lg-ring: inset 0 0 0 1px rgb(251 191 36 / 0.22); }

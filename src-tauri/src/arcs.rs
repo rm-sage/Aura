@@ -12,7 +12,7 @@
 //! Spy x Family, Frieren, Haikyu, Blue Lock, Dr. Stone, One-Punch Man,
 //! Code Geass, ...). Every other candidate source was checked and has no arc
 //! model at all: AniList (schema introspected), MAL/Jikan, Kitsu, AniDB,
-//! Trakt, Simkl, and animefillerlist (whose episode table is exactly four
+//! Simkl, and animefillerlist (whose episode table is exactly four
 //! columns: #, Title, Type, Airdate).
 //!
 //! THE JOIN IS THE HARD PART, AND IT IS NOT A NUMBERING CONVERSION.
@@ -90,7 +90,7 @@ fn client() -> &'static reqwest::Client {
             .tcp_nodelay(true)
             .pool_max_idle_per_host(1)
             .pool_idle_timeout(Duration::from_secs(30))
-            .user_agent("Aura/1.4 story-arcs")
+            .user_agent(concat!("Aura/", env!("CARGO_PKG_VERSION"), " story-arcs"))
             .build()
             .expect("arcs HTTP client init failed")
     })

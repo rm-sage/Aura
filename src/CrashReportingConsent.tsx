@@ -90,11 +90,13 @@ export default function CrashReportingConsent() {
       role="dialog"
       aria-modal="true"
       aria-labelledby="crash-consent-title"
-      className="aura-modal-backdrop-in fixed inset-0 z-[2000] flex items-center justify-center
-                 bg-black/70 backdrop-blur-md"
+      className="fixed inset-0 z-[2000] flex items-center justify-center"
     >
+      {/* Dim + blur on a sibling layer, never the wrapper: an ancestor's
+          backdrop-filter (or fading opacity) would blind the card's glass. */}
+      <div aria-hidden className="aura-modal-backdrop-in absolute inset-0 bg-black/70 backdrop-blur-md" />
       <div
-        className="aura-modal-card-in aura-glass-menu rounded-2xl max-w-[520px] w-[92%] p-7
+        className="aura-modal-card-in aura-float-glass relative rounded-2xl max-w-[520px] w-[92%] p-7
                    text-white"
       >
         <h2
@@ -116,18 +118,24 @@ export default function CrashReportingConsent() {
             What gets sent
           </p>
           <ul className="text-[12px] text-white/70 leading-relaxed list-disc pl-5 space-y-1">
-            <li>Error message + stack trace</li>
-            <li>OS version, app version, and runtime info</li>
-            <li>A randomly-generated install id (no account info)</li>
+            <li>The error message and stack trace, plus recent console warnings and errors</li>
+            <li>OS version, app version and runtime info, and a random install id</li>
+            <li>
+              A masked replay of the app window (all text hidden, images blocked) with
+              network request details, for sessions with an error and about 1 in 10 others
+            </li>
           </ul>
           <p className="text-[12.5px] text-white/85 font-medium pt-2">
-            What does <span className="italic">not</span> get sent
+            Removed before sending
           </p>
           <ul className="text-[12px] text-white/70 leading-relaxed list-disc pl-5 space-y-1">
-            <li>Your name, email, IP address, or system username</li>
-            <li>Stream URLs, file paths, or what you're watching</li>
-            <li>Library, history, or login credentials</li>
+            <li>Your account email and system username</li>
+            <li>Your IP address and location</li>
           </ul>
+          <p className="text-[11.5px] text-white/55 leading-relaxed pt-1">
+            The error text itself is kept, so it can include what the failing code was
+            handling, such as a title name.
+          </p>
         </div>
 
         <p className="text-[11.5px] text-white/55 leading-relaxed mb-5">
@@ -141,10 +149,8 @@ export default function CrashReportingConsent() {
             type="button"
             disabled={submitting}
             onClick={() => submit(false)}
-            className="px-4 py-2 rounded-lg text-[13px] font-medium tracking-wide
-                       text-white/85 bg-white/[0.06] border border-white/12
-                       hover:bg-white/[0.10] hover:text-white
-                       transition-colors disabled:opacity-50"
+            className="aura-glass-flat aura-glass-press px-4 py-2 rounded-lg text-[13px] font-medium tracking-wide
+                       text-white/85 hover:text-white disabled:opacity-50"
           >
             No thanks
           </button>
@@ -152,10 +158,8 @@ export default function CrashReportingConsent() {
             type="button"
             disabled={submitting}
             onClick={() => submit(true)}
-            className="px-4 py-2 rounded-lg text-[13px] font-medium tracking-wide
-                       text-ln-accent bg-ln-accent/15 border border-ln-accent/35
-                       hover:bg-ln-accent/25 hover:border-ln-accent/55
-                       transition-colors disabled:opacity-50"
+            className="aura-glass-flat aura-glass-press is-primary px-4 py-2 rounded-lg text-[13px] font-medium tracking-wide
+                       disabled:opacity-50"
           >
             Send crash reports
           </button>

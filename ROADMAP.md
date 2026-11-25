@@ -61,7 +61,7 @@ Platform keyring, `Zeroizing<String>` password scrubbing, `https_only` auth clie
 - [x] Incoming URL forwarded to frontend as `deep-link` Tauri event
 - [x] `aura://search?q=...`: handled in App.tsx; navigates to Home, queues query, fires search
 - [x] `stremio://detail/{type}/{id}` (and `aura://detail/<type>/<id>` alias): routes to DetailView with a stub MetaPreview, full meta detail filled in by DetailView's own fetch
-- [x] `aura://oauth/{trakt,anilist}?...`: OAuth callback handler (see Phase 6.x scrobble auth)
+- [x] `aura://oauth/{anilist,simkl}?...`: OAuth callback handler (see Phase 6.x scrobble auth)
 - [x] Auto-updater wired: `tauri-plugin-updater` registered with `endpoints` pointing at `github.com/rm-sage/Aura/releases/latest/download/latest.json`; `updater.ts` + `updaterPlugin.ts` perform the version check
 - [x] Update signing keypair: real minisign keypair generated; `tauri.conf.json::plugins.updater.pubkey` carries the production public key (key id `B632D9CFF50F9FDD`); `bundle.createUpdaterArtifacts: true` ships a matching `.sig` next to every release installer; `scripts/release.ps1` runs `pnpm tauri signer sign` against the bundled output. Authenticode / EV code signing is intentionally not on the roadmap — installers ship unsigned and rely on the SmartScreen "Run anyway" path
 
@@ -121,7 +121,7 @@ Platform keyring, `Zeroizing<String>` password scrubbing, `https_only` auth clie
 - [x] HeroCarousel: prefers `background`; falls back to 20px-blur poster with 1.08 scale to hide blurred edges
 - [x] AIOMetadata helpers (`aiometadata.ts`): `typeLabel`, `withTypeSuffix` ("Trending Movies", "Top Anime"), `isAnimeMeta` (`media_type === "anime"` ∨ id prefix in `kitsu:`/`anilist:`/`mal:`/`anidb:` ∨ genre/language signals)
 - [x] HomeView applies suffix mapping to every Discovery row
-- [x] Scrobble pipeline (`scrobble.rs` + `useScrobble.ts`): completion-only; fires `/sync/history` to Trakt and `SaveMediaListEntry` to AniList. Best-effort, never blocks playback. Stricter than Stremio defaults: 80% progress AND ≥ 5 minutes elapsed playback in the current session
+- [x] Scrobble pipeline (`scrobble.rs` + `useScrobble.ts`): completion-only; fires `SaveMediaListEntry` to AniList and `/sync/history` to Simkl. Best-effort, never blocks playback. Stricter than Stremio defaults: 80% progress AND ≥ 5 minutes elapsed playback in the current session
 - [x] Settings split: Playback section is two cards: "Global Defaults" (default audio + subs language) and "Anime Defaults" (e.g. Japanese audio + English subs); `apply_lang_defaults` Tauri command applies them to MPV's `alang` / `slang` with comma-separated fallbacks
 - [x] Discord Rich Presence (`window_logic.rs`): `discord-rich-presence 0.2` IPC client, lazy connect with retry on next call, `discord_set_presence` / `discord_clear_presence`; Privacy Mode: enable toggle, show-titles toggle, per-title blocklist
 - [x] Window lifecycle: `pause_on_minimize` (Resized → 0,0), `pause_on_lost_focus` (`Focused(false)`), `close_on_exit` (CloseRequested → MPV stop + RPC clear)
@@ -500,12 +500,10 @@ A grab-bag of post-5.8 work that isn't gated to a single rendering / IPC milesto
 
 ### 6.0.x Scrobble OAuth ✅
 
-- [x] OAuth proxy at `aura.animasec.dev/oauth/{trakt,anilist}` holds the client_secrets; Aura desktop only sees access tokens
-- [x] Trakt: device flow via proxy `/device/code` + `/device/token`; no scheme handler, no deep-link
+- [x] OAuth proxy at `aura.animasec.dev/oauth/anilist` holds the client_secret; Aura desktop only sees access tokens
 - [x] AniList: authorization-code flow with `aura://oauth/anilist?...` callback handled by an in-app Tauri Webview (`open_oauth_popup_webview`) that intercepts the redirect via `on_navigation`, re-emits as `deep-link`, and never round-trips through the user's default browser
 - [x] In-app popup gates the intercept by referring origin (only honours `aura://oauth/*` when the prior page was the proxy host) and renders a live security chip showing the current host
 - [x] Tokens persisted in OS keyring under `(service, scope)` where scope is the first 12 chars of the active Stremio auth_key (or `guest`)
-- [x] Trakt scrobble switched from `/scrobble/stop` (stale-session quirks, 409 on duplicates) to `/sync/history`: canonical "add to watched history" path
 - [x] AniList save_progress: title search → media id resolve → SaveMediaListEntry mutation; per-show id cache persisted to disk; only updates if our episode > existing progress
 - [x] Token redaction in three log sites (single-instance argv, deep-link arrival, popup intercept) so `token=<redacted>` lands in `aura-mpv.log` instead of the live JWT
 
@@ -519,7 +517,7 @@ A grab-bag of post-5.8 work that isn't gated to a single rendering / IPC milesto
 ### 6.0.x Discover / History / Queue views ✅
 
 - [x] `<DiscoverView />`: Addon → Catalog dual pill selector; surfaces every catalog including the "enabled but hidden from home" set (`catalog_is_hidden_from_home` detects them via required-without-default extras like AIOMetadata's calendar-videos / schedule). FilterBar sidebar reused
-- [x] `<HistoryView />`: Trakt-style automatic-watches feed (entries created at exit-playback when ≥ 85 % progress OR ≥ 5 min elapsed; manual marks excluded by contract). Scope-keyed `aura:history:<scope>` with 1000-entry cap; day-grouped with cumulative runtime totals; per-entry hover-X remove + "Clear history" wipe
+- [x] `<HistoryView />`: automatic-watches feed (entries created at exit-playback when ≥ 85 % progress OR ≥ 5 min elapsed; manual marks excluded by contract). Scope-keyed `aura:history:<scope>` with 1000-entry cap; day-grouped with cumulative runtime totals; per-entry hover-X remove + "Clear history" wipe
 - [x] `<QueueView />`: ordered list of items marked "planned". `@dnd-kit` drag reorder (PointerSensor with 6 px activation distance so Remove clicks don't accidentally start a drag; KeyboardSensor for accessibility). Reorder persists via `setManualWatchedOrder` and rides Aura Cloud's `manual-state` namespace
 - [x] Both views integrate `FilterBar` (year / rating / genre / sort) so the existing filtering muscle works on personal feeds, not just discovery
 
@@ -552,8 +550,8 @@ A grab-bag of post-5.8 work that isn't gated to a single rendering / IPC milesto
 
 - [x] AniList authorization flow runs inside an in-app Tauri `WebviewWindow` (`open_oauth_popup_webview`); intercepts `aura://oauth/anilist?...` via `on_navigation`, re-emits as a `deep-link` event, never round-trips through the user's default browser. Origin-gated to honour `aura://oauth/*` only when the prior page was the proxy host; live security chip shows the current host
 - [x] `scrobble_anilist.rs`: title-search → AniList media id resolve → `SaveMediaListEntry` mutation. Per-show id cache persisted to `<app_data>/anilist-id-cache.json`. No-op when the saved AniList progress already exceeds ours (no clobbering for users who scrobble from multiple clients)
-- [x] `useScrobbleAuthAlerts.ts`: per-scope token-expiry watcher (`get_scrobble_auth_status`); fires warning notifications on Trakt / AniList 401s; rechecks on `focus` + `deep-link` events for mid-session token death
-- [x] Scrobble test command: `DevConsole > scrobble` (Rust `scrobble_test_fire`) — fires Trakt `/sync/history` + AniList `SaveMediaListEntry` against the live session WITHOUT consuming it, synthesizes 95 % progress, reports per-provider fired/skipped status with rationale (no token, not flagged anime, unsupported id, etc.)
+- [x] `useScrobbleAuthAlerts.ts`: per-scope token-expiry watcher (`get_scrobble_auth_status`); fires warning notifications on AniList / Simkl 401s; rechecks on `focus` + `deep-link` events for mid-session token death
+- [x] Scrobble test command: `DevConsole > scrobble` (Rust `scrobble_test_fire`): fires AniList `SaveMediaListEntry` + Simkl `/sync/history` against the live session WITHOUT consuming it, synthesizes 95 % progress, reports per-provider fired/skipped status with rationale (no token, not flagged anime, unsupported id, etc.)
 
 ### 6.0.x System tray + window state + boot splash + resize handles ✅
 
@@ -619,7 +617,7 @@ that is already the source of truth.
 
 - Library / watch progress: Stremio's `datastoreGet/Put` already syncs these per Stremio account; duplicating on our side adds a conflict surface with no QOL gain
 - Cached metadata (`aura:meta-cache`, `aura:omdb-cache`, `aura:aniskip-cache`, `aura:anime-id-cache`): cheap to re-fetch, would dominate the per-user storage budget
-- OAuth tokens (Trakt / AniList): live in the OS keyring per machine; syncing them across devices defeats the per-machine credential isolation
+- OAuth tokens (AniList / Simkl): live in the OS keyring per machine; syncing them across devices defeats the per-machine credential isolation
 - Window position / size / fullscreen state (`tauri-plugin-window-state`): inherently per-machine
 - Crash-reporting consent / DSN: per-install, not per-account
 - Local logs and panic dumps
@@ -783,7 +781,7 @@ version updates). Three pages, each independently skippable with
 forward + back navigation:
 
 1. Import existing Aura settings string / file (reuses `settingsTransfer.ts`)
-2. No-addon-dependent setup: language priorities, theme, OMDb / OpenSubtitles keys (optional with "where do I get this?" link), scrobble connect (Trakt + AniList), AniSkip modes, Discord RPC consent
+2. No-addon-dependent setup: language priorities, theme, OMDb / OpenSubtitles keys (optional with "where do I get this?" link), scrobble connect (AniList + Simkl), AniSkip modes, Discord RPC consent
 3. Recommended addon set — AIOMetadata, AIOStreams, Cinemeta (fallback), OpenSubtitles v3 / PRO. No download / configure walkthrough (defer to each addon's configure page). Includes a notice that this page can be reopened anytime from Addons → ↻ "Reopen onboarding addons"
 
 Resume-after-quit semantics: persist the cursor + per-step state to
@@ -830,7 +828,7 @@ controls (loudness, panscan, screenshot, etc.) as they land.
 
 ### 8.7 Scrobble auth UX 🔴
 
-- Surface precise token expiry dates in Settings → Trakt & AniList ("Expires <date>" + relative qualifier, amber when ≤ 3 days, rose + Reconnect button when expired). Backend's `expires_at: Option<u64>` is already populated — frontend formatting only
+- Surface precise token expiry dates in Settings → Scrobbling ("Expires <date>" + relative qualifier, amber when ≤ 3 days, rose + Reconnect button when expired). Backend's `expires_at: Option<u64>` is already populated; frontend formatting only
 - "Reconnect AniList" inline action inside the warning notification fired by `useScrobbleAuthAlerts` (already tracked separately in 6.0.x Open as the AniList re-auth UX item)
 
 ### 8.8 Watched-marks menu reorganization 🔴

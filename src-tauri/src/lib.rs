@@ -20,6 +20,7 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+mod addon_rate;
 mod addons;
 mod aniskip;
 mod arc_align;
@@ -50,7 +51,6 @@ mod media_controls;
 // Direct-FFI libmpv layer — Aura's only playback path (engine + headless
 // thumbnail instance). Replaced `tauri-plugin-libmpv` entirely; see
 // mpv/mod.rs for the consolidation history.
-mod debug_panel;
 mod img_proxy;
 // IPTV (Live TV) network hop — see src/iptv/ for the TS parsers.
 mod introdb;
@@ -101,6 +101,12 @@ use tauri::{Emitter, Listener, Manager};
 // ---------------------------------------------------------------------------
 // Shared playback state (updated by the mpv-event-main observer bridge)
 // ---------------------------------------------------------------------------
+
+/// The playback bridge (installed in setup): folds each engine event into
+/// `playback-update` and the other frontend events. The engine's emit closure
+/// calls it directly (see `try_start_playback_engine`).
+type MpvEventSink = Box<dyn Fn(&serde_json::Value) + Send + Sync>;
+static MPV_EVENT_SINK: std::sync::OnceLock<MpvEventSink> = std::sync::OnceLock::new();
 
 #[derive(Clone, Serialize)]
 struct PlaybackState {
@@ -1082,10 +1088,19 @@ async fn apply_hdr_settings(app: tauri::AppHandle, mode: String) -> Result<(), S
         // player::apply_hdr_options) precisely so nothing needs to
         // change per content. A mode change mid-playback may only take
         // full effect (swapchain colorspace) on the next loadfile.
+        // Passthrough follows the per-load routing (engine.rs LoadFile): only
+        // a file loaded with an HDR hint gets the PQ set. Pushing it over an
+        // SDR file that is playing would leave that file dim and flat in the
+        // PQ container until the next load.
+        let effective_mode = if mode_norm == "passthrough" && !mpv::engine::last_load_was_hdr() {
+            "sdr"
+        } else {
+            mode_norm.as_str()
+        };
         let mut opts: indexmap::IndexMap<String, serde_json::Value> = indexmap::IndexMap::new();
         crate::player::apply_hdr_options(
             &mut opts,
-            &mode_norm,
+            effective_mode,
             settings::snapshot().hdr_target_peak_nits,
         );
         for (key, value) in opts.iter() {
@@ -1136,6 +1151,41 @@ fn is_windows_10() -> bool {
     #[cfg(not(target_os = "windows"))]
     {
         false
+    }
+}
+
+/// What the Settings "HDR mode" row needs to know about the display Aura's
+/// main window is on. `detected` false means the probe failed (or this is
+/// not Windows): the row then recommends the safe Convert mode.
+#[derive(Serialize, Clone, Copy, Default)]
+struct DisplayHdrInfo {
+    detected: bool,
+    supported: bool,
+    enabled: bool,
+}
+
+/// Frontend probe for the HDR mode recommendation: does the main window's
+/// display support HDR, and is Windows HDR on for it. Read when the Settings
+/// row mounts and on window focus; never polled. Async so the DisplayConfig
+/// queries stay off the main thread. See `win32::display_hdr_state`.
+#[tauri::command]
+async fn get_display_hdr_info(app: tauri::AppHandle) -> DisplayHdrInfo {
+    #[cfg(target_os = "windows")]
+    {
+        let hwnd = app
+            .get_webview_window("main")
+            .and_then(|w| w.hwnd().ok())
+            .map(|h| h.0 as isize)
+            .unwrap_or(0);
+        match crate::win32::display_hdr_state(hwnd) {
+            Some(s) => DisplayHdrInfo { detected: true, supported: s.supported, enabled: s.enabled },
+            None => DisplayHdrInfo::default(),
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = app;
+        DisplayHdrInfo::default()
     }
 }
 
@@ -1200,6 +1250,11 @@ async fn set_native_fullscreen(
 ///
 /// `is_anime` is kept in the signature for forward-compat but is unused —
 /// the global subtitle_language now applies to all titles.
+///
+/// Subtitles Off is the value "off", pushed as is: it matches no track, and
+/// a non-empty `slang` also keeps mpv's `subs-match-os-language` out of it.
+/// mpv may still select a default- or forced-flagged track by itself, so Off
+/// is enforced by PlayerOverlay hiding `sub-visibility` per file, not here.
 #[tauri::command]
 async fn apply_lang_defaults(
     is_anime: bool,
@@ -1536,7 +1591,15 @@ fn try_start_playback_engine<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> bo
             let mut wrapped = serde_json::Map::new();
             wrapped.insert("name".into(), serde_json::Value::String(name.to_string()));
             wrapped.insert("data".into(), payload);
-            let _ = emit_handle.emit("mpv-event-main", serde_json::Value::Object(wrapped));
+            let wrapped = serde_json::Value::Object(wrapped);
+            // The playback bridge (setup) is called directly; the Tauri event
+            // is only the fallback for an event that beats its install.
+            match MPV_EVENT_SINK.get() {
+                Some(sink) => sink(&wrapped),
+                None => {
+                    let _ = emit_handle.emit("mpv-event-main", wrapped);
+                }
+            }
         }),
     );
     let running = mpv::engine::is_running();
@@ -1775,7 +1838,7 @@ pub fn run() {
                 let _ = win.unminimize();
                 let _ = win.set_focus();
                 // The window is on screen again, so the tray icon's job is
-                // done (it is shown only while the window sits in the tray).
+                // done (it exists only while the window sits in the tray).
                 tray::set_tray_visible(app, false);
             }
         }))
@@ -2092,7 +2155,7 @@ pub fn run() {
             // ── Window lifecycle (pause-on-blur, pause-on-min, close-on-exit) ─
             window_logic::install(app.handle());
 
-            // ── Tray icon (gated behind minimize_to_tray_on_close at runtime) ─
+            // ── Tray menu handler (the icon is built on demand by close-to-tray) ─
             if let Err(e) = tray::install(app.handle()) {
                 crate::devlog!(warn, "tray", "tray install failed: {}", e);
             }
@@ -2188,13 +2251,14 @@ pub fn run() {
             let handle = app.handle().clone();
             let pb_ref = pb_state.clone();
 
-            app.listen_any("mpv-event-main", move |event| {
-                let Ok(ev) =
-                    serde_json::from_str::<serde_json::Value>(event.payload())
-                else {
-                    return;
-                };
-
+            // Installed as a direct sink rather than a `listen_any` on
+            // "mpv-event-main": the engine calls it on its own thread for
+            // every observed property change (time-pos at ~30 Hz), and the
+            // event route serialized each payload to a JSON string only for
+            // this handler to parse it straight back (and could queue it as
+            // "pending" behind another thread's emit). Same handler, same
+            // thread, minus the round trip.
+            let _ = MPV_EVENT_SINK.set(Box::new(move |ev: &serde_json::Value| {
                 let name = ev.get("name").and_then(|v| v.as_str()).unwrap_or("");
 
                 match name {
@@ -2357,7 +2421,7 @@ pub fn run() {
                         // mpv_end_file_reason enum (0=eof / 2=stop /
                         // 3=quit / 4=error / 5=redirect). Normalize to a
                         // string for the frontend.
-                        let data = ev.get("data").or(Some(&ev));
+                        let data = ev.get("data").or(Some(ev));
                         let reason: Option<String> = data
                             .and_then(|d| d.get("reason"))
                             .map(|r| {
@@ -2408,9 +2472,24 @@ pub fn run() {
                         // FILE_LOADED arm in mpv/engine.rs.
                         handle.emit("playback-file-loaded", serde_json::Value::Null).ok();
                     }
+                    "glass-state" => {
+                        // "Real glass over video" (mpv/glass.rs): whether the
+                        // shader is drawing, whether it is available on this
+                        // GPU, and the video rect in CSS px, so the player
+                        // surfaces know when (and where) to drop their fill.
+                        if let Some(data) = ev.get("data") {
+                            handle.emit("player-glass-state", data.clone()).ok();
+                        }
+                    }
+                    "undecodable" => {
+                        // The file opened but its packets do not decode (the
+                        // engine's UNDECODABLE_ERRORS rule). The frontend
+                        // treats it as a broken stream and re-reads the source.
+                        handle.emit("playback-undecodable", serde_json::Value::Null).ok();
+                    }
                     _ => {}
                 }
-            });
+            }));
 
             Ok(())
         })
@@ -2427,6 +2506,7 @@ pub fn run() {
             thumbs::extract_thumbnail,
             set_volume,
             save_screenshot,
+            mpv::glass::player_glass,
             set_video_eq,
             apply_buffer_settings,
             set_speed,
@@ -2446,10 +2526,6 @@ pub fn run() {
             arcs::fetch_story_arcs,
             arcs::story_arcs_available,
             dev_force_panic,
-            debug_panel::debug_engine_state,
-            debug_panel::debug_drop_test,
-            debug_panel::debug_load_test_pattern,
-            debug_panel::debug_stop_playback,
             popup_nav::popup_webview_back,
             popup_nav::popup_webview_forward,
             popup_nav::popup_webview_reload,
@@ -2484,6 +2560,7 @@ pub fn run() {
             ensure_playback_engine,
             set_native_fullscreen,
             is_windows_10,
+            get_display_hdr_info,
             // ── Per-title persistence (volume / shader / audio / sub) ───────
             per_title::get_title_state,
             per_title::set_title_state,
@@ -2575,17 +2652,14 @@ pub fn run() {
             scrobble::scrobble_start,
             scrobble::scrobble_heartbeat,
             scrobble::scrobble_end,
-            // ── Trakt + AniList OAuth (direct scrobble, replaces AIOMetadata) ──
+            // ── AniList + Simkl OAuth (direct scrobble, replaces AIOMetadata) ──
             scrobble_auth::get_scrobble_auth_status,
             scrobble_auth::set_scrobble_auth_token,
             scrobble_auth::clear_scrobble_auth_token,
             scrobble_auth::scrobble_oauth_authorize_url,
-            scrobble_auth::scrobble_oauth_device_begin,
-            scrobble_auth::scrobble_oauth_device_poll,
             scrobble_auth::open_oauth_popup_webview,
             scrobble_auth::scrobble_services_available,
             scrobble::scrobble_test_fire,
-            scrobble::scrobble_history_trakt,
             scrobble::scrobble_history_anilist,
             scrobble::scrobble_history_simkl,
             scrobble::set_scrobble_run_active,

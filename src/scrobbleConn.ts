@@ -23,8 +23,8 @@ import { invoke } from "@tauri-apps/api/core";
 // ONE tuple, and the union is derived from it. Per-provider CONSTANTS (the
 // labels and history command below, the alert and Settings copy, the sign-in
 // flow choice, the bulk runner's pacing) are Records keyed by ScrobbleService
-// rather than a `service === "trakt" ? a : b` ternary: with a ternary, a third
-// member compiled clean and silently took the AniList branch, whereas a Record
+// rather than a `service === "anilist" ? a : b` ternary: with a ternary, a new
+// member compiles clean and silently takes the other branch, whereas a Record
 // missing a key is a tsc error.
 //
 // That does NOT cover per-provider BEHAVIOUR. It is still written out by hand
@@ -36,17 +36,22 @@ import { invoke } from "@tauri-apps/api/core";
 //     batch of one).
 //   - scrobbleRun: the Simkl step after the per-row loop (one batched call
 //     for every Simkl row of the run, results mapped back by index).
-//   - skipActions: `markEpisodesSkipped` (Trakt is pushed per episode, AniList
-//     collapsed per media, Simkl per episode but in one batched call).
+//   - skipActions: `markEpisodesSkipped` (AniList collapsed per media, Simkl
+//     per episode but in one batched call).
 //   - SettingsView: one hand-placed ScrobbleAuthRow per service.
-//   - NotificationsPanel: the reconnect button (AniList and Simkl; Trakt's
-//     device flow needs the Settings row to show its code).
+//   - NotificationsPanel: the reconnect button.
 //   - App.tsx: the DevConsole test fire's per-service `*_fired` flags.
 // Mirrors `SCROBBLE_SERVICES` in scrobble_auth.rs, in the same order.
 // ---------------------------------------------------------------------------
 
-export const SCROBBLE_SERVICES = ["trakt", "anilist", "simkl"] as const;
+export const SCROBBLE_SERVICES = ["anilist", "simkl"] as const;
 export type ScrobbleService = typeof SCROBBLE_SERVICES[number];
+
+/** The scrobble onboarding notice's second line. Also re-applied to a stored
+ *  copy of that notice when the bell loads, so its wording follows the
+ *  provider list. */
+export const SCROBBLE_ONBOARDING_SUBTITLE =
+  "Connect AniList or Simkl to sync watch progress automatically. Click to open the scrobble settings.";
 
 /** Narrow an untrusted string (a deep-link path, say) to a known service. */
 export function isScrobbleService(value: string): value is ScrobbleService {
@@ -55,16 +60,21 @@ export function isScrobbleService(value: string): value is ScrobbleService {
 
 /** Display name per service. */
 export const SCROBBLE_LABELS: Record<ScrobbleService, string> = {
-  trakt: "Trakt",
   anilist: "AniList",
   simkl: "Simkl",
+};
+
+/** Each service's ScrobbleAuthRow description, shared by Settings > Scrobbling
+ *  and the first-run setup so the two cannot drift. */
+export const SCROBBLE_ROW_DESCRIPTIONS: Record<ScrobbleService, string> = {
+  anilist: "Updates your AniList list as you finish anime episodes (80% through, with at least 5 minutes watched). Nothing is sent while you watch, except an episode you mark Skipped, which is sent right away.",
+  simkl: "Adds the movies, series and anime you finish to your Simkl history, once per item (an episode marked Skipped is sent right away). Works alongside AniList: an anime episode goes to both.",
 };
 
 /** The Tauri command that pushes History rows to a service. Every caller
  *  (the History tab's row buttons, the bulk runner, skip actions) looks it up
  *  here, so they cannot disagree about which command a service maps to. */
 export const HISTORY_COMMAND: Record<ScrobbleService, string> = {
-  trakt: "scrobble_history_trakt",
   anilist: "scrobble_history_anilist",
   simkl: "scrobble_history_simkl",
 };
@@ -75,7 +85,6 @@ export const HISTORY_COMMAND: Record<ScrobbleService, string> = {
  *  POST per second, so a call per row is unsafe for a bulk run, and its
  *  command only has the batch shape (see scrobbleSimkl.ts). */
 export const HISTORY_SHAPE = {
-  trakt: "row",
   anilist: "row",
   simkl: "batch",
 } as const satisfies Record<ScrobbleService, "row" | "batch">;
@@ -100,7 +109,6 @@ export function isRowHistoryService(service: ScrobbleService): service is RowHis
  *  it: clearing the token first would dismiss that notice before any sign-in
  *  had happened (see NotificationsPanel). */
 export const REVOKE_BEFORE_RECONNECT: Record<ScrobbleService, boolean> = {
-  trakt: false,
   anilist: false,
   simkl: true,
 };
@@ -112,7 +120,6 @@ export const REVOKE_BEFORE_RECONNECT: Record<ScrobbleService, boolean> = {
  *  browser), and nothing to fall back to when the listener is down: the
  *  authorize URL itself fails then, inside Aura or out. */
 export const LOOPBACK_ONLY_SIGN_IN: Record<ScrobbleService, boolean> = {
-  trakt: false,
   anilist: false,
   simkl: true,
 };
@@ -126,8 +133,8 @@ export interface ScrobbleAuthSummary {
    *  7-day access token, which renews itself on the next push. */
   expires_at: number | null;
   /** Token is approaching expiry (provider-specific window: 7d for
-   *  AniList, 24h for Trakt, the last 7d before Simkl's renewal
-   *  deadline). Soft warning. */
+   *  AniList, the last 7d before Simkl's renewal deadline). Soft
+   *  warning. */
   stale: boolean;
   /** Token has already lapsed. Rendered as a hard "reconnect now"
    *  prompt (AniList cannot refresh at all). */
@@ -166,8 +173,7 @@ function perService<T>(pick: (service: ScrobbleService) => T): Record<ScrobbleSe
 // History button that can only error. `scrobble_services_available` answers
 // this; the answer is fixed for the life of the process, so it is asked once
 // and kept (one small Set, never grows). A FAILED ask is not kept, and reads
-// as "everything available" meanwhile: an IPC hiccup must never hide Trakt or
-// AniList, and an unconfigured Simkl then just says so when Connect is pressed.
+// as "everything available" meanwhile: an IPC hiccup must never hide AniList, and an unconfigured Simkl then just says so when Connect is pressed.
 // ---------------------------------------------------------------------------
 
 let availableAsk: Promise<ReadonlySet<ScrobbleService>> | null = null;
@@ -279,7 +285,7 @@ async function resolve(): Promise<void> {
     // The same switch Rust's automatic path reads (scrobble.rs
     // `!s.auto_scrobble_enabled`). skipActions.ts gates a user-initiated
     // skip's push on this, since the commands it calls
-    // (`scrobble_history_trakt` / `_anilist`) deliberately do not re-check it:
+    // (`scrobble_history_anilist` / `_simkl`) deliberately do not re-check it:
     // their other caller is the History tab's explicit per-row button.
     autoScrobbleEnabled = settings?.auto_scrobble_enabled === true;
   } catch { /* treat unknown as OFF: never push on a guess */ }

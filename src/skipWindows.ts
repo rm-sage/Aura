@@ -35,6 +35,17 @@
 //                       of it, which promotes it to plain "animethemes" (a
 //                       crowd row no longer does: `confirmsEndingStart`). Its end
 //                       counts as the trusted ending end for Next-Up.
+//   "animethemes-swap"  Layer 1 for the OTHER kind's song in a kind's place:
+//                       the opening song played as an episode's ending
+//                       (Secrets of the Silent Witch E01 has no ending; OP1
+//                       plays over its credits), or the ending song as its
+//                       opening. Matched only after none of the kind's own
+//                       themes was found. Located as precisely as any match,
+//                       but a final episode can play its opening song over
+//                       the epilogue, so it is Risky (prompt-only, shown only
+//                       with the player controls), has no conflict drop,
+//                       ranks below a chapter, and its end is never the
+//                       trusted ending end for Next-Up.
 //   "animethemes-early" the PROVISIONAL opening: the first 12 s of the theme
 //                       matched while the rest is still decoding. Prompt-only,
 //                       NOT Layer 1 (it never drops another source's window,
@@ -48,6 +59,10 @@
 export const LAYER1_SOURCE = "animethemes";
 export const LAYER1_PROMPT_SOURCE = "animethemes-over";
 export const LAYER1_TRANSITION_SOURCE = "animethemes-transition";
+/** The other kind's song in a kind's place (Rust SWAP_SOURCE). Deliberately
+ *  not in `isLayer1Source`: a final episode's epilogue under the opening song
+ *  must not drop a crowd or chapter ending that marks the real credits. */
+export const LAYER1_SWAP_SOURCE = "animethemes-swap";
 /** The provisional opening (Rust EARLY_SOURCE). Deliberately not in
  *  `isLayer1Source`: it must not trigger the conflict drop. */
 export const LAYER1_EARLY_SOURCE = "animethemes-early";
@@ -138,6 +153,9 @@ export interface PreparedWindow {
  *   - "theme-transition" Layer 1 on a theme that starts over the story: the
  *                        END is the song's, the START can sit inside story.
  *   - "theme-early"      the provisional opening (12 s of the song matched).
+ *   - "theme-swapped"    Layer 1 on the other kind's song in this kind's place
+ *                        (the opening song as the ending): located precisely,
+ *                        but it may play over story (Risky).
  *   - "chapter"          a strongly titled chapter of this release.
  *   - "chapter-tail"     a chapter titled as the ending that runs to the end of
  *                        the file (Blue Box 2:1's "Credits" 1347-1540 held a
@@ -160,6 +178,7 @@ export interface PreparedWindow {
  *   - "loudness"         Layer 3, a guess from the audio's loudness. */
 export type SkipBasis =
   | "theme" | "theme-settling" | "theme-partial" | "theme-transition" | "theme-early"
+  | "theme-swapped"
   | "chapter" | "chapter-tail" | "chapter-weak" | "chapter-guess"
   | "crowd-agreed" | "crowd" | "crowd-checking" | "crowd-not-found"
   | "crowd-other-cut" | "crowd-lone" | "crowd-single"
@@ -192,6 +211,7 @@ export function skipBasisFor(
     case LAYER1_PROMPT_SOURCE:     return "theme-partial";
     case LAYER1_TRANSITION_SOURCE: return "theme-transition";
     case LAYER1_EARLY_SOURCE:      return "theme-early";
+    case LAYER1_SWAP_SOURCE:       return "theme-swapped";
     case "chapter": {
       const g = skipKindGroup(w.type);
       const toEnd = w.reaches_end === true
@@ -266,6 +286,12 @@ export function skipConfidence(
     // Held while the theme match decides: 7 of 13 cut story, and the three a
     // viewer met all did (JJK S2E10's 0-90 s, 90 s of cold open).
     case "crowd-checking":
+    // The other kind's song in a kind's place: edges as precise as any match,
+    // but whether the song is over credits or story is not known (a final
+    // episode can play its opening song over the epilogue; unmeasured, one
+    // real episode, 2026-11-16). Risky, so its prompt shows only with the
+    // player controls and it raises the Next-Up card the same way.
+    case "theme-swapped":
     case "theme-transition":
     case "chapter-tail":
     case "chapter-weak":
@@ -312,8 +338,11 @@ function crowdRowAgreed(w: PreparedWindow, all: readonly PreparedWindow[]): bool
   const g = skipKindGroup(w.type);
   // A crowd recap that runs right up to the opening the theme match located
   // (applyCrossSourceHolds rule 4): the file itself confirms where it ends.
+  // A swapped opening is prompt-only with an unmeasured false-match rate, so
+  // it never corroborates anything.
   if (g === "recap" && all.some((d) => skipKindGroup(d.type) === "op"
-    && (d.source.startsWith(LAYER1_SOURCE) || d.source === LAYER1_EARLY_SOURCE)
+    && ((d.source.startsWith(LAYER1_SOURCE) && d.source !== LAYER1_SWAP_SOURCE)
+      || d.source === LAYER1_EARLY_SOURCE)
     && Math.abs(d.start - w.end) <= LAYER1_CONFLICT_SECONDS)) return true;
   return all.some((o) => {
     // A weak-title chapter is no independent witness: its hold may have been
@@ -477,6 +506,10 @@ export const isLayer1Source = (source: string): boolean =>
 export const SKIP_SOURCE_PRIORITY: Readonly<Record<string, number>> = {
   [LAYER1_SOURCE]: 8, [LAYER1_PROMPT_SOURCE]: 8,
   chapter: 7,
+  // Above a crowd row of the same region (its edges are measured in this
+  // file), below a titled chapter (which says what the region IS), except an
+  // ending chapter that runs to the end of the file (see `rankPrio`).
+  [LAYER1_SWAP_SOURCE]: 6.5,
   aniskip: 6, [INTRODB_SOURCE]: 6,
   [PAIRING_SOURCE]: 5, [PUBLICMETADB_SOURCE]: 5,
   // Below a chapter or crowd ending whose END agrees with it and that starts
@@ -570,11 +603,20 @@ export function dedupeSkipWindows(windowsIn: PreparedWindow[]): PreparedWindow[]
     if (group(w.type) !== "op") return 0;
     return -Math.round(Math.abs((w.end - w.start) - TARGET_OP_SECONDS) / 20);
   };
+  // An ending chapter that runs to the end of the file (Risky "chapter-tail":
+  // Blue Box 2:1's "Credits" held a 106 s scene after the ending) ranks just
+  // below the other kind's song located in the ending's place, which is
+  // measured in this file; a bounded ending chapter still outranks it. Same
+  // kind only: the cross-kind rule keeps plain source priority.
+  const rankPrio = (w: PreparedWindow): number =>
+    (w.source === "chapter" && w.reaches_end === true && group(w.type) === "ed"
+      ? prio(LAYER1_SWAP_SOURCE) - 0.25
+      : prio(w.source));
   const ordered = [...agreed].sort(
     (a, b) => l1Rank(b) - l1Rank(a)
            || weak(b) - weak(a)
            || opPlausible(b) - opPlausible(a)
-           || prio(b.source) - prio(a.source)
+           || rankPrio(b) - rankPrio(a)
            || opCloseness(b) - opCloseness(a)
            || tieBreak(b.source) - tieBreak(a.source)
            || a.start - b.start,
@@ -697,10 +739,11 @@ export const GUESS_SKIP_SOURCES: ReadonlySet<string> = new Set([
 ]);
 
 /** Real data for THIS episode that is too thinly backed to seek on its own:
- *  an IntroDB segment with a single submission (or under 0.9 confidence), and
- *  a Layer 1 opening whose theme overlaps the scene. */
+ *  an IntroDB segment with a single submission (or under 0.9 confidence), a
+ *  Layer 1 opening whose theme overlaps the scene, and the other kind's song
+ *  in a kind's place. */
 export const LOW_TRUST_SKIP_SOURCES: ReadonlySet<string> = new Set([
-  INTRODB_SINGLE_SOURCE, LAYER1_PROMPT_SOURCE, LAYER1_TRANSITION_SOURCE,
+  INTRODB_SINGLE_SOURCE, LAYER1_PROMPT_SOURCE, LAYER1_TRANSITION_SOURCE, LAYER1_SWAP_SOURCE,
 ]);
 
 /** Windows that are still being confirmed: the provisional opening. They only
@@ -1106,8 +1149,11 @@ export function applyCrossSourceHolds(
       const corroborated = base.some((o) => o !== w && skipKindGroup(o.type) === "recap" && near(o, w) && (
         (o.source === "chapter" && !o.hold)
         || (CROWD_SKIP_SOURCES.has(o.source) && provider(o.source) !== provider(w.source) && !same(o))))
+        // Never the swapped opening: it is prompt-only and its false-match
+        // rate is unmeasured, so it lifts no other window to auto.
         || detected.some((d) => skipKindGroup(d.type) === "op"
-          && (d.source.startsWith(LAYER1_SOURCE) || d.source === LAYER1_EARLY_SOURCE)
+          && ((d.source.startsWith(LAYER1_SOURCE) && d.source !== LAYER1_SWAP_SOURCE)
+            || d.source === LAYER1_EARLY_SOURCE)
           && Math.abs(d.start - w.end) <= LAYER1_CONFLICT_SECONDS);
       out.push(corroborated ? w : hold(w, "uncorroborated"));
       continue;
@@ -1165,7 +1211,7 @@ export function applyCrossSourceHolds(
 /** The Next-Up gate's TRUSTED ending end for a stamp's window list, or null.
  *  App passes the list before skip modes; composeSkipWindows has already
  *  clamped it to the media end. A published Layer 1 ending's end (an
- *  auto-eligible match, or a
+ *  auto-eligible match, a
  *  partially Over one: prompt-only, but its LOCATION is the same Layer 1
  *  evidence, so Pop Team Epic 1:5's ED4 holds the card until 1406.26 instead
  *  of raising it 28 s inside the ending); else the end of the published
@@ -1174,7 +1220,9 @@ export function applyCrossSourceHolds(
  *  crowd ending that outranked it) when the two ends agree within
  *  LAYER1_CONFLICT_SECONDS: the theme's END is trusted even where its start
  *  is not (Solo Leveling E1, Cowboy Bebop 13). Never a crowd, chapter or
- *  Layer 3 end on its own. */
+ *  Layer 3 end on its own, and never the other kind's song matched in the
+ *  ending's place (`LAYER1_SWAP_SOURCE`): near a finale the opening song can
+ *  play over the epilogue, so its end is no proof the credits are over. */
 export function trustedEndingEnd(
   published: PreparedWindow[],
   detectedEd: PreparedWindow | null,
@@ -1183,7 +1231,8 @@ export function trustedEndingEnd(
   const l1 = ends.find((w) => w.source === LAYER1_SOURCE || w.source === LAYER1_PROMPT_SOURCE);
   if (l1) return l1.end;
   const d = detectedEd;
-  if (d == null || (d.source !== LAYER1_SOURCE && d.source !== LAYER1_PROMPT_SOURCE && d.source !== LAYER1_TRANSITION_SOURCE)) return null;
+  if (d == null || (d.source !== LAYER1_SOURCE && d.source !== LAYER1_PROMPT_SOURCE
+    && d.source !== LAYER1_TRANSITION_SOURCE)) return null;
   const agreed = ends.find((w) => Math.abs(w.end - d.end) <= LAYER1_CONFLICT_SECONDS);
   return agreed ? agreed.end : null;
 }

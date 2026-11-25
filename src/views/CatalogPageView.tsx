@@ -13,6 +13,10 @@ import {
   FilterMenu, applyFilters, DEFAULT_FILTERS, type FilterState,
 } from "../FilterBar";
 import { PAGE_CONTENT_MAX_W } from "../pageLayout";
+import { sheet } from "../glassSheet";
+import WatchedBadge from "../WatchedBadge";
+import { useLibraryProgress } from "../LibraryContext";
+import { PosterProgressTrack } from "../CinemaRows";
 
 // ---------------------------------------------------------------------------
 // CatalogPageView — the "/catalog/:id" deep view.
@@ -54,6 +58,10 @@ function CatalogPageBody({ target, onBack, onSelectMeta }: Props) {
   const [items, setItems]   = useState<MetaPreview[] | null>(null);
   const [filters, setFilters] = useState<FilterState>(DEFAULT_FILTERS);
   const [error, setError]    = useState<string | null>(null);
+  // Bumped by Retry: a re-run of the fetch that bypasses the catalog cache,
+  // only for the catalog it was pressed on.
+  const targetKey = `${target.addonUrl}|${target.mediaType}|${target.catalogId}`;
+  const [retry, setRetry] = useState<{ key: string; n: number }>({ key: "", n: 0 });
 
   useEffect(() => {
     let cancelled = false;
@@ -63,11 +71,12 @@ function CatalogPageBody({ target, onBack, onSelectMeta }: Props) {
       addonUrl:    target.addonUrl,
       catalogType: target.mediaType,
       catalogId:   target.catalogId,
+      force:       retry.n > 0 && retry.key === targetKey,
     })
       .then((r) => { if (!cancelled) setItems(r); })
       .catch((e) => { if (!cancelled) { setItems([]); setError(String(e)); } });
     return () => { cancelled = true; };
-  }, [target.addonUrl, target.mediaType, target.catalogId]);
+  }, [target.addonUrl, target.mediaType, target.catalogId, retry]);
 
   // Esc returns to home
   useEffect(() => {
@@ -109,17 +118,16 @@ function CatalogPageBody({ target, onBack, onSelectMeta }: Props) {
               <button
                 onClick={onBack}
                 aria-label="Back"
-                className="nav-tap flex items-center gap-2 px-3 h-9 rounded-full
-                           bg-black/40 backdrop-blur-xl border border-white/10
+                className="aura-glass-flat aura-glass-press flex items-center gap-2 px-3 h-9 rounded-full
                            text-white/85 hover:text-white text-xs font-medium tracking-wide"
               >
                 <ArrowBackIcon /> Back
               </button>
               <div>
-                <h1 className="aura-row-title text-3xl font-semibold tracking-tight">
+                <h1 data-glass-light="text" className="aura-row-title text-3xl font-semibold tracking-tight">
                   {title}
                 </h1>
-                <p className="text-white/35 text-sm mt-1">
+                <p className="text-white/55 text-sm mt-1">
                   {target.addonName}
                   {items ? ` · ${items.length} items` : " · loading…"}
                 </p>
@@ -131,16 +139,23 @@ function CatalogPageBody({ target, onBack, onSelectMeta }: Props) {
           </div>
 
           {error && (
-            <div className="glass-panel rounded-2xl px-5 py-4 border-red-400/25 border">
+            <div {...sheet("rounded-[20px] px-5 py-4 flex items-center justify-between gap-4", { tone: "danger" })}>
               <p className="text-red-300/85 text-xs font-mono break-all">{error}</p>
+              <button
+                type="button"
+                onClick={() => setRetry((r) => ({ key: targetKey, n: r.n + 1 }))}
+                className="aura-glass-flat aura-glass-press shrink-0 px-3 h-8 rounded-full text-white/85 hover:text-white text-xs font-medium"
+              >
+                Retry
+              </button>
             </div>
           )}
 
           {/* Grid */}
           {items === null ? (
             <SkeletonGrid />
-          ) : filtered.length === 0 ? (
-            <div className="glass-panel rounded-2xl px-6 py-10 text-center">
+          ) : error ? null : filtered.length === 0 ? (
+            <div {...sheet("rounded-[20px] px-6 py-10 text-center")}>
               <p className="text-white/55 text-sm">
                 {items.length === 0
                   ? "No items returned by the addon."
@@ -151,7 +166,7 @@ function CatalogPageBody({ target, onBack, onSelectMeta }: Props) {
             <div ref={gridWrapperRef} style={{ position: "relative", height: win.totalHeight }}>
               <div
                 ref={gridRef}
-                className="grid gap-5"
+                className="grid gap-5 aura-poster-grid"
                 style={{
                   position: "absolute",
                   top: win.offsetY,
@@ -193,6 +208,9 @@ function CatalogPosterCard({
   meta: MetaPreview;
   onSelect?: (m: MetaPreview) => void;
 }) {
+  // The same watch mark and progress track as the Home row it came from
+  // (round 12), so "View all" never drops a card's state.
+  const progress = useLibraryProgress(meta.id);
   return (
     <button
       type="button"
@@ -203,12 +221,12 @@ function CatalogPosterCard({
           detail: { meta, x: e.clientX, y: e.clientY },
         }));
       }}
-      className="group flex flex-col gap-2 card-contain text-left
+      className="aura-poster-card group flex flex-col gap-2 card-contain text-left
                  focus:outline-none focus-visible:ring-2 focus-visible:ring-ln-accent/60 rounded-xl"
       data-meta-card={`${meta.media_type}:${meta.id}`}
     >
       <div
-        className="relative overflow-hidden rounded-xl bg-white/5 border border-white/8"
+        className="relative overflow-hidden rounded-xl bg-white/5"
         style={{ aspectRatio: "2 / 3" }}
       >
         {meta.poster ? (
@@ -219,16 +237,24 @@ function CatalogPosterCard({
             imgClassName="w-full h-full object-cover transition-transform duration-300 group-hover:scale-[1.04]"
           />
         ) : null}
+        <WatchedBadge
+          metaId={meta.id}
+          mediaType={meta.media_type}
+          material="frost"
+          className="absolute top-2 left-2 z-10"
+        />
+        <PosterProgressTrack ratio={progress?.partial ? progress.ratio : null} />
+        <span aria-hidden className="aura-card-bezel" data-glass-light="rim" />
       </div>
       {/* Fixed-height label block so every card is the SAME total height —
           the windowing hook derives row stride from one measured card. The
           parent button's `gap-2` already spaces it from the poster. */}
       <div className="px-0.5 h-14 overflow-hidden">
-        <p className="text-white/85 text-[13px] font-medium leading-tight line-clamp-2 text-center">
+        <p className="aura-poster-title text-white/85 text-[13px] font-medium leading-tight line-clamp-2 text-center">
           {meta.name}
         </p>
         {meta.release_info && (
-          <p className="text-white/40 text-xs mt-0.5 text-center font-mono">{meta.release_info}</p>
+          <p className="text-white/55 text-xs mt-0.5 text-center font-mono">{meta.release_info}</p>
         )}
       </div>
     </button>

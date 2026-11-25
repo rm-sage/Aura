@@ -120,9 +120,9 @@ function OsdOverlay({ stats, topPx }: { stats: OsdStats; topPx: number }) {
   const containerFps = stats.container_fps > 0 ? stats.container_fps.toFixed(2) : null;
   return (
     <div
-      className="fixed right-4 z-50 pointer-events-none
-                 bg-black/70 backdrop-blur-md rounded-xl px-4 py-3
-                 border border-white/10 font-mono text-[11px] text-white/75
+      // Over the mpv video: the player material (no backdrop pass).
+      className="aura-glass-player fixed right-4 z-50 pointer-events-none
+                 rounded-xl px-4 py-3 font-mono text-[11px] text-white/75
                  space-y-1 min-w-[260px] max-w-[320px]"
       style={{ top: topPx }}
     >

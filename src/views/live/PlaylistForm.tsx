@@ -4,6 +4,7 @@
 import { useEffect, useRef, useState } from "react";
 import { addPlaylistSource, updatePlaylistSource } from "../../iptv/store";
 import type { IptvPlaylistSource } from "../../iptv/types";
+import { SegmentedControl } from "../../settingsControls";
 
 // ---------------------------------------------------------------------------
 // PlaylistForm — modal to add OR edit a Live TV playlist. Two tabs:
@@ -116,14 +117,18 @@ export default function PlaylistForm({ onClose, onAdded, editSource }: Props) {
 
   return (
     <div
-      className="fixed inset-0 z-[200] flex items-center justify-center bg-black/60 backdrop-blur-sm"
+      className="fixed inset-0 z-[200] flex items-center justify-center"
       onClick={onClose}
     >
+      {/* The dim + blur is a SIBLING layer, not the wrapper: a backdrop-filter
+          on an ancestor would blind the card's own glass. */}
+      <div aria-hidden className="aura-modal-backdrop-in absolute inset-0 bg-black/60 backdrop-blur-sm" />
       <div
         role="dialog"
         aria-label={editing ? "Edit playlist" : "Add playlist"}
-        className="w-[460px] max-w-[92vw] rounded-2xl border border-white/12
-                   bg-[rgba(16,16,20,0.98)] backdrop-blur-2xl shadow-glass-edge p-5"
+        // A dialog: the shared floating glass (menu tier), growing from the centre.
+        className="aura-float-glass aura-glass-pop-in relative w-[460px] max-w-[92vw] rounded-2xl p-5"
+        style={{ "--lg-origin": "50% 50%" } as React.CSSProperties}
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between mb-4">
@@ -133,7 +138,7 @@ export default function PlaylistForm({ onClose, onAdded, editSource }: Props) {
           <button
             type="button"
             onClick={onClose}
-            className="w-7 h-7 rounded-md text-white/40 hover:text-white hover:bg-white/10
+            className="aura-glass-item w-7 h-7 rounded-md text-white/40 hover:text-white
                        flex items-center justify-center"
             aria-label="Close"
           >
@@ -144,14 +149,17 @@ export default function PlaylistForm({ onClose, onAdded, editSource }: Props) {
         {/* Tabs — locked to the source's kind when editing (can't change an
             M3U into an Xtream login in place). */}
         {!editing && (
-          <div className="flex gap-1 p-1 rounded-xl bg-white/5 border border-white/8 mb-4">
-            <TabButton active={tab === "m3u"} onClick={() => setTab("m3u")}>
-              M3U URL
-            </TabButton>
-            <TabButton active={tab === "xtream"} onClick={() => setTab("xtream")}>
-              Xtream Login
-            </TabButton>
-          </div>
+          <SegmentedControl<Tab>
+            value={tab}
+            onChange={setTab}
+            ariaLabel="Playlist type"
+            fill
+            className="mb-4"
+            options={[
+              { value: "m3u", label: "M3U URL" },
+              { value: "xtream", label: "Xtream Login" },
+            ]}
+          />
         )}
 
         <div className="space-y-3">
@@ -229,7 +237,7 @@ export default function PlaylistForm({ onClose, onAdded, editSource }: Props) {
               value={proxyUrl}
               onChange={(e) => setProxyUrl(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && submit()}
-              placeholder="http://host:8888  — tunnel this playlist's streams"
+              placeholder="http://host:8888 (tunnels this playlist's streams)"
               className={inputCls}
             />
           </Field>
@@ -247,8 +255,8 @@ export default function PlaylistForm({ onClose, onAdded, editSource }: Props) {
           <button
             type="button"
             onClick={onClose}
-            className="px-3.5 h-9 rounded-xl text-[13px] font-medium bg-white/5 border border-white/10
-                       text-white/70 hover:bg-white/10"
+            className="aura-glass-flat aura-glass-press px-3.5 h-9 rounded-xl text-[13px] font-medium
+                       text-white/70"
           >
             Cancel
           </button>
@@ -256,8 +264,7 @@ export default function PlaylistForm({ onClose, onAdded, editSource }: Props) {
             type="button"
             disabled={!canSubmit}
             onClick={submit}
-            className="px-4 h-9 rounded-xl text-[13px] font-medium border transition-colors
-                       bg-ln-accent/15 text-ln-accent border-ln-accent/30 hover:bg-ln-accent/25
+            className="aura-glass-flat is-primary aura-glass-press px-4 h-9 rounded-xl text-[13px] font-medium
                        disabled:opacity-40 disabled:cursor-not-allowed"
           >
             {saving ? (editing ? "Saving…" : "Adding…") : editing ? "Save changes" : "Add playlist"}
@@ -269,31 +276,8 @@ export default function PlaylistForm({ onClose, onAdded, editSource }: Props) {
 }
 
 const inputCls =
-  "w-full h-10 px-3 rounded-xl bg-white/5 border border-white/10 text-[13px] " +
-  "text-white/90 placeholder:text-white/30 focus:outline-none focus:border-ln-accent/40";
-
-function TabButton({
-  active,
-  onClick,
-  children,
-}: {
-  active: boolean;
-  onClick: () => void;
-  children: React.ReactNode;
-}) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      className={[
-        "flex-1 h-8 rounded-lg text-[12.5px] font-medium transition-colors",
-        active ? "bg-ln-accent/20 text-ln-accent" : "text-white/55 hover:text-white/85",
-      ].join(" ")}
-    >
-      {children}
-    </button>
-  );
-}
+  "aura-glass-field w-full h-10 px-3 rounded-xl text-[13px] " +
+  "text-white/90 placeholder:text-white/30 focus:outline-none";
 
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
   return (

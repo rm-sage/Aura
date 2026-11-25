@@ -129,8 +129,10 @@ export default function CastSessionBar({
   const positionSec = useInterpolatedPosition(status);
   return (
     <div
-      className="fixed left-1/2 -translate-x-1/2 z-[10000] aura-glass-bar rounded-2xl
-                 shadow-glass-edge px-4 py-2.5 flex items-center gap-3"
+      // The player family's material (.aura-glass-player): baked base, no
+      // backdrop pass, the chosen material's shading and the cursor glint.
+      className="fixed left-1/2 -translate-x-1/2 z-[10000] aura-glass-player rounded-2xl
+                 px-4 py-2.5 flex items-center gap-3"
       style={{ bottom: isFullscreen ? 24 : 56 }}
       role="status"
     >

@@ -250,7 +250,7 @@ export function NextUpTailPill({
   return (
     <div
       // Same slot and layer as the card, which it stands in for.
-      className={`aura-stack-surface fixed left-6 z-[10001] rounded-2xl px-6 py-4
+      className={`aura-glass-player aura-stack-surface fixed left-6 z-[10001] rounded-[20px] px-6 py-4
                   text-white pointer-events-none ${
                     exiting ? "aura-stack-exit" : mountedHidden ? "" : "aura-stack-enter"}`}
       style={{
@@ -273,9 +273,10 @@ export function NextUpTailPill({
   );
 }
 
-/** The skip prompt's text shadow: keeps small text legible over bright
- *  frames that bleed through the glass. */
-const STACK_TEXT_SHADOW = "0 1px 4px rgba(0,0,0,0.85)";
+/** The stack's text shadow: tight, like every player surface's
+ *  (styles/glass-player.css). The 0.9 face carries legibility now; the old
+ *  4 px 0.85 halo smudged the small caps. */
+const STACK_TEXT_SHADOW = "0 1px 1px rgb(0 0 0 / 0.35)";
 
 /** A key hint on one of the card's buttons: the skip prompt's key cap, small. */
 function KeyHint({ children }: { children: ReactNode }) {
@@ -435,7 +436,8 @@ export default function NextUpCta({
     <div
       // Z-INDEX 10001 (above PlayerOverlay's 9999) so the CTA paints
       // and receives clicks ahead of the overlay's invisible layer.
-      // `.aura-stack-surface` is the skip prompt's own surface: the two stack
+      // `.aura-glass-player.aura-stack-surface` is the skip prompt's own
+      // surface (the player's A face, denser): the two stack
       // as one group, so they must not read as two different materials.
       // The fade mirrors PlayerOverlay's chrome (opacity, 500 ms), and a
       // faded card takes no clicks, like the controls it follows.
@@ -445,7 +447,7 @@ export default function NextUpCta({
       // A card that first appears already faded (an ending auto-skipped
       // straight into what follows it, controls hidden) skips the entry: the
       // keyframes end at full opacity and would flash it on screen.
-      className={`aura-stack-surface fixed left-6 z-[10001] rounded-2xl px-6 py-4
+      className={`aura-glass-player aura-stack-surface fixed left-6 z-[10001] rounded-[20px] px-6 py-4
                   text-white ${exiting ? "aura-stack-exit" : mountedFaded ? "" : "aura-stack-enter"}`}
       style={{
         top,
@@ -569,7 +571,7 @@ export default function NextUpCta({
           <ArcIcon />
           <p className="min-w-0">
             <span className="text-white/85">{arcNote.ending} complete</span>
-            <span className="text-white/35"> · </span>
+            <span className="text-white/45"> · </span>
             <span className="text-ln-accent">
               {arcNote.next ? `Next: ${arcNote.next}` : "Final arc"}
             </span>
@@ -640,8 +642,10 @@ export default function NextUpCta({
                 canSkip
                   // Secondary when a skip is on offer: two equally loud
                   // buttons would make the choice harder, not easier.
-                  ? "h-9 border-white/12 bg-white/6 text-white/80 hover:bg-white/12 hover:text-white"
-                  : "border-ln-accent/50 bg-ln-accent/25 text-white hover:bg-ln-accent/35 hover:border-ln-accent/70"
+                  // Glass flat controls (App.css GLASS SYSTEM), so the chosen
+                  // material draws them; is-primary carries the accent.
+                  ? "h-9 aura-glass-flat text-white/80 hover:text-white"
+                  : "aura-glass-flat is-primary"
               }`}
             >
               <span className="relative flex flex-1 items-center gap-2.5 min-w-0">
@@ -677,7 +681,7 @@ export default function NextUpCta({
           the end screen's countdown presses. Last, and quiet: it is about
           the end screen, not this card's choice. */}
       {autoplayAhead && (
-        <p className="mt-3 flex items-center gap-1.5 text-white/45 text-[12px] leading-snug">
+        <p className="mt-3 flex items-center gap-1.5 text-white/60 text-[12px] leading-snug">
           <AutoplayIcon />
           Autoplay starts when this episode ends
         </p>

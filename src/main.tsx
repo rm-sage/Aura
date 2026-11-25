@@ -25,10 +25,28 @@ import ReactDOM from "react-dom/client";
 import * as Sentry from "@sentry/react";
 import { invoke } from "@tauri-apps/api/core";
 import App from "./App";
+// Per-group glass surface rules. Imported AFTER App (whose module imports
+// App.css), so they land later in the bundled stylesheet and win ties with it.
+import "./styles/glass-search.css";
+import "./styles/glass-chrome.css";
+import "./styles/glass-settings.css";
+import "./styles/glass-misc.css";
+import "./styles/glass-hero.css";
+import "./styles/glass-rail.css";
+import "./styles/glass-cards.css";
+import "./styles/glass-notify.css";
+import "./styles/glass-pages.css";
+import "./styles/glass-detail.css";
+import "./styles/glass-player.css";
 import { installSearchHotkey } from "./searchHotkey";
 import { installScrollPause } from "./scrollPause";
 import { installWheelSmooth } from "./wheelSmooth";
 import { applyReducedMotionAttribute, loadAuraSettings } from "./auraSettings";
+import { installGlassStyle } from "./glassStyle";
+import { installLiquidGlass } from "./liquidGlass";
+import { installGlassGlint } from "./glassGlint";
+import { installThemeAccent } from "./themeAccent";
+import { installCardGlow } from "./cardGlow";
 
 // Synchronous reduced-motion gate, fired BEFORE React mounts so the
 // initial paint already carries `<html data-reduced-motion="true|false">`.
@@ -36,6 +54,19 @@ import { applyReducedMotionAttribute, loadAuraSettings } from "./auraSettings";
 // for ~200ms while JS catches up. Live updates are wired in App.tsx via
 // matchMedia + aura:settings-changed subscriptions.
 applyReducedMotionAttribute();
+
+// Glass material (<html data-glass>), the Liquid refraction binder and the
+// cursor glint. Stamped before React mounts so the first frame draws the chosen
+// material; each installer returns its cleanup, run on a hot reload.
+const glassCleanups = [installGlassStyle(), installLiquidGlass(), installGlassGlint()];
+// The user's custom accent for the active theme (index.html already drew the
+// cached one pre-paint); it then follows every change to the stored map.
+glassCleanups.push(installThemeAccent());
+// The hovered catalog card's art-tinted underglow (one delegated listener).
+glassCleanups.push(installCardGlow());
+if (import.meta.hot) {
+  import.meta.hot.dispose(() => { for (const c of glassCleanups) c(); });
+}
 
 // ---------------------------------------------------------------------------
 // Sentry — initialised before React mounts ONLY when the user has opted in

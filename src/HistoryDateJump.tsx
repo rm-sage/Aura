@@ -225,7 +225,7 @@ export default function HistoryDateJump({
   // Read once: the theme does not change under an open popover.
   const inks = useMemo(() => inksFor(readAccentRgb()), []);
 
-  const [pos, setPos] = useState<{ left: number; top: number } | null>(null);
+  const [pos, setPos] = useState<{ left: number; top: number; up: boolean } | null>(null);
   // Under the anchor, right edges aligned, pulled back inside the viewport.
   // Measured before paint so it never flashes at an unclamped spot.
   useLayoutEffect(() => {
@@ -239,7 +239,7 @@ export default function HistoryDateJump({
       const left = Math.max(EDGE, Math.min(a.right - r.width, vw - r.width - EDGE));
       let top = a.bottom + 6;
       if (top + r.height > vh - EDGE) top = Math.max(TITLE_BAR_H + 8, a.top - r.height - 6);
-      setPos({ left, top });
+      setPos({ left, top, up: top < a.top });
     };
     place();
     window.addEventListener("resize", place);
@@ -379,8 +379,8 @@ export default function HistoryDateJump({
     btns[next]?.focus({ preventScroll: true });
   };
 
-  const navBtn = "w-9 h-9 rounded-lg grid place-items-center text-white/60 hover:text-white "
-    + "hover:bg-white/10 transition-colors disabled:opacity-25 disabled:pointer-events-none";
+  const navBtn = "aura-glass-item w-9 h-9 rounded-lg grid place-items-center text-white/60 hover:text-white "
+    + "disabled:opacity-25 disabled:pointer-events-none";
 
   const titleRef = useRef<HTMLButtonElement>(null);
   const step = (delta: number) => {
@@ -432,15 +432,16 @@ export default function HistoryDateJump({
       ref={panelRef}
       role="dialog"
       aria-label="Jump to date"
-      className="aura-float-glass fixed z-[10045] w-[440px] max-w-[calc(100vw-24px)]
+      // Grows from the trigger (right edges aligned): the glass pop.
+      className="aura-float-glass aura-glass-pop-in fixed z-[10045] w-[440px] max-w-[calc(100vw-24px)]
                  max-h-[calc(100vh-56px)] overflow-y-auto rounded-2xl p-4 select-none"
       style={{
         left: pos?.left ?? -9999,
         top: pos?.top ?? -9999,
-        animation: "fade-in 140ms ease-out",
+        "--lg-origin": pos?.up ? "bottom right" : "top right",
         scrollbarWidth: "thin",
         scrollbarColor: "rgba(255,255,255,0.08) transparent",
-      }}
+      } as React.CSSProperties}
       // Keys pressed in here stop here: App's window-level bindings do not
       // check defaultPrevented, and the arrows walking the grid must not also
       // drive them. Function keys still pass (F12 opens the DevConsole), and so
@@ -799,8 +800,8 @@ function QuickJump({ label, onClick }: { label: string; onClick: () => void }) {
     <button
       type="button"
       onClick={onClick}
-      className="flex-1 px-3 py-1.5 rounded-full text-[13px] font-medium whitespace-nowrap bg-white/6
-                 text-white/75 border border-white/10 hover:bg-white/12 hover:text-white transition-colors"
+      className="aura-glass-flat aura-glass-press flex-1 px-3 py-1.5 rounded-full text-[13px] font-medium
+                 whitespace-nowrap text-white/75 hover:text-white"
     >
       {label}
     </button>

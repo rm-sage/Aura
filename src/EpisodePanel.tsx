@@ -17,9 +17,10 @@
 //
 // Spoiler parity with DetailView is exact: thumbnails use the pure
 // `shouldBlurThumbnail` gate (same keys), and an unwatched-blurred thumb
-// shows a small lock affordance — identical rule to EpisodeRow. The glass
-// uses `.aura-glass-menu` (App.css) for the readable-over-bright-video
-// surface + universal text-shadow lift; the scrim is a touch stronger
+// shows a small lock affordance, identical rule to EpisodeRow. The glass
+// is `.aura-glass-player` (App.css GLASS SYSTEM: the chosen material with no
+// backdrop pass, since the video is a native window under the webview) plus
+// the player text-shadow lift (glass-misc.css); the scrim is a touch stronger
 // than the dropdown for legibility over a bright paused frame.
 // ---------------------------------------------------------------------------
 
@@ -35,6 +36,7 @@ import { shouldBlurThumbnail, isEpisodeWatched } from "./episodeSpoilers";
 import { seasonScrollAnchor } from "./seasonScroll";
 import { episodeKindFlags, formatEpisodeTag } from "./nextUp";
 import FillerRecapTags from "./FillerRecapTags";
+import { useListDroplet } from "./glassListDroplet";
 import { isSkipped, useSkipMarksVersion } from "./skipMarks";
 import { useReleaseSignal } from "./releaseSignalStore";
 import { isVideoAired } from "./types";
@@ -279,6 +281,9 @@ function EpisodePanel({
   // list changes (season pick, or the open arc), so the current row is centred
   // in whichever grouping is showing.
   const listRef = useRef<HTMLDivElement>(null);
+  // One hover droplet for the rows (Liquid; Frosted rows keep their own
+  // fill), as Switch source does: the player's faint droplet, 12 px in.
+  const droplet = useListDroplet<HTMLDivElement>(".aura-glass-item");
   useEffect(() => {
     if (!open || !currentEpisodeId) return;
     const id = window.setTimeout(() => {
@@ -392,7 +397,7 @@ function EpisodePanel({
       />
       <div
         className="fixed right-0 bottom-0 z-[10400] pointer-events-auto w-[420px] max-w-[88vw]
-                   aura-glass-menu border-l border-white/10
+                   aura-glass-player
                    flex flex-col text-white
                    animate-[ep-panel-slide_220ms_cubic-bezier(0.16,1,0.3,1)]"
         style={{ top: isFullscreen ? 0 : 36 }}
@@ -424,7 +429,7 @@ function EpisodePanel({
             ) : arcMode ? (
               <span className="text-[16px] font-semibold tracking-tight text-white">Arcs</span>
             ) : seasons.length > 1 ? (
-              <SeasonSelect seasons={seasons} value={season} onChange={pickSeason} />
+              <SeasonSelect seasons={seasons} value={season} onChange={pickSeason} overPlayer />
             ) : (
               <span className="text-[16px] font-semibold tracking-tight text-white">Episodes</span>
             )}
@@ -455,11 +460,17 @@ function EpisodePanel({
         </div>
 
         {/* List */}
+        {/* A flex column, not space-y: the droplet is the first child and
+            space-y would push a margin onto the first row. `relative` so the
+            droplet scrolls with the rows (ArcGrid measures its landing from
+            rects, so it does not mind being the offsetParent). */}
         <div
           ref={listRef}
-          className="flex-1 min-h-0 overflow-y-auto px-3 pt-3 pb-4 space-y-1.5"
+          {...droplet.listProps}
+          className="relative flex-1 min-h-0 overflow-y-auto px-3 pt-3 pb-4 flex flex-col gap-1.5"
           style={{ scrollbarWidth: "thin", scrollbarColor: "rgba(255,255,255,0.10) transparent" }}
         >
+          <span ref={droplet.ref} aria-hidden className="aura-glass-hl aura-player-hl" style={{ left: 12, right: 12 }} />
           {arcMode && !openArc ? (
             // Arc GRID: pick an arc to drill into its episodes. ArcGrid owns the
             // grouping switcher (Sagas / Story Arcs), the tiles, and the loading
@@ -483,7 +494,7 @@ function EpisodePanel({
             <ArcGridSkeleton />
           ) : loading && visibleEpisodes.length === 0 ? (
             Array.from({ length: 6 }).map((_, i) => (
-              <div key={i} className="h-[84px] rounded-xl bg-white/[0.04] animate-pulse" />
+              <div key={i} className="flex-none h-[84px] rounded-xl bg-white/[0.04] animate-pulse" />
             ))
           ) : visibleEpisodes.length === 0 ? (
             <p className="text-white/55 text-[13px] px-3 py-8 text-center">
@@ -529,15 +540,19 @@ function EpisodePanel({
                   onClick={() => handleRowClick(v)}
                   disabled={pendingPlayId !== null}
                   aria-busy={isPending || undefined}
-                  className={`relative overflow-hidden w-full flex gap-3 p-2 rounded-xl text-left transition-colors
-                              disabled:cursor-default
-                              ${isCurrent
-                                ? "bg-ln-accent/15 border border-ln-accent/35"
-                                : "border border-transparent hover:bg-white/10"}`}
+                  // The playing episode is SELECTED (GLASS SYSTEM): an accent
+                  // wash in Frosted, a raised face in Liquid, never an accent
+                  // ring there. The transparent border keeps the row box.
+                  // The playing episode is SELECTED: the player's selected row
+                  // (glass-player.css), the rail pill's face in Liquid with its
+                  // rim lit by the cursor light. The list's droplet is the hover.
+                  data-glass-light={isCurrent ? "rim" : undefined}
+                  className={`aura-glass-item relative overflow-hidden w-full flex flex-none gap-3 p-2 rounded-xl text-left
+                              border border-transparent disabled:cursor-default
+                              ${isCurrent ? "is-selected" : ""}`}
                 >
                   <div
-                    className="relative flex-shrink-0 w-[120px] rounded-lg overflow-hidden
-                               bg-white/5 border border-white/10"
+                    className="aura-ep-thumb relative flex-shrink-0 w-[120px] rounded-lg overflow-hidden bg-white/5"
                     style={{ aspectRatio: "16 / 9" }}
                   >
                     {v.thumbnail ? (
@@ -633,8 +648,9 @@ function EpisodePanel({
                   {isPending && (
                     <span
                       aria-hidden
+                      // No backdrop blur: over the video it samples nothing.
                       className="absolute inset-0 flex items-center justify-center
-                                 bg-black/45 backdrop-blur-sm pointer-events-none"
+                                 bg-black/55 pointer-events-none"
                     >
                       <svg
                         width="22"

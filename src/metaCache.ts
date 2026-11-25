@@ -166,6 +166,11 @@ function noteYear(id: string, detail: MetaDetail | null, ts: number) {
       // have been persisted, and rehydrating one re-sticks the empty
       // hover state until its (formerly multi-day) TTL aged out.
       if (!v.detail) continue;
+      // An AIOStreams error pseudo-meta ("[❌] <addon>", a wrapped addon's
+      // failure) stored by a build before fetch_meta_detail refused it: it
+      // is not the title, and as a fresh hit it would stand in for one until
+      // its TTL (7 days for a movie).
+      if (/^aiostreamserror\./i.test(v.detail.id ?? "")) continue;
       if (now - v.ts >= TTL_MAX_MS) continue;
       cache.set(k, v);
       const idPart = k.split("::")[2];

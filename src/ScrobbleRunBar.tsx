@@ -1,6 +1,7 @@
 // Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+import { memo } from "react";
 import { cancelScrobbleRun, useScrobbleRun } from "./scrobbleRun";
 
 // ---------------------------------------------------------------------------
@@ -13,7 +14,7 @@ import { cancelScrobbleRun, useScrobbleRun } from "./scrobbleRun";
 // Renders nothing at all when no job is running.
 // ---------------------------------------------------------------------------
 
-export default function ScrobbleRunBar({ suppressed = false }: { suppressed?: boolean }) {
+function ScrobbleRunBar({ suppressed = false }: { suppressed?: boolean }) {
   const run = useScrobbleRun();
   // Hidden, but NOT stopped: during playback (a stream or a trailer) the bar
   // would sit on top of the video, and while the close-confirmation prompt is up
@@ -25,10 +26,9 @@ export default function ScrobbleRunBar({ suppressed = false }: { suppressed?: bo
 
   return (
     <div
-      className="fixed bottom-5 left-1/2 -translate-x-1/2 z-[250]
-                 flex items-center gap-3 px-4 py-2.5 rounded-full
-                 bg-black/85 backdrop-blur-xl border border-white/15
-                 shadow-2xl shadow-black/50"
+      // The tooltip tier of the shared glass: cheap, never refracted.
+      className="aura-float-glass aura-glass-tip fixed bottom-5 left-1/2 -translate-x-1/2 z-[250]
+                 flex items-center gap-3 px-4 py-2.5 rounded-full"
       role="status"
       aria-live="polite"
     >
@@ -36,7 +36,7 @@ export default function ScrobbleRunBar({ suppressed = false }: { suppressed?: bo
         {/* A single long step (Simkl's batch) names itself instead of a count
             that would sit still for its whole duration. */}
         {run.step ? run.step : run.backingOff
-          ? `Rate limited — retrying ${run.done}/${run.total}`
+          ? `Rate limited, retrying ${run.done}/${run.total}`
           : `Scrobbling ${run.done}/${run.total}`}
       </span>
 
@@ -69,3 +69,7 @@ export default function ScrobbleRunBar({ suppressed = false }: { suppressed?: bo
     </div>
   );
 }
+
+// Memoized: App re-renders on every playback-update tick and passes only a
+// boolean; the bar follows its own store (useScrobbleRun).
+export default memo(ScrobbleRunBar);

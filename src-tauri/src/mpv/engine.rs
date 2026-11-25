@@ -53,7 +53,7 @@
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::ptr;
 use std::sync::{
-    atomic::{AtomicBool, AtomicIsize, AtomicU8, Ordering},
+    atomic::{AtomicBool, AtomicIsize, Ordering},
     mpsc::{self, Receiver, Sender, TryRecvError},
     Mutex, OnceLock,
 };
@@ -87,6 +87,7 @@ use super::ffi::{
     mpv_event_end_file, mpv_event_id, mpv_event_log_message, mpv_event_property,
     mpv_format, mpv_handle, Libmpv,
 };
+use super::glass::{self, GlassCmd, GlassState};
 
 // ===========================================================================
 // Public API
@@ -181,6 +182,10 @@ enum EngineCommand {
         /// on `reply.recv()` and forwards either to JS.
         reply: Sender<Result<serde_json::Value, String>>,
     },
+    /// "Real glass over video" (mpv/glass.rs). Handled entirely on the engine
+    /// thread, which owns the glass state, the cached video rect and the
+    /// async sends.
+    Glass(GlassCmd),
 }
 
 /// Live engine bookkeeping. Held inside [`ENGINE`] for the engine's lifetime.
@@ -407,6 +412,13 @@ pub fn submit_get_property(
     }
 }
 
+/// Submit a "Real glass over video" command (see `mpv/glass.rs`). Never
+/// blocks on mpv: the engine sends the shader updates with
+/// `mpv_command_async`.
+pub fn submit_glass(cmd: GlassCmd) -> Result<(), String> {
+    submit(EngineCommand::Glass(cmd))
+}
+
 /// Shared submit path — locks the slot briefly, sends through the
 /// channel, releases. Multiple Tauri command handlers can call this
 /// concurrently; the render thread drains them in order between frames.
@@ -579,11 +591,15 @@ const IDLE_TICK: Duration = Duration::from_millis(33);
 /// delays pump coarsening on minimize and un-coarsening on restore).
 const MODE_POLL_INTERVAL: Duration = Duration::from_millis(120);
 
-/// Current [`PresentMode`] discriminant, published from the render thread
-/// on every mode transition. 255 = engine not running. Read by the debug
-/// Tauri commands so the Settings → Debug Stuff panel can show the live
-/// state without touching the render thread.
-static CURRENT_MODE: AtomicU8 = AtomicU8::new(255);
+/// "Error while decoding frame" lines, with no first frame since the file
+/// opened, after which the load is reported as undecodable. The incident that
+/// set it logged one every 4-30 ms (H.264 packets under an HEVC header), so it
+/// is reached within a second there; a damaged first GOP or a hardware decoder
+/// handing over to software logs a handful.
+const UNDECODABLE_ERRORS: u32 = 60;
+/// And never sooner than this after the file opened (or a seek), so a burst
+/// before the first keyframe has time to resolve into a frame.
+const UNDECODABLE_GRACE: Duration = Duration::from_secs(3);
 
 /// Whether the display should be kept awake (set by the frontend via the
 /// `set_keep_display_awake` Tauri command when the player is active and
@@ -614,6 +630,17 @@ static PUMP_HWND: AtomicIsize = AtomicIsize::new(0);
 /// the parent-visibility re-detect and the geometry pass, which are otherwise
 /// rate-limited / edge-triggered and would sleep through a restore.
 static FORCE_RESYNC: AtomicBool = AtomicBool::new(false);
+
+/// Whether the last LoadFile carried an HDR hint. A Settings change to
+/// passthrough (or a nits change under it) re-pushes the output set while a
+/// file may be playing; it reads this so an SDR file keeps the SDR set the
+/// per-load routing gave it instead of dropping into the PQ container.
+static LAST_LOAD_HDR: AtomicBool = AtomicBool::new(false);
+
+/// See LAST_LOAD_HDR.
+pub fn last_load_was_hdr() -> bool {
+    LAST_LOAD_HDR.load(Ordering::SeqCst)
+}
 
 /// Cut the current pump wait short and force one full resync. Called from the
 /// window-event thread when the window goes from minimized back to restored
@@ -656,12 +683,6 @@ pub fn wake_and_resync() {
             );
         }
     }
-}
-
-/// Read the engine's current [`PresentMode`]. Returns `None` when the
-/// engine isn't running.
-pub fn current_present_mode() -> Option<PresentMode> {
-    PresentMode::from_u8(CURRENT_MODE.load(Ordering::Acquire))
 }
 
 /// Host-window wndproc. Only `WM_PAINT` is special-cased; everything else
@@ -766,6 +787,51 @@ unsafe fn run_mpv_command(
     } else {
         Ok(())
     }
+}
+
+/// `mpv_command_async(handle, userdata, args)`: queued to mpv's core thread
+/// and answered later by an `MPV_EVENT_COMMAND_REPLY` carrying `userdata`
+/// (drained, and logged on error, by `drain_mpv_events`). mpv copies the
+/// arguments before returning, so the CStrings may drop right after. Used for
+/// the glass shader updates, which wait on the VO thread (6 to 9 ms while
+/// playing) when sent synchronously (landmine 11). Commands queued this way
+/// still run in order with the synchronous ones: both go through the core's
+/// one FIFO dispatch queue.
+unsafe fn run_mpv_command_async(
+    lib: &Libmpv,
+    handle: *mut mpv_handle,
+    userdata: u64,
+    args: &[&str],
+) -> Result<(), String> {
+    let cstrings: Vec<CString> = args
+        .iter()
+        .map(|s| CString::new(*s))
+        .collect::<Result<_, _>>()
+        .map_err(|e| format!("argument contained NUL: {e}"))?;
+    let mut ptrs: Vec<*const c_char> = cstrings.iter().map(|c| c.as_ptr()).collect();
+    ptrs.push(ptr::null());
+    let r = (lib.command_async)(handle, userdata, ptrs.as_mut_ptr());
+    if r < 0 {
+        Err(err_str(lib, r))
+    } else {
+        Ok(())
+    }
+}
+
+/// One glass `change-list` op, async, logged on a submit error.
+unsafe fn glass_command(lib: &Libmpv, handle: *mut mpv_handle, args: &[&str]) -> bool {
+    match run_mpv_command_async(lib, handle, glass::REPLY_ID, args) {
+        Ok(()) => true,
+        Err(e) => {
+            crate::devlog!(warn, "mpv", "real glass: {} {} failed: {e}", args.first().unwrap_or(&""), args.get(1).unwrap_or(&""));
+            false
+        }
+    }
+}
+
+/// Send one full `glsl-shader-opts` set (async).
+unsafe fn glass_send_opts(lib: &Libmpv, handle: *mut mpv_handle, opts: &str) -> bool {
+    glass_command(lib, handle, &["change-list", "glsl-shader-opts", "add", opts])
 }
 
 /// `mpv_set_property("pause", MPV_FORMAT_FLAG, &flag)`. Separate helper
@@ -1032,10 +1098,20 @@ struct EventTick {
     /// own: mpv rewords its log strings between builds, so text must never be
     /// the thing that fires UI.
     corrupt_hint: Option<&'static str>,
+    /// mpv's own codec-agnostic "Error while decoding frame" lines (prefix
+    /// `vd`) seen this drain. Counted per load by the pump to spot a file
+    /// whose packets do not decode at all (see `UNDECODABLE_ERRORS`).
+    vd_errors: u32,
     /// Latest `time-pos` seen this drain, so the pump can spot a discontinuity
     /// without a `get_property` (which must never run during a state
     /// transition; see the landmines in CLAUDE.md).
     time_pos: Option<f64>,
+    /// Latest `pause` / `speed` from the observed set (the glass fade needs
+    /// to know whether PTS advances, and how fast).
+    paused: Option<bool>,
+    speed: Option<f64>,
+    /// An async glass command mpv answered with an error (its code).
+    glass_reply_err: Option<c_int>,
 }
 
 unsafe fn drain_mpv_events(lib: &Libmpv, handle: *mut mpv_handle, emit: &EngineEmit) -> EventTick {
@@ -1082,6 +1158,15 @@ unsafe fn drain_mpv_events(lib: &Libmpv, handle: *mut mpv_handle, emit: &EngineE
             continue;
         }
         if id == mpv_event_id::SEEK { t.seek = true; continue; }
+        // Replies to `mpv_command_async` (only the glass updates use it). The
+        // result node is owned by mpv and freed on the next wait_event; all
+        // we keep is a failure code to log.
+        if id == mpv_event_id::COMMAND_REPLY {
+            if (*ev).reply_userdata == glass::REPLY_ID && (*ev).error < 0 {
+                t.glass_reply_err = Some((*ev).error);
+            }
+            continue;
+        }
         if id == mpv_event_id::PLAYBACK_RESTART { t.restart = true; continue; }
         if id == mpv_event_id::LOG_MESSAGE {
             let m = (*ev).data as *const mpv_event_log_message;
@@ -1116,6 +1201,9 @@ unsafe fn drain_mpv_events(lib: &Libmpv, handle: *mut mpv_handle, emit: &EngineE
                     let hit = DAMAGE.iter().find(|(needle, _)| body.contains(needle));
                     if let Some((_, kind)) = hit {
                         t.corrupt_hint = Some(kind);
+                    }
+                    if cstr((*m).prefix).trim() == "vd" && body.contains("Error while decoding frame") {
+                        t.vd_errors = t.vd_errors.saturating_add(1);
                     }
                     // mpv names the file it opens (`Playing: <url>`,
                     // `Failed to open <url>.`), and these lines reach the
@@ -1169,8 +1257,8 @@ unsafe fn drain_mpv_events(lib: &Libmpv, handle: *mut mpv_handle, emit: &EngineE
                 // on every increment — at info they flooded the ring
                 // buffer + stderr + the Tauri event channel (an overhead
                 // amplifier exactly when the system is already behind).
-                // The debug panel's drop test reads the counters via
-                // get_property instead.
+                // The Performance Monitor reads them through
+                // perf_monitor::note_drops.
                 if name == "frame-drop-count" {
                     crate::perf_monitor::note_drops(false, data.as_i64());
                     crate::devlog!(
@@ -1189,6 +1277,10 @@ unsafe fn drain_mpv_events(lib: &Libmpv, handle: *mut mpv_handle, emit: &EngineE
                 // which must never be issued during a state transition.
                 if name == "time-pos" {
                     if let Some(v) = data.as_f64() { t.time_pos = Some(v); }
+                } else if name == "pause" {
+                    if let Some(v) = data.as_bool() { t.paused = Some(v); }
+                } else if name == "speed" {
+                    if let Some(v) = data.as_f64() { t.speed = Some(v); }
                 }
                 emit(&name, data);
             }
@@ -1217,13 +1309,12 @@ unsafe fn drain_mpv_events(lib: &Libmpv, handle: *mut mpv_handle, emit: &EngineE
     t
 }
 
-/// Three-state visibility classification of the parent window, retained
-/// from the render-engine era as **telemetry only** — under `--wid`
-/// embedding mpv owns presentation, so nothing here changes playback
-/// behaviour. The engine publishes the current mode to [`CURRENT_MODE`]
-/// (read by the Settings → Debug panel) and devlogs transitions, which
-/// remains the easiest way to correlate off-focus frame-drop reports
-/// with the window state they happened in.
+/// Three-state visibility classification of the parent window. Under
+/// `--wid` embedding mpv owns presentation, so the mode never changes
+/// playback itself: it sets the pump's tick tier and the 1 ms timer
+/// re-assert, and transitions are devlogged, which remains the easiest way
+/// to correlate off-focus frame-drop reports with the window state they
+/// happened in.
 ///
 /// * [`Foreground`] — the parent IS `GetForegroundWindow()` AND visible.
 /// * [`VisibleBackground`] — visible but NOT foreground (Aura on monitor
@@ -1238,38 +1329,6 @@ pub enum PresentMode {
 }
 
 impl PresentMode {
-    /// Numeric discriminant for the [`CURRENT_MODE`] atomic. 255 stands
-    /// for "engine not running" so debug callers can distinguish a
-    /// genuinely-foreground engine from an idle / shut-down one.
-    fn as_u8(self) -> u8 {
-        match self {
-            PresentMode::Foreground => 0,
-            PresentMode::VisibleBackground => 1,
-            PresentMode::Hidden => 2,
-        }
-    }
-
-    /// Reverse of [`as_u8`] — used by [`current_present_mode`] to
-    /// translate the atomic back into a Mode.
-    fn from_u8(value: u8) -> Option<PresentMode> {
-        match value {
-            0 => Some(PresentMode::Foreground),
-            1 => Some(PresentMode::VisibleBackground),
-            2 => Some(PresentMode::Hidden),
-            _ => None,
-        }
-    }
-
-    /// Short string identifier (no parenthetical) for the debug API
-    /// JSON. Stable name — frontend can switch on this.
-    pub fn name(self) -> &'static str {
-        match self {
-            PresentMode::Foreground => "foreground",
-            PresentMode::VisibleBackground => "visible-background",
-            PresentMode::Hidden => "hidden",
-        }
-    }
-
     /// Human-readable label for devlog messages.
     fn label(self) -> &'static str {
         match self {
@@ -1380,6 +1439,189 @@ unsafe fn parent_client_inset(parent: HWND) -> (i32, i32, i32, i32) {
         return (0, y_off, w, h);
     }
     (0, y_off, FALLBACK_W, FALLBACK_H)
+}
+
+/// Property writes that move or rescale the video inside mpv's window (the
+/// glass's cached `osd-dimensions` go stale). An explicit list: a broad
+/// `video-` prefix would also catch `video-sync` (the interpolation toggle)
+/// and cost two needless renderer resets.
+fn glass_moves_video(name: &str) -> bool {
+    matches!(
+        name,
+        "panscan"
+            | "video-zoom"
+            | "video-pan-x"
+            | "video-pan-y"
+            | "video-align-x"
+            | "video-align-y"
+            | "video-scale-x"
+            | "video-scale-y"
+            | "video-aspect-override"
+            | "video-unscaled"
+            | "video-rotate"
+            | "video-crop"
+            | "keepaspect"
+            | "video-margin-ratio-left"
+            | "video-margin-ratio-right"
+            | "video-margin-ratio-top"
+            | "video-margin-ratio-bottom"
+    )
+}
+
+/// Property writes that can change the output transfer the glass decodes
+/// (the HDR option sets, `player::apply_hdr_options`).
+fn glass_changes_target(name: &str) -> bool {
+    name.starts_with("target-") || name == "tone-mapping" || name == "hdr-compute-peak"
+}
+
+/// Apply one `player_glass` command on the engine thread.
+unsafe fn glass_apply(
+    lib: &Libmpv,
+    handle: *mut mpv_handle,
+    g: &mut GlassState,
+    cmd: GlassCmd,
+    playing: Option<(f64, f64)>,
+) {
+    let now = Instant::now();
+    match cmd {
+        GlassCmd::Enable(Some(path)) => g.enable(path),
+        GlassCmd::Enable(None) => {
+            let was_on = g.path.is_some();
+            if g.last_active {
+                glass_send_opts(lib, handle, &glass::off_opts());
+            }
+            if let Some(p) = g.disable() {
+                glass_command(lib, handle, &["change-list", "glsl-shaders", "remove", &p]);
+            }
+            g.on_sent(String::new(), false, now);
+            if was_on {
+                crate::devlog!(info, "mpv", "real glass: disabled");
+            }
+        }
+        GlassCmd::Update { rects, dpr, visible, style } => {
+            g.update(rects, dpr, visible, style, now, playing)
+        }
+        GlassCmd::Clear => g.clear(),
+        GlassCmd::EnsureLast => {
+            if let (true, Some(p)) = (g.enabled(), g.path.clone()) {
+                if g.in_list {
+                    glass_command(lib, handle, &["change-list", "glsl-shaders", "remove", &p]);
+                }
+                let ok = glass_command(lib, handle, &["change-list", "glsl-shaders", "append", &p]);
+                g.set_in_list(ok);
+            }
+        }
+    }
+}
+
+/// One pump tick of the glass: keep the shader in the list, refresh the
+/// cached video rect and output transfer when invalidated, check once that
+/// the composite pass runs, and send the parameters when the wanted state
+/// changed (one async `change-list glsl-shader-opts add`, deduplicated).
+/// Costs a few flag checks on a tick where nothing changed.
+unsafe fn glass_service(
+    lib: &Libmpv,
+    handle: *mut mpv_handle,
+    g: &mut GlassState,
+    ctx: glass::Ctx,
+    readable: bool,
+    emit: &EngineEmit,
+) {
+    let now = Instant::now();
+    let mut touched = false;
+
+    if g.enabled() && !g.in_list {
+        if let Some(p) = g.path.clone() {
+            if glass_command(lib, handle, &["change-list", "glsl-shaders", "append", &p]) {
+                g.set_in_list(true);
+            } else {
+                g.give_up();
+            }
+            touched = true;
+        }
+    }
+
+    if readable && (g.needs_area() || g.needs_target()) && g.read_allowed(now) {
+        touched = true;
+        if g.needs_area() {
+            let d = |k: &str| {
+                get_property_generic(lib, handle, &format!("osd-dimensions/{k}"), GetFormat::Double)
+                    .ok()
+                    .and_then(|v| v.as_f64())
+            };
+            let area = match (d("w"), d("h"), d("ml"), d("mt"), d("mr"), d("mb")) {
+                (Some(w), Some(h), Some(ml), Some(mt), Some(mr), Some(mb)) => {
+                    glass::VideoArea::from_osd(w, h, ml, mt, mr, mb)
+                }
+                _ => None,
+            };
+            g.set_area(area, now);
+        }
+        if g.needs_target() {
+            // STRING, never node (landmine 3). Unreadable: fall back on what
+            // the per-load HDR routing chose.
+            let t = get_property_generic(lib, handle, "video-target-params/gamma", GetFormat::String)
+                .ok()
+                .and_then(|v| v.as_str().map(glass::Target::from_gamma))
+                .unwrap_or_else(|| {
+                    let snap = crate::settings::snapshot();
+                    let pq = last_load_was_hdr() && crate::player::resolve_hdr_mode(&snap) == "passthrough";
+                    glass::Target { pq, gamma: 2.4 }
+                });
+            g.set_target(t);
+        }
+    }
+
+    if readable && g.verify_due(now) {
+        touched = true;
+        match get_property_generic(lib, handle, "vo-passes", GetFormat::String) {
+            Ok(v) => {
+                let found = v.as_str().is_some_and(|s| s.contains(glass::COMPOSITE_PASS));
+                match g.verify_result(found, now) {
+                    glass::Verify::Ok => {
+                        crate::devlog!(info, "mpv", "real glass: composite pass is running");
+                    }
+                    glass::Verify::Retry => {
+                        crate::devlog!(info, "mpv", "real glass: composite pass not in vo-passes yet; checking again");
+                    }
+                    glass::Verify::Fail => {
+                        crate::devlog!(
+                            warn, "mpv",
+                            "real glass: the shader does not run on this GPU (no composite pass in vo-passes); \
+                             turned off, player surfaces keep their normal fill",
+                        );
+                        glass_send_opts(lib, handle, &glass::off_opts());
+                        if let (true, Some(p)) = (g.in_list, g.path.clone()) {
+                            glass_command(lib, handle, &["change-list", "glsl-shaders", "remove", &p]);
+                        }
+                        g.in_list = false;
+                        g.on_sent(String::new(), false, now);
+                    }
+                }
+            }
+            Err(_) => g.verify_defer(now),
+        }
+    }
+
+    if g.should_eval(now) {
+        touched = true;
+        let (s, active) = match g.desired(now, &ctx) {
+            Some(p) => (p.opts(), true),
+            None => (glass::off_opts(), false),
+        };
+        // Off after off (or after nothing) is no change: the shader's own
+        // default is n = 0.
+        let same = s == g.last_sent || (!active && !g.last_active);
+        if !same && glass_send_opts(lib, handle, &s) {
+            g.on_sent(s, active, now);
+        }
+    }
+
+    if touched {
+        if let Some(state) = g.state_json(ctx.inset) {
+            emit("glass-state", state);
+        }
+    }
 }
 
 /// Engine-thread body. Sets everything up, runs the pump loop until
@@ -1868,11 +2110,9 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
         }
 
         // -- Visibility telemetry --
-        // PresentMode is observation-only under --wid (mpv owns its own
-        // presentation); see the enum doc. Published for the debug panel
-        // and devlog'd on transitions.
+        // PresentMode drives the pump's tick tier, not presentation (mpv
+        // owns that under --wid); see the enum doc. Devlog'd on transitions.
         let mut mode = detect_present_mode(parent);
-        CURRENT_MODE.store(mode.as_u8(), Ordering::Release);
         crate::devlog!(
             info, "mpv",
             "engine ready — parent visibility: {}",
@@ -1940,9 +2180,20 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
         // A damage line seen recently, used only to LABEL a jump we already
         // detected. Short-lived so it can never explain an unrelated later one.
         let mut damage_hint: Option<(&'static str, Instant)> = None;
+        // Per-load "opens but never decodes" state (see the pump below).
+        let mut undecodable_errors: u32 = 0;
+        let mut first_frame = false;
+        let mut undecodable_reported = false;
         // One report per load. A badly mastered file can trip the demuxer over
         // and over, and a toast per resync would be worse than silence.
         let mut anomaly_reported = false;
+        // "Real glass over video" (mpv/glass.rs): the shader state, plus the
+        // pause / position / speed the hide fade needs, folded in from the
+        // observed properties each drain (never a get_property).
+        let mut glass_st = GlassState::default();
+        let mut cur_paused = true;
+        let mut cur_time: Option<f64> = None;
+        let mut cur_speed = 1.0_f64;
         const CACHE_POLL_INTERVAL: Duration = Duration::from_millis(500);
         const CACHE_SETTLE: Duration = Duration::from_millis(700);
         // A forced resync (see `wake_and_resync`) stays armed for at most this
@@ -2022,6 +2273,11 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
                         playback_ready = false;
                         seeking = false;
                         last_transition = Instant::now();
+                        LAST_LOAD_HDR.store(hdr_hint == Some(true), Ordering::SeqCst);
+                        // New video rect and possibly a new output transfer
+                        // (the per-load HDR set below): re-read both.
+                        glass_st.mark_area_dirty(Instant::now());
+                        glass_st.mark_target_dirty(Instant::now());
                         // Per-load HDR routing (passthrough mode only):
                         // the PQ output set engages only for HDR-labelled
                         // streams; everything else gets the plain SDR
@@ -2160,7 +2416,34 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
                         }
                         let borrowed: Vec<&str> =
                             args.iter().map(String::as_str).collect();
-                        if let Err(e) = run_mpv_command(&lib, handle, &borrowed) {
+                        // A `window` screenshot renders WITH the user shaders,
+                        // so live glass would be baked into the PNG. n=0 goes
+                        // out first (async, but the core runs it before this
+                        // synchronous command: one FIFO queue, and
+                        // video_screenshot re-reads the options), and the
+                        // last state is restored right after. No extra wait
+                        // on the engine thread beyond the screenshot itself.
+                        let glass_shot = borrowed.first() == Some(&"screenshot-to-file")
+                            && glass_st.last_active;
+                        if glass_shot {
+                            glass_send_opts(&lib, handle, &glass::off_opts());
+                        }
+                        // The upscaler picker (cinema.rs) rebuilds the list
+                        // with `clr` / `set`, which drops the glass shader:
+                        // the glass pass below re-appends it.
+                        if borrowed.len() >= 3
+                            && borrowed[0] == "change-list"
+                            && borrowed[1] == "glsl-shaders"
+                            && matches!(borrowed[2], "clr" | "set")
+                        {
+                            glass_st.in_list = false;
+                        }
+                        let cmd_result = run_mpv_command(&lib, handle, &borrowed);
+                        if glass_shot {
+                            let restore = glass_st.last_sent.clone();
+                            glass_send_opts(&lib, handle, &restore);
+                        }
+                        if let Err(e) = cmd_result {
                             // An arg can be a URL (a plain-http `sub-add`),
                             // so it is redacted like every logged URL.
                             let shown: Vec<_> = borrowed
@@ -2174,6 +2457,15 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
                         }
                     }
                     Ok(EngineCommand::SetProperty { name, value }) => {
+                        // Writes that move the video inside the window, or
+                        // change the output transfer, invalidate the glass's
+                        // cached video rect / target (re-read, gated).
+                        if glass_moves_video(&name) {
+                            glass_st.mark_area_recheck(Instant::now());
+                        }
+                        if glass_changes_target(&name) {
+                            glass_st.mark_target_dirty(Instant::now());
+                        }
                         if let Err(e) =
                             set_property_generic(&lib, handle, &name, &value)
                         {
@@ -2190,6 +2482,14 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
                         // away — the channel close is the natural signal
                         // and we don't want to leak a warning for it.
                         let _ = reply.send(result);
+                    }
+                    Ok(EngineCommand::Glass(cmd)) => {
+                        let playing = if cur_paused {
+                            None
+                        } else {
+                            cur_time.map(|t| (t, cur_speed))
+                        };
+                        glass_apply(&lib, handle, &mut glass_st, cmd, playing);
                     }
                     Err(TryRecvError::Empty) => break,
                 }
@@ -2215,7 +2515,6 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
                 let now_mode = detect_present_mode(parent);
                 if now_mode != mode {
                     mode = now_mode;
-                    CURRENT_MODE.store(mode.as_u8(), Ordering::Release);
                     crate::devlog!(
                         info, "mpv",
                         "parent visibility → {}",
@@ -2280,6 +2579,13 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
                         target_geom.2, target_geom.3,
                     );
                 }
+                // A real resize or fullscreen switch (not the reconfig
+                // sentinel, not a same-size forced pass): the glass lags the
+                // geometry by a frame or more, so it goes off until the
+                // window holds still, then the video rect is re-read.
+                if last_geom.0 != i32::MIN && target_geom != last_geom {
+                    glass_st.suspend(Instant::now());
+                }
                 if let Err(e) = SetWindowPos(
                     hwnd,
                     None,
@@ -2310,6 +2616,19 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
             let tick = drain_mpv_events(&lib, handle, &emit);
             if tick.video_reconfig {
                 last_geom = (i32::MIN, i32::MIN, i32::MIN, i32::MIN);
+                glass_st.mark_area_dirty(Instant::now());
+                glass_st.mark_target_dirty(Instant::now());
+            }
+            if tick.started {
+                glass_st.mark_area_dirty(Instant::now());
+                glass_st.mark_target_dirty(Instant::now());
+            }
+            if let Some(p) = tick.paused { cur_paused = p; }
+            if let Some(sp) = tick.speed { cur_speed = sp; }
+            if let Some(t) = tick.time_pos { cur_time = Some(t); }
+            if tick.started { cur_time = None; }
+            if let Some(code) = tick.glass_reply_err {
+                crate::devlog!(warn, "mpv", "real glass: mpv rejected a shader update: {}", err_str(&lib, code));
             }
             // Fold the load/seek lifecycle into the cache-poll gate.
             if tick.started { playback_ready = false; seeking = false; last_transition = Instant::now(); }
@@ -2321,6 +2640,36 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
             // poll gate would stay locked until the next load.
             if tick.ended   { playback_ready = false; seeking = false; last_transition = Instant::now(); }
             if tick.started { last_pos = None; damage_hint = None; anomaly_reported = false; }
+            // ── A file that opens but never decodes ──
+            //
+            // Seen live: a day-old AIOStreams url answered the header read
+            // from one release (HEVC + EAC3) and the packet reads from another
+            // (H.264 + FLAC). mpv opened it, then every packet failed to
+            // decode, and the frontend showed "Loading" for as long as the
+            // demuxer kept reading: no detector fires without a first frame,
+            // an end-file, or a stalled buffer. PLAYBACK_RESTART is the
+            // first-frame signal (thumb.rs relies on the same), so a load
+            // that piles up decode errors past FILE_LOADED with no restart is
+            // reported ONCE. A few errors before the first keyframe, or a
+            // hardware decoder handing over to software, stay far below the
+            // bar. Counting log lines only adds to a frame-level fact the pump
+            // already has (no restart), never fires UI on wording alone.
+            if tick.started { undecodable_errors = 0; first_frame = false; undecodable_reported = false; }
+            if tick.restart { first_frame = true; }
+            if playback_ready && !first_frame && !undecodable_reported {
+                undecodable_errors = undecodable_errors.saturating_add(tick.vd_errors);
+                if undecodable_errors >= UNDECODABLE_ERRORS
+                    && last_transition.elapsed() >= UNDECODABLE_GRACE
+                {
+                    undecodable_reported = true;
+                    crate::devlog!(
+                        warn, "mpv",
+                        "{} decode errors and no frame since the file opened: the stream does not decode",
+                        undecodable_errors,
+                    );
+                    emit("undecodable", serde_json::Value::Null);
+                }
+            }
             // Per-load reset for the truncation telemetry: a fresh file has not
             // hit EOF, and the unreadable-property warning is worth repeating
             // once per load rather than once per process.
@@ -2577,6 +2926,20 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
                 emit("cache-state", serde_json::Value::Object(m));
             }
 
+            // -- Real glass over video (mpv/glass.rs) --
+            // Reads (osd-dimensions, video-target-params, vo-passes) are gated
+            // like the cache poll above (landmine 3): a file with a first
+            // frame, no seek in flight, past the settle window, window shown.
+            {
+                let readable = playback_ready
+                    && first_frame
+                    && !seeking
+                    && mode != PresentMode::Hidden
+                    && last_transition.elapsed() >= CACHE_SETTLE;
+                let ctx = glass::Ctx { file_ready: playback_ready && first_frame, inset: y_off as f64 };
+                glass_service(&lib, handle, &mut glass_st, ctx, readable, &emit);
+            }
+
             // Hold 1 ms multimedia timer resolution only while we are actively
             // pacing a visible file (the 5 ms TICK below needs ~1 ms sleep
             // granularity). Release it in every coarse-tick state and let the
@@ -2656,10 +3019,8 @@ fn run_engine(rx: Receiver<EngineCommand>, parent_hwnd: isize, emit: EngineEmit)
         (lib.terminate_destroy)(handle);
         let _ = DestroyWindow(hwnd);
 
-        // Reset the published mode so debug callers see "not running" after
-        // teardown, and drop the pump handle so a late `wake_and_resync` is a
-        // no-op rather than an unpark aimed at a thread on its way out.
-        CURRENT_MODE.store(255, Ordering::Release);
+        // Drop the pump handle so a late `wake_and_resync` is a no-op rather
+        // than an unpark aimed at a thread on its way out.
         if let Ok(mut g) = PUMP_THREAD.lock() {
             *g = None;
         }

@@ -3,6 +3,7 @@
 
 import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
+import type React from "react";
 import type { LibraryItem, MetaPreview } from "../types";
 import type { UserSession } from "../LoginView";
 import ImageLoader from "../ImageLoader";
@@ -30,6 +31,8 @@ import { episodeIsBeforeResume } from "../LibraryContext";
 import { loadAuraSettings, saveAuraSettings } from "../auraSettings";
 import { peekRichestCachedDetailById } from "../metaCache";
 import { seriesIsFinished } from "../libraryActions";
+import { sheet } from "../glassSheet";
+import { ToggleSwitch } from "../settingsControls";
 
 // ---------------------------------------------------------------------------
 // LibraryView — full grid of saved Stremio library items.
@@ -679,8 +682,8 @@ function LibraryViewBody({ library, session, onSelectMeta, onRemoveItem, onAutoR
           {/* ── Shell: header (always renders) ── */}
           <div className="flex items-end justify-between gap-4 flex-wrap">
             <div>
-              <h1 className="aura-row-title text-3xl font-semibold tracking-tight">Library</h1>
-              <p className="text-white/35 text-sm mt-1">
+              <h1 data-glass-light="text" className="aura-row-title text-3xl font-semibold tracking-tight">Library</h1>
+              <p className="text-white/55 text-sm mt-1">
                 {isLoading
                   ? "Loading your synced library…"
                   : session && loadFailed && libraryTotal === 0
@@ -754,15 +757,15 @@ function LibraryViewBody({ library, session, onSelectMeta, onRemoveItem, onAutoR
           ) : !session ? (
             <EmptyCard message="Sign in to your Stremio account in the Addons tab to load your library." />
           ) : loadFailed && libraryTotal === 0 ? (
-            <div className="glass-panel rounded-2xl px-6 py-10 text-center space-y-3">
+            <div {...sheet("rounded-[20px] px-6 py-10 text-center space-y-3")}>
               <p className="text-white/65 text-sm">
                 Could not load your library. Check your connection and try again.
               </p>
               <button
                 type="button"
                 onClick={onRetryLoad}
-                className="px-4 py-1.5 rounded-lg border border-white/15 bg-white/5
-                           text-white/80 text-[12px] font-medium hover:bg-white/10 transition-colors"
+                className="aura-glass-flat px-4 py-1.5 rounded-lg
+                           text-white/80 text-[12px] font-medium"
               >
                 Retry
               </button>
@@ -819,7 +822,7 @@ function LibraryViewBody({ library, session, onSelectMeta, onRemoveItem, onAutoR
 
 // ---------------------------------------------------------------------------
 // LibraryOptionsMenu - gear popover holding the auto-remove-watched toggles.
-// Sits beside the Filter & Sort menu. Uses aura-glass-menu (hardcoded-dark,
+// Sits beside the Filter & Sort menu. Uses aura-float-glass (baked dark base,
 // theme-safe) so it stays legible on every theme. Each toggle carries a
 // hover Tooltip explaining exactly when a removal fires (crucially, that an
 // ongoing series is never touched).
@@ -865,11 +868,11 @@ function LibraryOptionsMenu({
         aria-expanded={open}
         aria-label="Library options"
         title="Library options"
-        className={`flex items-center gap-2 px-3 py-1.5 rounded-lg border text-xs font-semibold tracking-[0.1em] uppercase transition-colors
-                    ${open
-                      ? "bg-ln-accent/25 border-ln-accent/35 text-ln-accent"
-                      : "bg-white/5 border-white/8 text-white/75 hover:bg-white/10"
-                    }`}
+        // Same trigger as Filter & Sort (FilterBar.tsx): open reads as
+        // SELECTED (is-selected, src/styles/glass-search.css).
+        className={`aura-glass-flat aura-filter-chip flex items-center gap-2 px-3 py-1.5 rounded-lg
+                    text-xs font-semibold tracking-[0.1em] uppercase text-white/75
+                    ${open ? "is-selected" : ""}`}
       >
         <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
           <path d="M19.14 12.94a7.9 7.9 0 000-1.88l2.03-1.58a.5.5 0 00.12-.64l-1.92-3.32a.5.5 0 00-.61-.22l-2.39.96a7.3 7.3 0 00-1.62-.94l-.36-2.54a.5.5 0 00-.5-.42h-3.84a.5.5 0 00-.5.42l-.36 2.54c-.58.24-1.12.56-1.62.94l-2.39-.96a.5.5 0 00-.61.22L2.68 8.84a.5.5 0 00.12.64l2.03 1.58a7.9 7.9 0 000 1.88l-2.03 1.58a.5.5 0 00-.12.64l1.92 3.32c.14.24.42.34.68.22l2.39-.96c.5.38 1.04.7 1.62.94l.36 2.54c.05.24.25.42.5.42h3.84c.25 0 .45-.18.5-.42l.36-2.54c.58-.24 1.12-.56 1.62-.94l2.39.96c.26.12.54.02.68-.22l1.92-3.32a.5.5 0 00-.12-.64l-2.03-1.58zM12 15.5A3.5 3.5 0 1112 8.5a3.5 3.5 0 010 7z" />
@@ -909,7 +912,13 @@ function LibraryOptionsMenu({
               style={{ left: "100%", width: MENU_PANEL_GAP }}
             />
           )}
-          <div className="w-72 aura-glass-menu rounded-2xl p-4 shadow-2xl space-y-3">
+          {/* Menu tier glass, growing out of the trigger's corner. The pop
+              sits on this card, not the wrapper above (that one is positioned
+              by transform for the shift). */}
+          <div
+            className="w-72 aura-float-glass aura-glass-pop-in rounded-2xl p-4 space-y-3"
+            style={{ "--lg-origin": "top right" } as React.CSSProperties}
+          >
             <div className="space-y-0.5">
               <p className="text-white/85 text-[13px] font-semibold">Auto-remove watched</p>
               <p className="text-white/45 text-[11px] leading-snug">
@@ -954,20 +963,16 @@ function AutoRemoveToggleRow({
         role="switch"
         aria-checked={on}
         onClick={onClick}
-        className="w-full flex items-center justify-between gap-3 px-2.5 py-2 rounded-lg
-                   border border-white/10 bg-white/5 text-white/75
-                   hover:text-white/95 hover:bg-white/10 transition-colors text-left"
+        // A menu row (it sits inside a glass popover: never a raised glass
+        // face on glass). The state lives in the glass toggle on the right,
+        // so the row carries no selected face (glass-misc.css, role=switch).
+        className="aura-glass-row w-full flex items-center justify-between gap-3 px-2.5 py-2 rounded-lg
+                   text-white/75 hover:text-white/95 text-left"
       >
         <span className="text-[12px] font-medium">{label}</span>
-        <span
-          className={`relative flex-shrink-0 w-8 h-[18px] rounded-full transition-colors
-                      ${on ? "bg-ln-accent/70" : "bg-white/15"}`}
-        >
-          <span
-            className={`absolute top-0.5 w-[14px] h-[14px] rounded-full bg-white transition-all
-                        ${on ? "left-[18px]" : "left-0.5"}`}
-          />
-        </span>
+        {/* The shared glass switch, decorative: the button carries the
+            switch role, the click and the keyboard. */}
+        <ToggleSwitch decorative size="xs" value={on} />
       </button>
     </Tooltip>
   );
@@ -1004,16 +1009,22 @@ function LibrarySweepConfirm({
 
   const node = (
     <div
-      className="fixed inset-0 z-[10000] flex items-center justify-center p-6 bg-black/60 backdrop-blur-sm
-                 animate-[fade-in_120ms_ease-out]"
+      className="fixed inset-0 z-[10000] flex items-center justify-center p-6"
       onClick={onCancel}
     >
+      {/* The dim + blur is a SIBLING layer, not the wrapper: a backdrop-filter
+          (or a fading opacity) on an ancestor would blind the card's own glass. */}
+      <div aria-hidden className="aura-modal-backdrop-in absolute inset-0 bg-black/60 backdrop-blur-sm" />
       <div
         role="dialog"
         aria-modal="true"
         onClick={(e) => e.stopPropagation()}
-        className="max-w-[400px] w-full rounded-2xl bg-zinc-900/95 border border-white/15 ring-1 ring-rose-400/40
-                   shadow-2xl p-6 space-y-4"
+        // A dialog: the menu tier of the glass, growing from the centre. The
+        // destructive hint is a hairline through the --lg-ring hook
+        // (aura-danger-dialog, src/styles/glass-search.css), never ring-*.
+        className="aura-float-glass aura-glass-pop-in aura-danger-dialog relative max-w-[400px] w-full rounded-2xl
+                   p-6 space-y-4"
+        style={{ "--lg-origin": "50% 50%" } as React.CSSProperties}
       >
         <div className="flex items-start gap-3">
           <span className="flex-shrink-0 mt-0.5 text-2xl leading-none text-rose-300" aria-hidden>⚠</span>
@@ -1029,16 +1040,16 @@ function LibrarySweepConfirm({
           <button
             type="button"
             onClick={onCancel}
-            className="px-4 py-1.5 rounded-lg border border-white/15 bg-white/5
-                       text-white/80 text-[12px] font-medium hover:bg-white/10 transition-colors"
+            className="aura-glass-flat px-4 py-1.5 rounded-lg
+                       text-white/80 text-[12px] font-medium"
           >
             Keep them
           </button>
           <button
             type="button"
             onClick={onConfirm}
-            className="px-4 py-1.5 rounded-lg border border-rose-300/60 bg-rose-500/30 text-rose-50
-                       text-[12px] font-medium hover:bg-rose-500/45 transition-colors"
+            className="aura-glass-flat is-danger px-4 py-1.5 rounded-lg
+                       text-[12px] font-medium"
           >
             Remove {count}
           </button>
@@ -1075,7 +1086,7 @@ function SkeletonGrid() {
 
 function EmptyCard({ message }: { message: string }) {
   return (
-    <div className="glass-panel rounded-2xl px-6 py-10 text-center">
+    <div {...sheet("rounded-[20px] px-6 py-10 text-center")}>
       <p className="text-white/65 text-sm">{message}</p>
     </div>
   );
@@ -1117,7 +1128,7 @@ const LibraryCard = memo(function LibraryCard({
                    focus:outline-none focus-visible:ring-2 focus-visible:ring-ln-accent/60 rounded-xl"
       >
         <div
-          className="relative overflow-hidden rounded-xl bg-white/5 border border-white/8"
+          className="relative overflow-hidden rounded-xl bg-white/5"
           style={{ aspectRatio: "2 / 3" }}
         >
           {item.poster ? (
@@ -1153,19 +1164,22 @@ const LibraryCard = memo(function LibraryCard({
           <WatchedBadge
             metaId={item.id}
             mediaType={item.media_type}
-            className="absolute top-1.5 left-1.5"
+            material="frost"
+            className="absolute top-2 left-2 z-10"
           />
+          {/* The cursor-lit bezel (glass-cards.css), last child of the art box. */}
+          <span aria-hidden className="aura-card-bezel" data-glass-light="rim" />
         </div>
         {/* Fixed-height label block (h-14) so every card is the SAME total
             height regardless of whether the title wraps to 1 or 2 lines.
             Uniform card height is what lets the windowing hook derive an
             accurate per-row stride from a single measured card. */}
         <div className="px-0.5 h-14 overflow-hidden">
-          <p className="text-white/85 text-sm font-medium leading-tight line-clamp-2 text-center">
+          <p className="aura-poster-title text-white/85 text-sm font-medium leading-tight line-clamp-2 text-center">
             {item.name ?? "Unknown title"}
           </p>
           <div className="flex items-center justify-center gap-1.5 mt-1">
-            <span className="text-white/40 text-[10px] uppercase tracking-wider">
+            <span className="text-white/55 text-[10px] uppercase tracking-wider">
               {typeLabel(item.media_type ?? "other")}
             </span>
           </div>
@@ -1192,13 +1206,11 @@ const LibraryCard = memo(function LibraryCard({
             e.preventDefault();
             onRemove(item, { x: e.clientX, y: e.clientY });
           }}
-          className="absolute top-2 right-2 w-7 h-7 rounded-full
-                     bg-black/70 border border-white/20
-                     text-white/85 hover:text-white hover:bg-rose-500/40
-                     hover:border-rose-300/50
+          data-glass-light="rim"
+          className="aura-frost aura-frost-btn is-remove absolute top-2 right-2 w-7 h-7 rounded-full
+                     text-white/85 hover:text-rose-200
                      flex items-center justify-center
-                     opacity-0 group-hover:opacity-100 focus:opacity-100
-                     transition-all duration-150 z-10"
+                     opacity-0 group-hover:opacity-100 focus:opacity-100 z-30"
         >
           <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
             <path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" />

@@ -1,7 +1,7 @@
 // Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 
@@ -373,7 +373,7 @@ const COMMANDS: DevCommand[] = [
   {
     name: "scrobble",
     usage: "scrobble",
-    description: "Fire a test scrobble against the current stream (Trakt + AniList per same gates as scrobble_end). Requires an active stream — works the moment the player is open, no warmup wait.",
+    description: "Fire a test scrobble against the current stream (AniList + Simkl per same gates as scrobble_end). Requires an active stream; works the moment the player is open, no warmup wait.",
     run: async (_args, ctx) => {
       // Dispatch an event App.tsx listens for; the listener has the
       // current activeTarget + playback snapshot in scope and runs
@@ -571,14 +571,17 @@ const COMMANDS: DevCommand[] = [
       }
       const mediaType = (item?.media_type ?? "series").toLowerCase();
       const isMovie = mediaType === "movie";
-      const title = item
-        ? (isMovie ? `${item.name} — now available` : `${item.name} — TEST EPISODE`)
-        : `${imdbId} — notifyforce test`;
+      // Same shape as the scanner: the name as the title, the news on the
+      // second line.
+      const title = item ? item.name : `${imdbId} (notifyforce test)`;
+      const subtitle = item
+        ? (isMovie ? "Now available" : "TEST EPISODE")
+        : "Synthesized by notifyforce: bell/popup pipeline test";
       const eventDetail = {
         id: `notifyforce:${imdbId}:${Date.now()}`,
         kind: (isMovie ? "release" : "episode") as "release" | "episode",
         title,
-        subtitle: "Synthesized by notifyforce — bell/popup pipeline test",
+        subtitle,
         data: {
           metaId:    imdbId,
           mediaType: item?.media_type ?? "series",
@@ -711,7 +714,7 @@ function resolveSuggestions(input: string): { suggestions: DevCommand[]; insideA
 // DevConsole component
 // ---------------------------------------------------------------------------
 
-export default function DevConsole() {
+function DevConsole() {
   const [open, setOpen]      = useState(false);
   const [entries, setEntries] = useState<LogEntry[]>([]);
   const [enabled, setEnabled] = useState<Record<LogLevel, boolean>>({
@@ -1283,7 +1286,7 @@ export default function DevConsole() {
             }}
             className="absolute bottom-3 left-1/2 -translate-x-1/2
                        px-3 py-1.5 rounded-full
-                       bg-ln-accent/85 text-black text-[11px] font-semibold
+                       bg-ln-accent/85 text-ln-accent-ink text-[11px] font-semibold
                        tracking-wide shadow-[0_8px_24px_-6px_rgba(0,0,0,0.75)]
                        hover:bg-ln-accent transition-colors
                        border border-white/20"
@@ -1434,3 +1437,9 @@ function Row({ entry }: { entry: LogEntry }) {
     </div>
   );
 }
+
+// Memoized: App renders this host with no props (or only primitives / its own
+// stable state) and re-renders on every playback-update tick. The host is
+// driven by its own state and store subscriptions, so skipping those renders
+// changes nothing on screen.
+export default memo(DevConsole);

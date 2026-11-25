@@ -1,7 +1,10 @@
 # CLAUDE.md
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
-It is the single source of truth for project context: the former `HANDOFF.md` was consolidated into it.
+It is the root of the project context. Subsystem detail lives in the files listed under "Subsystem docs"
+(the end of this file): READ THE MATCHING ONE BEFORE CHANGING THAT SUBSYSTEM. The `.claude/rules/` ones
+are path-scoped (their `paths` frontmatter) and load automatically when a matching file is read or
+edited; the `docs/agents/` ones never load on their own.
 
 ## What Aura is
 
@@ -16,9 +19,9 @@ live TV, and synced "watch together" rooms are all built on top of that addon mo
 ```bash
 # Frontend
 pnpm dev                          # Vite dev server (HMR)
-pnpm build                        # tsc + vite production build
+pnpm build                        # tsc + vite production build (uploads source maps: not for checks)
 pnpm exec tsc --noEmit            # type-check only (no emit)
-pnpm exec vite build              # bundle without type-check
+pnpm exec vite build --mode verify   # bundle check; never a default `vite build` for verification
 
 # Tauri
 pnpm tauri dev                    # full app with hot reload (Rust restarts on .rs change)
@@ -26,15 +29,17 @@ pnpm tauri build                  # bundled installer
 
 # Rust (run FROM src-tauri/)
 cargo check --message-format=short    # fast Rust check
+cargo test --lib                      # unit tests (corpus / runtime / e2e tests are #[ignore]d)
 cargo build --release
 
 # Verification cycle (run after every meaningful edit)
 cd src-tauri && cargo check --message-format=short && cd .. && pnpm exec tsc --noEmit
 ```
 
-There are no tests, no ESLint, no Prettier. `cargo check` + `tsc --noEmit` are the only correctness
-gates; use them. For a TS-only change, `tsc --noEmit` is sufficient; touch Rust and you also need
-`cargo check`.
+No ESLint, no Prettier, no frontend test runner. The gates are `cargo check`, `cargo test --lib` and
+`tsc --noEmit`; for a TS-only change `tsc --noEmit` is enough. Pure TS modules that are import-free
+(`src/skipWindows.ts`, `src/nextUpGate.ts`, `src/nestedAddonStatus.ts`, `src/streamMeta.ts`, ...) are
+checked by running them under node with hand-written cases.
 
 When inspecting bundle output for confirmed CSS rules (e.g. verifying a Tailwind class actually
 emitted), `dist/assets/index-*.css` is the artifact. It is git-ignored, so build first.
@@ -44,10 +49,10 @@ emitted), `dist/assets/index-*.css` is the artifact. It is git-ignored, so build
 | Area | Constraint |
 |------|------------|
 | MAL API | `api.tenrai.org/v1` via `tenrai.rs`, NOT Jikan (shut down permanently in 2026). Same response envelope and field names, but the version segment is `/v1`, not `/v4`. Public tier is 4 req/s, 120/min, 40k/day. There is exactly ONE base-URL const; do not inline a second host. |
-| AnimeThemes API | `https://api.animethemes.moe` via `skipdetect/animethemes.rs` (the skip detector's theme list and theme audio). Exactly ONE base-URL const, rustls client with `https_only(true)`, GET only, request starts paced at least 1 s apart (the API allows 90/min). Theme audio is accepted only over https from animethemes.moe or a subdomain (no userinfo, no port); it is decoded through ffmpeg stdin to a fingerprint and DISCARDED. Only fingerprints are cached. |
+| AnimeThemes API | GraphQL at `https://rs.animethemes.moe/graphql` (`skipdetect/animethemes.rs`). The old JSON:API (`api.animethemes.moe`) answers 503 since 2026-11-08: never go back to it. ONE endpoint const, rustls `https_only(true)`. GraphQL failures arrive as HTTP 200 and must read as Unavailable, never a cached miss. Full rules (query shape, `overlap` enum, pacing, audio host allowlist): `.claude/rules/skip-detection.md`. |
 | HTTP client | `reqwest 0.12`, default-features off, `rustls-tls` backend. Auth / account clients enforce `https_only(true)`. Do not add a plaintext-HTTP fallback: every one removed was the result of a real wire-capture incident. |
 | TLS exception | Casting (`cast/`) uses `native-tls` (SChannel) on purpose, to accept self-signed CASTV2 device certs on the LAN. This is the only deliberate divergence from the rustls posture. |
-| Credentials | Platform-native keyring (`keyring 3`, `windows-native` / `apple-native` / `linux-native-sync-persistent`). Native backends are MANDATORY (an in-memory mock silently lost OpenSubtitles keys between launches). Passwords wrapped in `Zeroizing<String>` (`zeroize 1`). |
+| Credentials | Platform-native keyring (`keyring 3`, `windows-native` / `apple-native` / `linux-native-sync-persistent`). Native backends are MANDATORY (an in-memory mock silently lost OpenSubtitles keys between launches). Passwords wrapped in `Zeroizing<String>` (`zeroize 1`). Retired scrobble tokens (Trakt) are swept once per launch: on Windows under EVERY scope through `CredEnumerateW("trakt-*")` (`scrobble_auth.rs`, since keyring cannot enumerate); on other platforms only the active scope is cleared. |
 | Secrets at rest | Stremio session (`auth_key` + email), user-supplied API keys (OpenSubtitles, PublicMetaDB), and Xtream passwords all live in the OS keyring (`auth.rs`, `api_keyring.rs`, `iptv.rs`). Build-time default keys (`AURA_MDBLIST_KEY`, `AURA_PUBLICMETADB_KEY`) are baked by `build.rs` from a git-ignored `.env.local` (see "Build-time secrets"). |
 | File I/O | Scoped to `app_data_dir()`. Downloaded subtitles must land inside `app_data_dir()/subtitles`; `add_subtitle_to_mpv` enforces path containment before handing a local path to mpv. |
 | Search safety | All poster URLs validated; text fields capped before returning to the frontend. |
@@ -68,41 +73,46 @@ emitted), `dist/assets/index-*.css` is the artifact. It is git-ignored, so build
 
 ### The MPV engine (`src-tauri/src/mpv/`)
 
-One engine, one DLL (`libmpv-2.dll`), one event channel. Driven by direct FFI in
-`mpv/ffi.rs` (raw symbol loader + C structs/enums) and orchestrated by `mpv/engine.rs`.
+One engine, one DLL (`libmpv-2.dll`), one event channel, driven by direct FFI (`mpv/ffi.rs`,
+`mpv/engine.rs`). It is embedded with `--wid` into a black host child window of the main window at
+`HWND_BOTTOM`, below the WebView2, and renders with `vo=gpu-next` on d3d11 (real HDR passthrough via a
+per-file `target-colorspace-hint`). The engine thread owns the mpv handle, the `EngineCommand` channel
+(every playback Tauri command submits one), the event drain and the geometry pump (36 px title-bar
+inset windowed, 0 in fullscreen). Observed properties are ONLY `pause`, `time-pos`, `duration`,
+`volume`, `speed`, `frame-drop-count`, `decoder-frame-drop-count`; everything else is polled.
+`tauri-plugin-libmpv`, `libmpv-wrapper.dll` and the render-context path are gone for good (no
+`gpu-next`, so no HDR); `lib.rs` deletes their orphaned DLLs. The hover-thumbnail extractor
+(`mpv/thumb.rs`) is created on demand and torn down when idle: never a second resident libmpv. Init
+options, buffer tuning and the pump's tick tiers: `.claude/rules/mpv.md`.
 
-- **Embedding** is via `--wid=<host hwnd>`: the engine thread creates a black host child window of
-  the Tauri main window at `HWND_BOTTOM` (below the WebView2) and embeds mpv into it. mpv owns
-  rendering entirely through `vo=gpu-next` on a d3d11 GPU context.
-- **The engine thread owns** the mpv handle, a command channel (every playback Tauri command submits
-  an `EngineCommand`: `LoadFile`, `TogglePause`, `SetVolume`, `Command(Vec<String>)`,
-  `SetProperty{typed}`, `GetProperty{sync reply}`, `Shutdown`), the event drain
-  (mpv events -> `mpv-event-main` -> the lib.rs observer bridge -> `playback-update` / `osd-update`),
-  and a geometry pump that tracks the parent client rect and resizes the host + mpv child
-  (36 px title-bar inset windowed, 0 in fullscreen). The pump cadence is three-tier: `TICK` 5 ms
-  while a file is loaded (playing OR paused), `IDLE_TICK` 33 ms when visible with no file loaded
-  (idle Home/menu), `HIDDEN_TICK` 150 ms while minimized/occluded. Keyed on file-loaded
-  (`playback_ready`), NOT pause state, so a paused file and background audio keep the fast tick.
-  Parent-visibility (`PresentMode`) is detected at most every `MODE_POLL_INTERVAL` (120 ms), not per
-  tick, to avoid a per-tick DWM round-trip.
-- **Observed properties (the only safe set on this libmpv build):** `pause`, `time-pos`, `duration`,
-  `volume`, `speed`, `frame-drop-count`, `decoder-frame-drop-count`. Everything else is polled. See
-  the landmines: extending this set carelessly kills the ENTIRE event channel.
-- **Init options of note** (`INIT_OPTS` in `engine.rs`): `hwdec=auto`, `keepaspect=yes`,
-  `background=none`, `d3d11-output-format=rgb10_a2` (10-bit swapchain for HDR10 eligibility),
-  `volume=50` (headphone-safe), `keep-open=yes` + `keep-open-pause=yes` (retain last frame at EOF),
-  and the buffer tuning: `cache-secs=180`, `demuxer-readahead-secs=120`, `demuxer-max-bytes=768 MiB`,
-  `demuxer-max-back-bytes=128 MiB`, `network-timeout=60`, plus
-  `demuxer-lavf-o=reconnect=1,reconnect_streamed=1,reconnect_on_network_error=1,reconnect_delay_max=4`.
-- **HDR** is REAL via `gpu-next` + d3d11 with a per-file `target-colorspace-hint` (PQ/DV passthrough
-  on HDR streams, SDR otherwise), applied by `apply_hdr_settings`. `hdr_target_peak_nits` exists to
-  curb OLED True-Black blow-out.
-- **What was removed (do not reintroduce):** `tauri-plugin-libmpv` and `libmpv-wrapper.dll` (the
-  legacy plugin) are gone; so is the render-context (`mpv_render_context`) path, because it could not
-  reach `vo=gpu-next` and therefore had no HDR passthrough. `lib.rs` actively deletes orphaned
-  `mpv.dll` / `libmpv-wrapper.dll` left by older installs on startup. A separate, on-demand FFI
-  instance in `mpv/thumb.rs` extracts hover thumbnails and is torn down when idle (do not keep a
-  second resident libmpv).
+### MPV stability landmines (DO NOT re-introduce)
+
+Each has a hard-to-diagnose symptom; the full story of each is in `.claude/rules/mpv.md`.
+
+1. **Property writes use the typed set-property path** (`EngineCommand::SetProperty`), never
+   `command("set_property", ...)`, which silently no-ops on this build ("volume slider snaps back").
+2. **Never enable `audio-exclusive=yes` or `audio-spdif` by default**: it locks the WASAPI device
+   system-wide until reboot if Aura crashes.
+3. **No `get_property` during libmpv state transitions**: gate polling on `duration > 0`, never poll
+   during a seek, read tracks once after `duration > 0` + 1.5 s and again only on `aura:tracks-refresh`;
+   the `chapter-list` poll uses `string` format, never `node` (the same dispatch-table fault as
+   `track-list/node`).
+4. **Do not extend `observed_properties`**: `track-list (node)`, `aid`, `sid`, `core-idle`,
+   `paused-for-cache` each kill the ENTIRE event channel.
+5. **Do not reapply Mica on every pause** (the backdrop ends up over the mpv child).
+6. **Do not unmount `<TitleBar>` during windowed playback** (`opaque` prop; only true OS fullscreen
+   unmounts it; PlayerOverlay's top bar offsets 36 px windowed).
+7. **Title bar drag: no `data-tauri-drag-region`, never start a drag on `pointerdown`.** Arm on down,
+   drag on the first move past 4 px (keeps double-click-to-maximize); Win11 `startDragging()`, Win10 a
+   custom coalesced pointer drag gated by `is_windows_10`. Do not collapse either path.
+8. **Never set `glsl-shaders` (or any option list) via `set_property`**: `change-list glsl-shaders set
+   "<forward-slash path>"` with the `\\?\` prefix stripped.
+9. **Tear mpv down synchronously in `CloseRequested`** (not `spawn_blocking`), or WASAPI stays held.
+10. **Never reparent the mpv child to a top-level window**: libmpv's context does not survive it.
+11. **Never hand mpv a remote URL for `sub-add`, and never block the engine thread.** It is the sole
+    producer of `playback-update` and `cache-state`; a block freezes the UI while video keeps playing
+    and can falsely trip the stream-lost watchdog. Subtitles are downloaded to
+    `app_data_dir()/subtitles` first; keep `submit_get_property`'s `recv_timeout`.
 
 ### Streaming bridge (`src-tauri/src/streaming.rs`) - the bypasses are intentional
 
@@ -125,27 +135,48 @@ setup (no sidecar; the old `aura-bridge.exe` was internalised). `resolve_stream`
 
 Do not undo either the HTTPS or the HLS bypass.
 
-### Two stream-list invariants that auto-advance depends on
+### Stream lists: what auto-advance depends on
 
-The source switcher and the Next-Up pre-resolve issue SEPARATE `fetch_streams` calls for the same
-episode, and the user compares them by eye. They must agree, so:
+Full rules and history: `.claude/rules/streams.md`.
 
-1. **Every `StreamEntry` that reaches the frontend is playable.** `sanitize_stream` filters the url
-   for scheme and length BEFORE the "url or infoHash" gate, never after. With the filter below the
-   gate, a non-http(s) or over-4096-char url passed the gate and was then nulled, emitting an entry
-   with `url == None` AND `info_hash == None`: it rendered as a row in the switcher but could not be
-   played (the play path builds `magnet:?xt=urn:btih:null`, which the bridge 501s), and it shifted
-   what auto-advance picked. The `unwrap_or_else(|| s.title.clone())` fallback in the dedup key is a
-   leftover from that era, not licence to reintroduce it.
-2. **`fetch_streams` returns ADDON order, deterministically.** The fan-out tags each task with its
-   addon index and sorts before merging, because `JoinSet::join_next` yields COMPLETION order - the
-   list would otherwise be ordered by whichever addon answered fastest, differently on every call.
+1. **Every `StreamEntry` that reaches the frontend is playable**: `sanitize_stream` filters the url
+   (scheme, length) BEFORE the "url or infoHash" gate, never after.
+2. **`fetch_streams` returns ADDON order, deterministically** (tasks tagged by addon index and sorted;
+   `JoinSet::join_next` yields completion order).
+3. So `pickFirstStreamForEpisode` (`src/nextUp.ts`) takes `streams[0]`, full stop: no filtering or
+   re-ranking (for AIOStreams users that order IS their sort), scoped through `streamQueryAddons`.
+4. **Stale urls**: an addon url is re-read before it plays when older than `STREAM_URL_MAX_AGE_MS`
+   (2 h, `src/streamFreshness.ts`; Rust stamps `resolved_at_ms`); while it is re-read the row that
+   started it shows a pending pill and a repeat play of the same source is ignored. A load that piles up decode errors
+   with no PLAYBACK_RESTART (`playback-undecodable`) is re-resolved at once, never re-sent.
 
-Consequently `pickFirstStreamForEpisode` (`src/nextUp.ts`) takes `streams[0]`, full stop. It must not
-filter or re-rank: for AIOStreams users that ordering is the sort criteria they configured, so the top
-row IS the answer. It also scopes through `streamQueryAddons` (`src/auraSettings.ts`), the single
-definition of "which addons answer a stream query"; auto-advance used to skip that scoping and query
-addons the user had excluded in Settings.
+Stream chips (`src/streamMeta.ts`): split each line into glyph SEGMENTS (`splitSegments`); never
+dispatch on a line's first character. A fallback that fills a field with a WRONG value is worse than
+an empty one. Keep parsing both old and new TamTaro shapes (pin glyphs by codepoint). AIOStreams'
+structured `streamData` facts beat the lossy text. The stream row never wraps a chip line.
+
+### AIOMetadata wrapped inside AIOStreams
+
+Supported setup; full rules in `.claude/rules/aiostreams.md`, fork specs in
+`docs/superpowers/specs/2026-11-14-aiostreams-wrapped-aiometadata.md` and
+`docs/superpowers/specs/2026-11-15-aiostreams-nested-addon-status.md`.
+
+- **Error pseudo-metas are not titles**: AIOStreams answers any wrapped failure (a not-found included)
+  with HTTP 200 and an `aiostreamserror.<json>` item. `is_addon_error_item` (stremio.rs) turns it into
+  an error in `fetch_meta_detail` and drops it from catalog arrays.
+- **Hidden from Home**: `showInHome` when present, else a required extra whose ONLY option is `"None"`
+  (`catalog_is_hidden_from_home`). Wrapped catalog ids carry a 7-hex instance prefix.
+- **Capability hints come from the LIVE manifest** (`behaviorHints.wrappedAddons`, `landscapeArt`,
+  `addonStatus`) through `get_addon_manifest` / `src/addonHints.ts`, never `AddonEntry` fields:
+  stremio-core drops unknown hints when an official app re-saves the collection.
+- **Rate limits are read, never hard-coded**: `addon_rate.rs` keeps a bucket per (route kind, host)
+  from the live `RateLimit-*` headers. Over budget AIOStreams answers HTTP 200 with a "Rate Limit
+  Exceeded" error item, not a 429. Meta waits and retries (3 attempts, 30 s); search asks at most 12
+  catalogs at once (`SEARCH_CATALOG_CONCURRENCY`), paced by the "catalog" bucket, a refusal retried
+  once; a catalog still refused (or not answering) is reported `failed`, never folded into "no results",
+  and Search shows it as a one-line "did not answer" row whose Retry asks only that catalog
+  (`search_addon_grouped`'s `only`). Board catalogs are not gated.
+- AIOMetadata's manifest id is `aio-metadata` (`com.aio.metadata` unconfigured).
 
 ### Tauri command registration is three places, all required
 
@@ -199,441 +230,71 @@ up by the normalizer. Library state is shared through `LibraryContext`.
 (library record key: series root for series, equal to `id` for movies). `libraryWriteProgress`
 writes `_id = series_id ?? id` and stamps `state.video_id = id` when they differ.
 `libraryClearProgress` is Stremio's "Rewind": only zeroes `state.timeOffset`, preserving `video_id`
-and everything else.
+and everything else. Two entry points, one path (`aura:cw-clear` in App.tsx): the CW card's X / "Remove
+from Continue Watching", and "Reset Progress" in the card menu of any title with `timeOffset > 0`, which
+asks first (`askConfirm`, Cancel focused) with copy that must match what `libraryClearProgress` keeps.
+The write is built from a FRESH `library_get` of the title's raw records, never the (up to 5 min old)
+snapshot; a title with no record left (removed on another device) is dropped locally and nothing is
+written, and a failed or empty read writes nothing and rolls back like a failed write.
+
+### Detail page exit fade
+
+`closeDetail` (App.tsx) is the ONLY place `selectedMeta` goes null. It stashes the leaving meta in
+`detailExit` and bumps `detailGenRef`, so the same DetailView instance stays mounted, inert and
+`closing`, for `DETAIL_EXIT_MS` (220 ms, DetailView.tsx) while it fades over the page beneath.
+DetailView is keyed `${media_type}:${id}:${gen}`: the gen keeps the key steady through the fade and
+gives any reopen a fresh instance. Play still drops the overlay instantly through the
+`!isPlayerActive` gate. Do not use the View Transitions API for this (its snapshot layer swallows
+input and freezes Liquid lenses).
 
 ### Story arcs: NEVER join TMDB arcs to episodes by number
 
-Arcs come from TMDB episode groups (`type == 5`), which define an arc as a set of TMDB
-`(season, episode)` pairs. Aura's episode ids come from Stremio meta addons (Cinemeta / TVDB
-numbering). **The two numbering systems disagree, and not by a constant.** Do not "fix" this with a
-season join, an absolute-episode join, or a hardcoded offset. All three are wrong:
-
-- TMDB's season boundaries are not Cinemeta's (One Piece: TMDB S1 = 61 episodes, Cinemeta S1 = 8).
-- TMDB promotes a Toriko crossover special into One Piece's MAIN RUN at absolute 590; Cinemeta files
-  it as special S0E39. So TMDB abs N == Cinemeta abs N up to 589 and N-1 from 591 on. A naive
-  absolute-index join misplaces **579 of 1168 episodes (49.6%)**: every arc from Punk Hazard onward
-  starts and ends one episode late, and it *looks correct*. That offset is one TMDB editorial
-  decision, not a constant, and it grows over time.
-- Air date alone is not a key (weekly anime repeat dates: 40 of Naruto Shippuden's air dates carry
-  two episodes). Title alone is not a key (TVDB and TMDB use different English translations of the
-  same episode; some true pairs score 0.00 on bigram similarity).
-
-`arc_align.rs` is the answer: a banded Needleman-Wunsch alignment over air date + title with
-broadcast order as a hard constraint, which absorbs a promotion/demotion as a single gap. Measured
-100% correct on One Piece (1168/1168) and Naruto Shippuden (500/500). It has real `#[cfg(test)]`
-tests, including a regression test for exactly the off-by-one above; keep them. Any arc containing a
-sub-0.5-confidence pair is DROPPED and logged rather than rendered. Fail visible, never fail
-off-by-one. Season 0 is excluded on both sides (the two databases' specials do not correspond).
-
-**Related: never trust TMDB's arc NAME for filler status either.** TMDB bakes a
-marker into the title string ("The Past (Filler)"), and it is wrong in both
-directions on Bleach: "The Past" is titled filler and is fully CANON, while
-"Gotei 13 Invading Army" is titled filler and is filler except for its last
-episode. Aura has per-episode filler data from AIOMetadata plus the cloud
-release signal, so `arcKindSummary` (`src/storyArcs.ts`) derives the label from
-that, using the SAME predicate as `countFillerRecap` and `mergedKindFlags` so a
-tile can never disagree with the episode rows it opens. The parenthetical is
-stripped from the displayed name only when the show HAS kind data; for a show
-with none, TMDB's marker is the only signal and is kept. That check is made at
-SHOW level, because a fully-canon arc inside a show that does have data carries
-no flags at all and an arc-level check would misread that as "no data".
+TMDB arcs are sets of TMDB `(season, episode)` pairs; Aura's episodes come from Stremio meta addons, and
+the two numberings disagree by no constant (TMDB promotes a One Piece special into the main run at 590:
+a naive absolute join misplaces 49.6% of episodes and LOOKS correct). No season join, no absolute join,
+no offset, no air-date-only or title-only key. `arc_align.rs` (banded Needleman-Wunsch over air date +
+title, broadcast order as a hard constraint) is the answer; keep its tests, including the off-by-one
+regression. An arc with a sub-0.5-confidence pair is dropped and logged; season 0 is excluded. Never
+trust TMDB's arc NAME for filler status either: `arcKindSummary` (`src/storyArcs.ts`) derives it from
+Aura's per-episode data. Full write-up: `.claude/rules/story-arcs.md`.
 
 ### Skip detection: layered, and an ED end is never EOF
 
-`src-tauri/src/skipdetect/` (Rust, one tagged command `skip_detect` with `detect` / `cancel` /
-`status` / `prefetch` / `prescan` / `prescan_cancel`, events `skipdetect-update`) plus the pure frontend half in `src/skipWindows.ts` (chapter
-titles, ranking, modes, media-end clamp) and `src/nextUpGate.ts` (when the Next-Up card may appear,
-and the detected media end the end-of-stream detectors use). Both TS modules are import-free so a
-node check can load them. Devlog label `[skipdetect]`. It was designed against a 31-episode corpus
-with frame-verified truth. It REPLACED the old ffmpeg silencedetect OP scan and outro tail scan
-(`detect_silence_intervals`, `detect_outro_boundary`, both gone from all three registration sites),
-which scored OP 10 correct / 7 wrong / 2 false positives and ED 0 correct, skipping the
-after-credits scene on 10 of the 11 episodes that have one.
+`src-tauri/src/skipdetect/` (one tagged command `skip_detect`) plus `src/skipWindows.ts` and
+`src/nextUpGate.ts`. **Read `.claude/rules/skip-detection.md` before touching any of it, including
+the frontend files**: every threshold there was measured against a frame-verified corpus. The rules
+most often broken:
 
-- **Layer 1 (high trust): AnimeThemes reference match.** The cour's themes (MAL id from AIOMetadata's
-  per-video `_malId`, else the AniList pair, else the AniSkip resolution) are fingerprinted and
-  located in the episode's audio. Accept gates: 30 s run, BER <= 0.35, margin >= 0.15 (do not raise
-  it: it is the gate that rejects TV-edited themes), soft42 coverage >= 0.85. Mapping A (chained
-  runs, theme file start to theme file end, `matcher::layer1_window`) is the research port and the
-  corpus parity tests hold it; the PUBLISHED window is that refined by the edge rule
-  (`matcher::refine_layer1_window`, `job::EDGE_RULE` 1): START = the theme's AUDIBLE start (the
-  file's lead silence put Steins;Gate 24's opening 2.3 s into story); END decided by the EPISODE's
-  0.4 s RMS levels inside the theme file's trailing fade, once the region has finished: a window at
-  or above -40 dB there is new content (a preview) and the end becomes onset - 1 s (both kinds);
-  otherwise an OP keeps mapping A's end, and an ED ends at audible end + 0.5 s when the fade is at or
-  above -60 dB (talked over) or reference end - 0.5 s when it is quiet (a held card). Never past
-  mapping A, always clamped to the MEDIA end. Measured on the 89-episode e2e set
-  (`edge_mapping.md`, variant REC): every Layer 1 preview / after-credits overrun gone, no verdict
-  worse; the thresholds rest on 6 OP and 6 ED onsets, so re-validate before moving one. A stored
-  result from an older edge rule answers no kind. No silence snapping (every snap variant pushed ED
-  ends into after-credits scenes). Corpus: OP 26/2/0 wrong, ED 23/5/0 wrong, 0 false positives
-  (mapping A; `skipdetect_layer1_edge_rule_corpus` pins the edge rule's windows: one ED correct ->
-  near, TYBW 1:1). It runs on EVERY anime episode with a MAL id while `autoSkipDetect` is on,
-  because its 3 s conflict drop is what removes a wrong crowd window. Themes existed but none matched
-  = an informative abstain: Layer 3 is NOT run for that kind. Informative ONLY when every candidate
-  loaded and one of the cour's own themes was really compared: a failed theme load (download, HTTP,
-  timeout, decode) or a cour whose themes are all shorter than the 30 s run gate (short-form anime)
-  leaves the kind `Unavailable` (undecided: the crowd keeps its trust). Failed loads count toward the
-  8-per-kind download cap, and two consecutive failures end the kind's search at once (an audio
-  outage used to walk every candidate and sibling cour at up to 46 s each, holding both kinds
-  pending). A theme the main loader is still fetching when HEAD completes is settled before the OP
-  decision forks, so it is never downloaded twice.
-  Theme flags are judged PER AUDIO (`animethemes.rs`): an ED whose audio only "Over" videos use is
-  not a candidate (TYBW 1:13's insert song); a PARTIALLY Over audio (Pop Team Epic ED3 / ED4 ship an
-  NCBD "None" and a TV "Over" video of one audio) is a candidate, sorted last, prompt-only
-  (`animethemes-over`). A Transition-only ED (every video of its audio starts over the episode) is
-  prompt-only too, under `animethemes-transition`: its matched START is the song's, which can sit
-  minutes inside the story (Cowboy Bebop 13's 402 s "Space Lion" passed every gate and would have
-  auto-skipped 280 s of story). Its END is trusted. Theme lists cached before `over_partial` existed
-  read the old entry-wide flag, which only errs toward excluding.
-- **Layer 3 (low trust): loudness continuity** between silences. Only when the cour's OWN AnimeThemes
-  list has no theme of the kind ("Over" themes count; a sibling cour's themes that did not match do
-  not), or there is no MAL id. Prompt-only, never auto, never a Next-Up trigger, and dropped at stamp
-  time for any kind AniSkip, IntroDB, PublicMetaDB or a chapter already supplied. Live action and
-  MAL-less anime run the detector only for a kind NOTHING else supplied. A continuity ED that
-  overlaps the published opening is withdrawn (with the opening too when that is continuity as
-  well): on a file shorter than 480 s TAIL re-reads HEAD's audio, and Kaiju No. 8's 224 s Narumi
-  special got one in-story block as both kinds.
-- **TAIL never waits for the OP decision.** When HEAD ran to its end, the OP's theme search, sibling
-  lookup and Layer 3 run beside the TAIL pass on a forked `Decider` (job.rs) and publish the moment
-  they resolve; still one detector ffmpeg at a time.
-- **Early provisional opening (`animethemes-early`, HEAD only).** The full gate needs ~75-77 s of
-  the theme decoded (30 s run + soft42 coverage), so a 0:00 OP used to prompt 10-34 s into the
-  song. `matcher::EarlyTracker` publishes a PROMPT once >= 12 s of a run that starts within 5 s of
-  the theme's audible lead clears BER 0.35 and margin 0.15 on the global best placement. Corpus
-  (`skipdetect_early_rule_corpus`): every OP fires 12.3-14.1 s into the song (0:00 ones at 13.0 s),
-  windows within 0.05 s of the final Layer 1 window, 0 false fires over all 6,696 theme x region
-  pairings with no horizon. Do NOT go below 12 s (8 s let the Bleach "Over" insert through, 10 s had
-  a thin margin), and never offer it an "Over" theme (the one corpus fire left is exactly that).
-  Its own source: prompt-only, NOT Layer 1 (no 3 s conflict drop, so withdrawing it loses nothing),
-  ranked 4.5 (below every auto-capable source, above every guess), never cached, never in the final
-  snapshot. Replaced by the full match (the tracker stops), withdrawn when the best placement moves,
-  the margin drops, the run stops short of 30 s, the whole theme decoded without a full accept, or
-  HEAD ends without one. It fires only while HEAD has decoded < 300 s (`EARLY_HORIZON_S`); the curve
-  is folded incrementally (same total work as ONE full match) and run detection is skipped while
-  the margin is under the floor. An auto window entered past its midpoint (a late full match, a
-  resume) now becomes a prompt in `SkipController` instead of nothing.
-- **Start latency.** The frontend starts `skip_detect` the moment the MAL id and the duration are
-  both known (`watchLoadDuration`: the playback-update events, never a poll), not after AniSkip /
-  PublicMetaDB / IntroDB; those ride a promise that the chapter poll awaits only after reading the
-  chapters, so the first stamp waits for the slower of the two. Nothing is stamped before the chapter
-  poll settles (the Hell's Paradise rule stands). The probe stays: it is the DURATION-tag source of
-  the probe-only path. The `prefetch` action warms the AnimeThemes list and the top-ranked theme
-  fingerprint per kind for the episode Next-Up pre-resolved (its own MAL pair, else the playing cour
-  when it is the next episode of the same season); never episode audio, never with detection off or
-  without ffmpeg, one at a time.
-- **Next-episode pre-scan (`prescan`, `src/nextPrescan.ts` decisions, the App.tsx effect drives
-  them; setting `prescanNextEpisode`, advanced).** The SAME detect job runs on the stream Next-Up
-  pre-resolved (the canon episode when the end screen will skip filler / recap), so that episode's
-  load is a result-cache hit. It never publishes a snapshot or progress event and shows NOTHING on
-  the player (DevConsole `[skipdetect]` only); its probe and region ffmpeg run at BELOW_NORMAL
-  priority. It starts only after THIS file's live detect settled, the playing stream has been
-  continuously healthy for 15 s (fresh cache readings, no seek, readahead >= 30 s or demuxer at
-  EOF), not while casting, anime with a MAL id, ffmpeg already installed, and the Next-Up card on
-  (lead time > 0: its pre-resolve is the only stream source). For such an episode (a MAL cour, both
-  switches on, a kind wanted, not casting) that pre-resolve runs as soon as this file's live detect
-  settled instead of at 50 % (`prescanWantsEarlyResolve`; one early try per episode, a failed one
-  waits for 50 %), so the pre-scan starts minutes into the episode. It is cancelled when the playing
-  stream buffers, breaks, is truncated, drops under 10 s of readahead, its cache readings stop while
-  it plays (a cloaked window), a cast starts, the setting is switched off or the next episode
-  changes; a cancelled run starts over (at most 3 starts per key). It has its own slot in Rust:
-  every live Detect preempts it, a cancel that arrives before it reached the slot is not lost
-  (`PRESCAN_CANCEL_EPOCH`), and `PRESCANNED` is a session record (cap 64, 1 h) of what was already
-  pre-scanned.
-- **Layer 2 (blind pairing) is not shipped**; the `pairing` source and its priority slot are reserved.
-- **Layer 1's verdict holds the crowd (`op_l1` / `ed_l1`).** Every snapshot carries a STRUCTURED
-  per-kind state (`L1State`: pending, matched, informative, no_themes, unavailable, not_requested;
-  never parse a note string). The frontend starts a kind "pending" when the detector will decide it
-  (MAL id, detection on, a stream, kind gathered: an ending on Off still is while the Next-Up card
-  is on) and `composeSkipWindows` (`src/skipWindows.ts`, the
-  ONE stamp function App.tsx and the e2e harness share) applies holds that ride the window as
-  `hold`, so the re-stamp cannot re-arm them: pending = crowd rows (AniSkip, IntroDB, PublicMetaDB)
-  of that kind only PROMPT ("l1-pending"), unless the provisional opening already starts within 3 s
-  of the row; matched = the conflict drop decides as before; informative = auto-capable crowd rows
-  prompt ("l1-abstain") and the kind's guesses plus prompt-only crowd rows (introdb-single, AniSkip
-  ED) are DROPPED; no_themes / unavailable / a detect that ends or never runs = trusted as before.
-  Strongly titled chapters are exempt (a weak-title one is dropped, see Chapters). Both HOLDS apply only to rows overlapping the audio Layer 1 actually
-  SEARCHED for the kind by at least 30 s (its minimum accepted run; all of a shorter row): the
-  snapshot's `op_region` (0 to the end HEAD decoded) and `ed_region` (TAIL origin to the final media
-  end), defaulting to 0-600 s and the last 480 s before the media end. A row outside it (an opening
-  at 640 s, past HEAD) was never looked for, so it is not held. The informative DROP of guesses and
-  prompt-only crowd rows still applies outside it (judgement call, measured: Spy x Family E2's
-  single-submission IntroDB "ending" at 905-995 s of an episode with no ending came back as a wrong
-  prompt when the drop was scoped to the region too). Why: before the theme match lands, a crowd opening at 0-90 s
-  auto-skipped 89 s of JJK S2E10's cold open (the Hell's Paradise rule again, reopened by the
-  mid-play re-stamp); after an informative abstain, Solo Leveling E1, Re:Zero S3E1 and Gintama's OAD
-  each auto-skipped ~90 s of story on AniSkip's word. Cost: a correct crowd 0:00 opening is skipped
-  once the provisional opening confirms it (~13 s into the song) instead of instantly. Result-cache
-  entries written before the states existed answer no request (detected once more).
-- **Crowd rows are checked against THIS file** (`fitCrowdToDuration`, once the duration is known,
-  before anything counts as "supplied"): a row that starts past the end is dropped for every crowd
-  source (House of the Dragon S2E1's two endings started past the end and kept the detector from
-  ever looking); IntroDB keeps its stricter end rule; an AniSkip row whose `episode_length` (now
-  carried from Rust) differs from the file by more than 15 s is held prompt-only ("other-cut"):
-  10 / 15 / 20 s all catch the same 20 of 36 wrong rows over both corpora, including every one that
-  auto-skipped story, and the 6 correct rows they demote are each replaced by a theme match or a
-  chapter. Without a MAL id (live action) a crowd OPENING auto-skips only when a second independent
-  source agrees within 3 s at both edges (IntroDB vs PublicMetaDB, or a strongly titled chapter),
-  else it prompts ("uncorroborated"): 5 of the 9 lone live-action crowd openings cut into story.
-  Endings keep their trust. A crowd RECAP (anime or not) needs the same second source; identical
-  rows (to 0.05 s) are one submitter, not two (JJK S1E3's AniSkip and IntroDB "recap" 0.5-41.6 are
-  the same numbers, and frames show 30 s of it is the episode's own dorm scene). The opening Layer 1
-  (or the provisional opening) located in the file also corroborates a recap whose END is within 3 s
-  of that opening's start: evidence from the file itself. Trade-off, measured: without it the rule
-  rescued one episode (JJK S1E3) and held every correct automatic recap in the corpora (Black Clover
-  2:1 recap end 178.0 vs theme 176.05, DBZ Kai 26 40.13 vs 39.01); with it all three come out right
-  and Bleach 266 / One Piece 8 stay held by other-cut. Cost: the theme match lands some 10-17 s into
-  a load, so such a recap at 0 s turns auto only then; the SkipController skips the rest of it
-  while that is before its midpoint and offers it as a prompt after. The PublicMetaDB
-  anime fallback for an id with no season of its own (`kitsu:N:E`) maps the cour's local episode to
-  TMDB's through its Fribb row (`season.tmdb` + `episode_offset.tmdb`) and is not asked at all for an
-  OVA / special / movie or an entry Fribb does not map: their TMDB id is the parent show's (the Mob
-  Psycho 100 OVA was stamped with TV episode 1's opening). It reads a MAL-keyed index of EVERY Fribb
-  row (`anime_id_map.rs` `MAL_TMDB`), not the imdb-keyed one: Fribb lists many TV cours without an
-  imdb_id, and the imdb index silently skipped every one of them.
-- **Merge (`dedupeSkipWindows`)**: animethemes 8 > chapter 7 > aniskip = introdb 6 > pairing =
-  publicmetadb 5 > animethemes-transition 4.75 > animethemes-early 4.5 > introdb-single 4 >
-  aniskip-neighbour 3 > chapter-heuristic 2 > continuity 1. `base` reaches the stamp UNDEDUPED (the
-  chapter merge and the IntroDB join no longer dedupe), so a corroborating second source is still
-  there to be read. A Transition-only ending keeps another ending only when that ending's END agrees
-  within 3 s AND it starts no earlier than the song (a real ending cannot start before its song; a
-  crowd ending fitted to the file's end that starts in story before it was outranking the match), and
-  such an ending then outranks it; one whose START a strongly titled chapter confirms within 3 s
-  becomes plain `animethemes` (Bebop 26, Bocchi 12). A crowd row no longer promotes one: a single
-  AniSkip row marking where a Bebop-13-style song begins would have made a 280 s story cut a
-  Verified, automatic skip. The Transition match itself stays
-  prompt-only even when it is right (Solo Leveling E1 loses an automatic ED skip): the accepted cost
-  of the Bebop 13 rule, since its start can sit minutes inside the story. A weak-title chapter
-  ("weak-title" hold) ranks below every unheld window of its kind, so it never wins the one-opening
-  election over a crowd opening it disagrees with; with nothing else of its kind it still prompts. An ending never overlaps the opening: the
-  better-ranked one stays, a tie or two continuity windows both go. When
-  a Layer 1 window exists for a kind, every other window of that kind whose start OR end is more than
-  3 s away is DROPPED (TYBW 3:9-3:11 AniSkip ED rows were 32-38 s early with a matching
-  episodeLength). AniSkip ED rows are prompt-only even with the ED mode on auto; IntroDB keeps its
-  own tiers. The AniSkip rows a Layer 1 window replaced ride the `set_skip_windows` payload's
-  `superseded` list (`dedupeSkipWindowsDetailed`): the AuraSkip menu lists them for their vote arrows,
-  and nothing that seeks or prompts reads it (mpv's property gets `windows` only).
-  A crowd recap lying inside a Layer 1 opening is dropped (a recap never plays under the theme).
-- **Chapters**: "epilogue" is NOT an ending. Preview / next episode / next time / coming up chapters
-  are their own `preview` kind (so is a combined "ED + Preview" title, and the localized adelanto /
-  avance / avant-premiere / prochain episode / vorschau / anteprima / proximo episodio / yokoku);
-  only one in the outro region counts (Steins;Gate 24's FIRST chapter, its cold open, is titled
-  "Preview"). No ED is derived from an untitled LAST chapter that runs to EOF (it can hold the
-  ending, an after-credits scene and a preview). "Intro" / "Introduction" / "Outro" are WEAK titles
-  (9 of 11 such chapters in both corpora were cold opens, previews or story: Re:Zero S4E5's pair
-  alone is 372 s of story): dropped when the file also has a strongly titled chapter of the kind,
-  otherwise prompt-only ("weak-title") unless a fitting crowd row agrees within 3 s at both edges,
-  and DROPPED while Layer 1 is pending for its kind or after an informative abstain (Re:Zero S4E5's
-  "Intro" prompt was on screen at 0.6 s; over all 89 corpus episodes this changes that episode
-  only).
-  Prologue / avant / cold open / teaser / pre-title chapters are STORY and never feed the
-  untitled-chapter heuristics (TYBW 1:1's "Prologue" became an 80 s opening on an episode with
-  none).
-- **`preview` kind**: no Settings row; hard-coded in `skipModeForKind` (used by BOTH the chain's
-  `modeFor` and the re-stamp's `modeForKind`): prompt, never auto, off when the ED mode is off.
-- **THE RULE: an ED window end is NEVER the file / container duration.** It ends where the matched
-  theme ends (Layer 1) or at a trailing silence (Layer 3), and every window is clamped to the MEDIA
-  end (TAIL origin + decoded samples at TAIL EOF), which can be ~29 s shorter than the container
-  duration (Spy x Family E2, Demon Slayer S1E2, TYBW 3:14). Never stamp `[ed_start, duration]`,
-  never borrow an ED from neighbour episodes (that borrow put a phantom ED inside TYBW 3:10's
-  after-credits scene and is retired; the OP borrow remains), and never gate an ED's existence on a
-  "last N seconds" band (TYBW 3:14's ED starts 418 s before EOF, 3:1's 290 s).
-- **Next-Up**: the card (`NextUpCta.tsx`) has NO countdown. Unattended advance happens only
-  at end of stream, through the EOS Spotlight, so after-credits scenes and previews always play
-  unless the user presses Play. The card appears as the ending STARTS when `nextUpEnding`
-  (`skipWindows.ts`) elects an ending (any source and level; Verified, then Likely, then Risky,
-  then the LATEST) and that ending starts in the second half of the file and more than 5 s before
-  its end.
-  It reads the stamp BEFORE skip
-  modes, so a mid-play mode change does not move the card. Endings set to Off are still GATHERED while
-  the card is on (lead time > 0): `gatherFor` in the chain maps an Off ending / preview to prompt
-  for every fetch, chapter derivation, the Layer 1 pending state and the detector's `detect_ed`,
-  while publishing stays on `modeFor`. The PAYLOAD is a second `composeSkipWindows` over the
-  mode-filtered base AND detected windows, never `full` filtered afterwards: a Layer 1 ending
-  outranks an opening in the cross-kind rule and would drop the user's opening. The card-only ending
-  read never downloads ffmpeg (no toast), is not requested on a file under 1140 s (600 + 480 + 60:
-  below that TAIL can reach HEAD's audio, and Rust's `no_ed_inside_the_opening` withdraws a
-  continuity opening together with a continuity ED overlapping it, at ANY length), and is not
-  requested without a MAL id (it could only be Layer 3, Risky). Only an Off ending / preview while
-  the card is on is left out of the payload compose up front; an opening or recap turned Off
-  mid-episode is composed and dropped by `applySkipModes` as before, since it is still the file's
-  evidence (a matched opening corroborates a recap). Every kind Off with the card
-  off is still the probe-only path. A Risky ending raises the card too, with its prompt (user's
-  call, 2026-10-20): a Transition-only start can sit 280 s into the story (Cowboy Bebop 13) and 8
-  of 13 lone AniSkip endings were wrong, but a card with no countdown only sits there, while
-  waiting for the trusted END put the card up in the last 7 s of To Be Hero X E07, whose
-  Transition-only ending runs to the end of the file. Under a Risky ending the prompt, the card
-  and the tail pill show ONLY with the player controls, never popping up on their own (user's
-  call, 2026-10-20; `edRisky` on the timing, `nextUpFollowsControls`, the prompt's
-  `withControls`, which keeps its stack slot while hidden so the card does not slide); the Skip
-  Segment and Play Next Episode keys work while they are hidden. v2.2.2 waited for
-  the ED END instead, which put the card up a fraction of a second before the end screen on every
-  episode whose ending runs to the end of the file; the countdown, not the start, was what lost
-  after-credits scenes. Without a credible start: `max(trusted ED end, end - lead)` (at the ED end
-  when nothing follows it), else `end - lead`; only a Layer 1 ED END is trusted (a Transition-only
-  match's end counts, so does a partially Over match's, prompt-only but located by the same
-  evidence: Pop Team Epic 1:5, and so does the end of the published ending that replaced a match
-  when the two ends agree within 3 s: Solo Leveling E1, Cowboy Bebop 13). Because the card is up
-  during the credits, a banner on it says what Play would skip (`nextUpTailNote`): "Preview after
-  the credits" when a preview chapter FILLS the tail (starts within 5 s of the ED end, ends within
-  5 s of the end), else "m:ss more after the credits", from a TRUSTED ED end to a MEASURED media
-  end (TAIL EOF, else the probe's DURATION tag; never a crowd / chapter end, never the container
-  duration the early estimate can be), and nothing otherwise. The banner goes once the ending is
-  over (the user is watching what follows), so a card first raised after it has none. It never calls an unlabelled tail a scene or a preview: Aura cannot tell them apart.
-  With no card to carry it (`nextUpInfo` null: no next episode, or the lookup failed), the same
-  note shows alone in the card's place (`NextUpTailPill`), under the card's own gate (lead time
-  above 0, not dismissed, not truncated); it takes no clicks and never fades, since it only ever
-  shows during the ending. Card and pill sit TOP LEFT, under the skip prompt: the prompt
-  publishes its bottom edge as a CSS variable on `<html>` while it is visible and the card's `top`
-  reads it (`src/playerStack.ts`), sliding up into the prompt's place when it fades or goes. All
-  three share the prompt's surface (`.aura-stack-surface`, App.css) and entry; card and pill fade
-  OUT through `StackPresence` (`NextUpCta.tsx`), which keeps the last element mounted, marked
-  `exiting` (key unbound, no clicks), for 200 ms. The
-  Play Next Episode keybinding (default Shift+X, handled inside `NextUpCta` because it needs keyup)
-  presses the card while it is up: Play, or with a skip to canon on offer Skip, held 2 s with the
-  canon preview showing unless `nextUpHoldToSkip` is off. The Skip Segment keybinding (default X,
-  `SkipController`) skips any window playing now, handled or not; the old always-on Shift+X force
-  skip is gone (it existed only because X answered visible prompts alone).
-  Only a card that went up while the PLAYHEAD was before the ED end (`nextUpRaisedTimeRef`, an
-  auto-skipped ending included) fades with the player controls past it (`nextUpFadeFrom`, stays
-  while hovered): one first raised by the fallback, a resume or a seek into the tail would be born
-  invisible. While the trigger is a fallback, the hide rule measures a seek-back from the EARLIEST
-  trigger the card was raised at (`nextUpShownAtRef`), so a stamp that withdraws the ending cannot
-  take the card down mid-credits; a credible start is measured from itself, so a stamp that
-  replaced a wrong early ending takes down a card that went up over story. "end" is the detector's
-  media end when known. The keep-open, stale-heartbeat and eof EOS detectors test against
-  `eosEnd(duration)` (the FINAL media end, else the probe's mapped-track DURATION tag, never the
-  container duration), so a container longer than its media still reaches the end card instead of a
-  false "stream lost". A series load that detects no kind (everything supplied, detection switched
-  off, ED off without a MAL id or with the Next-Up card off) still runs a PROBE-ONLY detect for that tag when ffmpeg is present, and so does every
-  MOVIE load. The detected media end belongs to the FILE: it is cleared with the load token and on
-  exit, never in `notifyNewLoad`, because EOS Replay, the VOD auto-retry and the recovery Reload
-  re-run loadfile on the same url without re-running the skip chain.
-- **ffmpeg passes**: probe, then ONE sequential HEAD pass (0-600 s, output-side `-to 600`, no `-ss`,
-  no `-copyts`, no `-t`), then TAIL (`-ss S -copyts` to EOF, no `-t` / `-to`, `S = min(container,
-  mapped track DURATION tag) - 480`). At most one detector ffmpeg at a time, all CPU work on the
-  blocking pool, nothing on the engine thread. Region origin = the FIRST DECODED PTS, never the `-ss`
-  value. The resampler is `aresample=11025:async=1`: a DTS track with timestamp gaps (JJK S1E3)
-  otherwise shifts every window about 2 s early.
-- **Cancellation**: a module-level generation counter in Rust; the frontend cancels on every load, on
-  exit playback and before each Detect, and applies only `skipdetect-update` events of its own
-  generation. A main-page reload (F5, the stream-lost Reload) cancels too, in Rust
-  (`skipdetect::cancel_all` from `on_page_load`), since the page that would cancel is gone. A
-  mid-play skip-mode change re-stamps through the running chain's serialised `stamp`
-  (`liveSkipStampRef`), never with a read-modify-write beside it. The SkipController matches handled
-  windows by kind with both edges within 3 s (`handledIn`), so a refinement of a skipped opening is
-  not re-prompted or re-skipped. The Detect (and Prefetch) action's kind switches travel as `detect_op` / `detect_ed`,
-  because the action enum is tagged `op`. A Prefetch is not cancelled by a Detect. A pre-scan IS
-  preempted by every Detect, is NOT stopped by Cancel (exit playback: the next episode may be
-  watched later), and is stopped by `prescan_cancel` (every load, the health abort), `cancel_all`
-  (page reload), the Storage clear and a newer pre-scan.
-- **Theme-match readout.** `stream_region` reports how far HEAD / TAIL has decoded (per whole
-  percent, held under 100 until the region ends) as its OWN event, `skipdetect-progress`
-  (`job::Progress`, same generation filter), never a Snapshot field: every snapshot re-stamps the
-  skip windows. `src/skipMatchProgress.ts` turns it plus the snapshots' `op_l1` / `ed_l1` into one
-  row per kind that is really being theme matched (the catalogue has a candidate of the kind, Layer
-  1 pending, mode not Off; never a card-only ending, a probe-only run or a cache hit), and the
-  verdicts linger 4 s. Shown inside the skip prompt under a divider, else in the prompt's slot
-  (`SkipMatchStatus`, only with the player controls, so it never sits over a cold open).
-- **Confidence levels (Verified / Likely / Risky)** on the skip prompt, the scrubber's hover card,
-  the AuraSkip menu rows, the auto-skip toast and a Settings legend. `composeSkipWindows` stamps a
-  `basis` on every window it publishes (`SkipBasis`, `skipBasisFor`: what the POSITION rests on,
-  judged against everything the stamp weighed, before the media-end clamp); `skipConfidence` maps
-  basis + kind + length to the level and `skipConfidenceInfo` (`src/skipSource.ts`) words it.
-  `basis` rides the Rust payload (`PreparedWindow::basis`) so the mid-play re-stamp keeps it.
-  The table is MEASURED, not guessed (every window of every stamp of the 89-episode corpus against
-  frame truth, scratchpad `confidence/evidence.md` of session 20dd39a5): Verified = a theme match
-  whose edges are refined (`WindowOut::refined`, set when the region's levels gated the edges, and
-  on a result-cache hit) and at most 150 s long, a titled opening chapter of 20-100 s, a titled
-  preview chapter of at most 40 s; measured worst case 1.6 s of story. Likely = an unrefined theme
-  match ("theme-settling": the pre-levels windows are where every 1.8 s overrun was), the early
-  opening, a theme that plays over story in some versions, other titled chapters, a crowd row
-  alone or with an independent second source. Risky = an AniSkip ending, a crowd row shown while
-  the theme match is still checking (7 of 13 cut story, JJK S2E10's 90 s cold open), an ending
-  chapter that runs to the end of the file ("chapter-tail": Blue Box 2:1's "Credits" chapter held a
-  106 s scene after the ending), a Transition-only theme, weak titles, guesses, other cuts, single
-  submissions, lone sources, rows the file contradicts. RISKY IS ALWAYS PROMPT-ONLY (`isPromptOnly`),
-  so a Risky label never sits on an automatic skip. A weak-title chapter is never an independent
-  witness (`weak_title`), and a window with no basis (a payload from before bases) shows no level.
-  Before moving a window into Verified, re-measure: the user's bar is that a Verified skip never
-  cuts story.
+- Layer 1 (AnimeThemes theme match) is high trust; its gates (30 s run, BER <= 0.35, margin >= 0.15,
+  soft42 >= 0.85) are measured: never loosen one to make an episode match. Layer 3 (loudness
+  continuity) is prompt-only. Layer 2 is not shipped. The `animethemes-swap` source is rated
+  Risky (prompt-only, shown only with the player controls), its end is never a trusted ending end
+  for Next-Up, and its false-match rate is unmeasured.
+- **An ED window end is NEVER the file / container duration**: it ends where the theme ends (Layer 1)
+  or at a trailing silence (Layer 3), clamped to the MEDIA end. Never borrow an ED from neighbour
+  episodes, never gate an ED on a "last N seconds" band.
+- `composeSkipWindows` (`src/skipWindows.ts`) is the ONE stamp function (App.tsx and the e2e harness).
+  Per-kind Layer 1 state is structured (`L1State`): never parse a note string.
+- Risky is ALWAYS prompt-only, and a Verified skip must never cut story: re-measure before moving any
+  window into Verified.
+- The Next-Up card has NO countdown; unattended advance happens only at end of stream.
+- ffmpeg: one detector ffmpeg at a time, CPU work on the blocking pool, nothing on the engine thread;
+  with `-copyts` never bound with `-t` (see Native dependencies).
 
 ### Downloads: two landmines and one governing rule
 
-`src-tauri/src/downloads/` (engine) plus `src-tauri/src/download_path.rs` (path
-safety) plus `src/Downloads*.tsx` / `src/downloads*.ts`. Right-click a source on
-the DETAIL PAGE to download it; a title-bar button beside the service status chip
-(`ServiceStatusChip.tsx`, formerly the Aura Cloud chip) opens the panel. Downloads are FILE downloads only: `load_video` still refuses
-local paths and offline playback is not in scope.
+`src-tauri/src/downloads/`, `src-tauri/src/download_path.rs`, `src/Downloads*.tsx`, `src/downloads*.ts`.
+Full design and rules: `.claude/rules/downloads.md`.
 
-Rust is authoritative; the React store is a projection that rehydrates from
-`downloads_list`, because F5 and the stream-lost modal's Reload must not lose a
-40 GB transfer. Two concurrent, promoted by a PUMP rather than a
-`tokio::sync::Semaphore` (a Semaphore hands out permits in wait-arrival order,
-which would make drag-to-reorder decorative). The control primitive is a
-`watch` channel read in a **`biased`** select against the body read: without
-`biased`, a pause issued while the body is stalled waits on a dead network
-future, and a stalled body is the most common debrid failure.
-
-**LANDMINE 1: never use `-ss` to resume an HLS download.** Measured against the
-bundled ffmpeg 8.1.1 on a 5 x 6.000 s VOD playlist, `-ss 15` and `-ss 18`
-produce BYTE-IDENTICAL output: on a mid-segment value ffmpeg lands on the start
-of the containing segment, but on an exact segment BOUNDARY it lands one whole
-segment early. A resume point is always a boundary, so the error is every
-resume, not some, and the mpegts muxer rebases each run to the same origin so
-the duplicated segment is invisible downstream. ffmpeg exits 0 with no
-diagnostic. The offset is not a constant you can subtract (1 segment at
-boundaries, 0 mid-segment, dependent on `#EXT-X-TARGETDURATION`, undocumented
-`hls.c` behaviour), and correcting it needs `-copyts` plus `-to`, which is the
-documented zero-bytes landmine. **No download-job ffmpeg invocation may pass
-`-ss`, `-copyts`, `-t` or `-to`.** Mode A therefore fetches segments in Rust and
-lets ffmpeg do exactly one local remux at the end; pause is byte-exact
-(verified `cmp`-identical, including fMP4/CMAF). Mode B (encrypted or
-discontinuous playlists) is a single ffmpeg pass and is genuinely NOT pausable,
-so it says so; `JobKind` is written back once the admission gate has run,
-because a job that lies about being pausable turns a Pause press into a silent
-cancel.
-
-**LANDMINE 2: a body that ends early looks exactly like success.** `chunk()`
-returning `None` is not proof of completion (this is the mpv truncated-stream
-bug from v2.0.1, in a different costume). Completion requires the byte count to
-match what the origin promised. Likewise, when a host sends neither `ETag` nor
-`Last-Modified` (common for debrid), a resume compares a 64 KiB tail hash before
-appending: without it a rotated link answers 206 at the stored offset and two
-different releases get spliced into one file that reports no error at all. Same
-rule for a ranged HLS segment: a 200 to a `Range` request is the WHOLE resource,
-and appending it yields K concatenated copies that ffmpeg remuxes happily.
-
-**The governing rule in `download_path.rs`:** it does not try to model
-`RtlGetFullPathName_U`, it emits only paths that are FIXED POINTS of it. Win32
-strips trailing dots and spaces from every component before the kernel sees it,
-which is why `".. "` is a traversal that passes a naive containment check.
-Applying that strip ourselves, then re-validating, makes the traversal
-structurally unrepresentable, and sound lexical containment follows. The module
-also covers reserved device names (`CON.mkv` included), bidi and zero-width
-spoofs, an extension ALLOWLIST (without it `payload.exe` lands), UTF-16 MAX_PATH
-budgeting, and `create_new` collision claims. It does NOT normalize: NFKC maps
-U+FF0F to `/` and U+FF1A to `:`, i.e. it manufactures path separators. 17 tests,
-plus 10 for the HLS parser and relink guard.
-
-`download_dir` is machine-local and is stripped from the cloud blob in BOTH
-directions in `sync.ts`. Being absent from `PORTABLE_*_FIELDS` is NOT sufficient:
-those gate file export/import, while `update_settings` shallow-merges whatever
-the cloud sends. The `screenshot_dir` comment used to claim an exclusion it did
-not have; it does now. `gpu_acceleration` ("Hardware acceleration") is
-machine-local the same way and is not exported either: its one home is
-`render.json` beside the settings dir (`settings.rs`), which every save writes,
-every scope load reads back and the launch alone reads, so the switch shown is
-what the next launch does (the settings cache starts from render.json too, so a
-scope with no settings file cannot show or save the default). It reaches WebView2
-as browser arguments on the webview builders (`lib.rs::webview_browser_args`);
-wry ignores the `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS` variable. Every webview
-sharing the main user data folder needs the SAME arguments (WebView2 refuses a
-second environment with different options), so `SourcePopup.tsx` builds every
-popup, OAuth or not, through the Rust `open_oauth_popup_webview` command, never
-the JS `new Webview()` API.
-
-Full design: `docs/superpowers/specs/2026-09-05-download-manager-design.md`.
+- **No download-job ffmpeg invocation may pass `-ss`, `-copyts`, `-t` or `-to`.** `-ss` on an HLS
+  segment boundary lands one segment early, silently duplicating it on every resume.
+- **A body that ends early looks exactly like success**: completion requires the promised byte count;
+  a resume without `ETag` / `Last-Modified` compares a 64 KiB tail hash; a 200 to a `Range` request is
+  the whole resource.
+- **`download_path.rs` emits only fixed points of Win32 path normalization** and never NFKC-normalizes
+  (that manufactures `/` and `:`).
+- Rust is authoritative (the store rehydrates from `downloads_list`); the queue is a pump, not a
+  Semaphore; pause/stall selects are `biased`.
 
 ### Build-time secrets
 
@@ -642,210 +303,102 @@ via `cargo:rustc-env`: `AURA_MDBLIST_KEY` (used by `ratings.rs`), `AURA_PUBLICME
 `publicmetadb.rs`), and `AURA_TMDB_KEY` (used by `arcs.rs`). An empty/missing key makes that feature
 cleanly no-op (no error, just empty ratings, no skip windows, or no Arcs toggle). A user-supplied key
 in the OS keyring overrides the baked one where supported (`api_keyring::SUPPORTED_KEYS` is
-`opensubtitles` + `tmdb`). Per-account cloud sync scopes by a SHA-256 hash of the Stremio `auth_key`
+`opensubtitles` + `tmdb` + `introdb`; `introdb` is the user's own IntroDB key, used only to SUBMIT a
+segment, never to read). Per-account cloud sync scopes by a SHA-256 hash of the Stremio `auth_key`
 (`sync.rs`); each account's blob is isolated.
 
 ## Codebase map
 
-Dense pointers; grep the file for specifics. The repo is large (Rust ~27k LOC over ~37 files;
-frontend ~40k LOC over ~70 files + ~13 views).
+Rust ~27k LOC, frontend ~40k LOC. One line per area here; the per-module detail (commands, devlog
+labels, caches, provider rules) is in `docs/agents/codebase-map.md`.
 
-### Rust (`src-tauri/src/`)
+**Rust (`src-tauri/src/`)**
+- Engine + window: `mpv/` (engine, ffi, thumb, glass: the "Real glass over video" shader, SHELVED behind `REAL_GLASS_AVAILABLE` in `src/realGlass.ts` for dark spots / brightness / striping; code kept, one flag to restore), `win32.rs`, `window_logic.rs`, `player.rs`, `cinema.rs`.
+- Stremio + streaming: `stremio.rs` (catalog / search / meta / streams; the biggest module),
+  `streaming.rs` (bridge), `auth.rs`, `addon_rate.rs`, `sync.rs`, `addons.rs`, `oauth_callback.rs`
+  (RFC 8252 loopback landing on the bridge, incl. Simkl's PKCE redirect).
+- Metadata + ratings: `ratings.rs`, `tenrai.rs` (MyAnimeList), `theme_parse.rs`, `publicmetadb.rs`,
+  `anime_id_map.rs`, `silencedetect.rs` (only the ffmpeg resolver now), `trailer.rs`, `release_dates.rs`.
+- Skip / scrobble: `skipdetect/`, `aniskip.rs`, `introdb.rs`, `scrobble.rs`, `scrobble_auth.rs`,
+  `scrobble_anilist.rs`, `scrobble_simkl.rs`. **Trakt was REMOVED (2026-11-15, user's call): never
+  bring it back.**
+- Subtitles + media: `subtitles.rs`, `subsync.rs`, `media_controls.rs`, `per_title.rs`.
+- Story arcs + manga: `arcs.rs`, `arc_align.rs`, `arc_art.rs`, `manga_chapters.rs` (joins by AIR DATE,
+  never by number).
+- Casting + live TV: `cast/` (CASTV2, DLNA, HLS transcode, media server), `iptv.rs`.
+- Downloads: `downloads/`, `download_path.rs`.
+- Settings + infra: `settings.rs`, `api_keyring.rs`, `backup.rs`, `storage.rs`, `stats.rs`,
+  `crash_reporting.rs`, `runtime_deps.rs`, `tray.rs`, `popup_nav.rs`, `devlog.rs`, `log_export.rs`,
+  `perf_monitor.rs`, `history_store.rs` (watch history, user data, uncapped),
+  `service_status.rs` (title-bar status chip probes; fixed endpoint table, addon URLs never logged
+  unredacted or echoed).
 
-- **Engine + window**: `mpv/engine.rs` (FFI engine), `mpv/ffi.rs` (raw bindings), `mpv/thumb.rs`
-  (on-demand thumbnail extractor), `win32.rs` (native fullscreen, mpv-child resize, display-refresh
-  query, power-throttling opt-out, windowed MPO poison), `window_logic.rs` (window events, native
-  fullscreen toggle, Discord RPC presence), `player.rs` (HDR mode resolution, audio passthrough,
-  subtitle styling defaults), `cinema.rs` (GLSL shader profiles).
-- **Stremio + streaming**: `stremio.rs` (catalog / search / library / meta / stream aggregation /
-  external subs; the biggest module), `streaming.rs` (axum bridge), `auth.rs` (Stremio login /
-  session), `sync.rs` (cloud library sync + release-signal polling), `addons.rs`,
-  `oauth_callback.rs` (RFC 8252 §7.3 loopback landing pad for system-browser OAuth, served as
-  `GET /oauth/callback` on the same bridge listener; nonce-guarded, re-emits the existing
-  `deep-link` event so `App.tsx` persists tokens through one code path. Proxy-side contract in
-  `docs/oauth-loopback-contract.md`. Also serves `GET /oauth/callback/simkl`, Simkl's own PKCE
-  redirect target with no proxy involved: the `state` is a nonce carrying the PKCE verifier, the
-  code is exchanged there, and the result leaves through the same `deep-link` re-emit).
-- **Metadata + ratings**: `ratings.rs` (MDBList + MAL + AniList aggregator, anime-aware weights),
-  `tenrai.rs` (the MyAnimeList client: base URL, a bounded `/anime/{id}/full` cache shared by
-  ratings and theme songs, plus the five on-demand extras commands), `theme_parse.rs` (MAL theme
-  display-string parser, has `#[cfg(test)]` tests),
-  `publicmetadb.rs` (OP/ED skip source + TMDB id resolution), `anime_id_map.rs`, `silencedetect.rs`
-  (now only the shared ffmpeg resolver; its old detectors are retired), `trailer.rs` (YouTube
-  trailer resolve).
-- **Skip / scrobble**: `skipdetect/` (the layered OP/ED detector, see "Skip detection" above:
-  `fingerprint`, `matcher` (Layer 1 gates), `themes`, `continuity` (Layer 3), `probe` (argv +
-  stderr parsers), `audio` (ffmpeg processes), `animethemes`, `cache`, `job`; ignored corpus and
-  runtime parity tests), `aniskip.rs` (OP/ED timing, vote/submit, id resolution), `introdb.rs` +
-  `src/introdb.ts` (IntroDB: IMDb-keyed intro / recap / outro segments for ANY series with a `tt`
-  root, not gated to anime; one `introdb` command with a tagged `fetch` / `submit` / `status`
-  action. Rows are keyed by the SUBMITTER's numbering, so the frontend asks the addon's own pair
-  first, then the id-string pair, then absolute-under-S1, and uses only the first answer with a
-  usable segment; it never invents an offset. Trust split in Rust: `introdb` (>= 2 submissions
-  at >= 0.9 confidence) ranks with AniSkip in `dedupeSkipWindows`, `introdb-single` sits between
-  publicmetadb and `aniskip-neighbour` and is prompt-only. Submission is user-initiated from the
-  AuraSkip menu, needs the user's own key (`api_keyring` name `introdb`), maps op/ed/recap to
-  intro/outro/recap, and treats 429 as "already submitted recently". Movies are not queried:
-  Aura has no movie ED slot), `scrobble.rs` +
-  `scrobble_auth.rs` + `scrobble_anilist.rs` (Trakt + AniList OAuth, heartbeat). `scrobble.rs` also
-  exposes the manual `scrobble_history_trakt` / `scrobble_history_anilist` commands (the per-row
-  buttons on the History tab in `src/views/HistoryView.tsx`), which backdate the mark to the original
-  watch time: Trakt exact via `watched_at`, AniList day-precision via `completedAt`.
-  `scrobble_simkl.rs` is the third provider: OAuth 2.0 authorization code + PKCE as a public client
-  (no proxy, no secret; lands on `/oauth/callback/simkl`), COMPLETION-ONLY like Trakt
-  (`POST /sync/history`, never `/scrobble/*`: one POST per finished item, plus one fallback POST
-  with show-level ids when an anime episode's cour-level ids come back not_found), and it
-  supplements AniList (an anime episode goes to both). Every Simkl POST is paced at least 1.1 s
-  apart (Simkl's budget is 1 POST/s: overage answers `429 {"error":"rate_limit"}` and starts a
-  throttling block, reported as `412 client_id_failed` while active, that repeated overage extends;
-  `400 RATE_LIMIT`, spelled `rate_limit` in the sync guide, is the 20 s per-user write lock, not a
-  rate limit), and `scrobble_history_simkl` takes the History rows as ONE batch (chunks of 100) and
-  returns a result per row. All of it is inert while
-  `SIMKL_CLIENT_ID` (beside `TRAKT_CLIENT_ID` in `scrobble_auth.rs`) is empty;
-  `scrobble_services_available` is how the frontend tells "not in this build" from "not connected".
-  Frontend: `src/scrobbleConn.ts` owns the provider list, its per-provider Records and the cached
-  availability ask (an unavailable Simkl is muted in Settings and never offered in History),
-  `src/scrobbleSimkl.ts` the batch call plus the id-eligibility mirror of Rust's `targets`, and
-  `src/scrobbleRun.ts` sends a bulk run's Simkl rows as ONE call after the per-row loop, mapping
-  the per-row results back by index.
-- **Subtitles + media**: `subtitles.rs` (OpenSubtitles v1: search incl. moviehash, download,
-  add-to-mpv), `subsync.rs` (Live Sync cue lists: SRT / WebVTT / ASS parsing for external tracks,
-  WINDOWED ffmpeg extraction for embedded ones), `media_controls.rs` (SMTC via souvlaki),
-  `per_title.rs` (per-id volume / shader / track memory).
-- **Story arcs**: `arcs.rs` (TMDB episode groups -> arcs, grouping selection, the command),
-  `arc_align.rs` (the join; see the landmine below), `arc_art.rs` (Fandom arc key art, curated
-  TMDB-id -> wiki table). Devlog label `[arcs]`. The wiki table is a struct per show: `art` gates
-  the key art (Bleach is listed `chapters_only`), `episodes` names the episode-infobox fields the
-  manga-chapter feature reads (verified per wiki; `None` where unverified or unusable).
-- **Manga chapters**: `manga_chapters.rs`, one tagged command `manga_chapters` (`series` / `arcs` /
-  `episodes`). Series line from MangaUpdates' public API (`anime.start` / `anime.end`, parsed
-  strictly: an unreadable string shows nothing, never the raw text), matched through MAL's
-  "Adaptation" relation (tenrai) and an EXACT normalized title, earliest year, type Manga / Manhwa /
-  Manhua. Arc ranges from the RENDERED infobox of the arc's Fandom page (`action=parse&section=0`),
-  the arc reaching its page through `arc_art::resolve_arc_pages` (by page, never by episode
-  number); a part ("Wano Country Part 2"), a combined name ("Water 7 & Enies Lobby Arc") or a
-  one-chapter infobox never takes a range. Per-episode chapters from episode pages fetched 50 per
-  request (`rvsection=0`), joined to Aura's episodes by AIR DATE with a title tie-break
-  (`join_by_air_date`), never by number: wikis number episodes officially, Aura's addon may not
-  (the One Piece 590 landmine again). One Piece's episode pages carry no Japanese air date, so it
-  gets arc ranges only, and an episode's hover shows its ARC's range, never an interpolated guess.
-  Devlog label `[manga]`. Frontend: `src/mangaChapters.ts` (bounded in-memory store + hooks +
-  formatting), shown as the "Manga" row of the detail page's Details list (under
-  Source; "Checking" / "Not available" with the reason on hover rather than no row, for a manga-type
-  source), on arc tiles and the open arc's breadcrumb, beside
-  the season picker (only where per-episode data covers the season), in episode rows' HOVER text
-  only, and next to the episode title in the player (read from the store, never fetched there).
-- **Casting + live TV**: `cast/mod.rs` + `cast/castv2.rs` + `cast/dlna.rs` + `cast/hls.rs` +
-  `cast/media_server.rs` (Chromecast via hand-rolled CASTV2 + DLNA + on-the-fly HLS transcode),
-  `iptv.rs` (EPG fetch + Xtream password keyring).
-- **Downloads**: `downloads/` (`manager.rs` registry + pump, `http.rs` direct
-  transport, `hls.rs` the two HLS modes, `store.rs` `downloads.json`,
-  `taskbar.rs` ITaskbarList3, `commands.rs` the five commands),
-  `download_path.rs` (Windows path safety, standalone + tested). Devlog label
-  `[downloads]`.
-- **Settings + infra**: `settings.rs` (per-scope AppSettings + theme + HDR resolver), `api_keyring.rs`
-  (user API keys in keyring), `backup.rs` (user-data export), `storage.rs`, `stats.rs`,
-  `crash_reporting.rs` (Sentry + minidump self-spawn), `runtime_deps.rs` (on-demand binary fetch),
-  `tray.rs`, `popup_nav.rs` (in-app browser webview nav), `devlog.rs`, `log_export.rs`,
-  `debug_panel.rs`.
-- **Watch history**: `history_store.rs` (one compact gzip file per scope under
-  `app_data_dir()/history`, no entry cap, coalesced atomic writes, the cloud `history` blob's
-  encode / decode; one tagged command `history_store`). A failed background write is retried with
-  backoff. `sync.ts` keeps an `aura:sync:history-unpushed:<scope>` marker from a local edit until a
-  push lands, and every completed pull republishes while it is set: only a local edit pushes
-  history, so a push lost at exit or on the network had no other retry. Devlog label `[history]`.
-- **Service status**: `service_status.rs`, one tagged command `service_status` (action `check`),
-  behind the title-bar chip. It probes Aura's server (`/healthz`, the ONE host const), every
-  installed addon's `/manifest.json`, the Watch Together relay's `/health`, and the debrid
-  providers the user chose to monitor (`monitoredProviders`, a portable Aura setting) from a FIXED
-  table of status endpoints in Rust, never URLs from the frontend. Provider answers are cached 60 s
-  (a failed fetch 5 s); the frontend polls every 5 min. Two clients: the Aura / provider one is
-  rustls `https_only(true)`; the ADDON one is deliberately not, because installed addons and the
-  dev relay can be `http://` (a LAN or loopback addon, Stremio's "Local Files" on 127.0.0.1:11470,
-  `ws://` relays), which matches every other addon fetch in `stremio.rs`. Addon URLs carry config
-  tokens: they are logged only through `redact_sensitive_url` and never echoed back (the reply is
-  index-aligned). An addon the list gains after a check read it gets one addons-only probe
-  (`probeNewAddons`) that moves neither the 5 min poll nor any other addon. A full round that reads offline (Aura and
-  every non-loopback addon and relay probe failed with no HTTP answer; `Probe.loopback` marks a probe to this machine)
-  gets one retry 30-60 s later by rewinding the poll clock, and the retry earns no further one. Devlog label `[status]`.
+**Frontend (`src/`)**
+- Shell: `App.tsx` (~7k LOC orchestrator), `main.tsx` (installs the contextmenu suppressor BEFORE React
+  mounts), `TitleBar.tsx`, `NavSidebar.tsx` (the left rail: + `RailRow.tsx`, `railLayout.ts`, `styles/glass-rail.css`), `ThemeEngine.tsx` (+ `themeAccent.ts` / `accentColor.ts` /
+  `AccentColorSetting.tsx`: the per-theme custom accent), `ErrorBoundary.tsx`, `pageLayout.ts`.
+- Player: `PlayerOverlay.tsx`, `SourceSwitcher.tsx`, `SubtitlePicker.tsx`, `AniSkipMenu.tsx`,
+  `EosSpotlight.tsx`, `NextUpCta.tsx`, `ResumePrompt.tsx`, `PlaybackEngineGate.tsx`, `playerMenu.tsx`.
+- Views (`src/views/`): Home, Library, Queue, Discover, Live, Calendar, History, Detail, Search, Addons,
+  Settings, Onboarding, CatalogPage.
+- Subsystems: `iptv/`, `watchTogether/`, `cast.ts` + `useCastSession.ts`, `Notifications*.tsx`,
+  `updater*.ts`, `Downloads*.tsx` + `downloads*.ts`, `ServiceStatusChip.tsx` +
+  `serviceStatusStore.ts` + `nestedAddonStatus.ts`, `heroBackdrop.ts`, `heroAmbient.ts` + `HeroBleed.tsx` (the Home hero's
+  dithered underglow and ambient bleed; art colours read back through the `/img` proxy's CORS),
+  `cardGlow.ts` + `styles/glass-cards.css` (Home catalog / CW cards: cursor-lit bezel, real-frost poster
+  badges and tracks, faux frost on CW cards since round 12 for frame rate, the hovered card's dithered underglow).
+- Data: `metaCache.ts`, `persistentCache.ts`, `libraryNormalize.ts`, `auraSettings.ts`,
+  `settingsTransfer.ts`, `sessionRoute.ts`, `historyStore.ts`, `streamMeta.ts`, `aiometadata.ts`,
+  `mangaChapters.ts`, `addonElection.ts` (which addons answer what, in what order; the ONE place for
+  that decision).
 
-### Frontend (`src/`)
+## Frontend rules
 
-- **Shell + router**: `App.tsx` (~7k LOC orchestrator: router, `usePlayback`, library load/normalize,
-  auth, fullscreen, notifications, watch-together room state, scrobble + auto-advance, chapter-skip
-  merge, session-route restore), `main.tsx` (entry; installs the capture-phase contextmenu
-  suppressor BEFORE React mounts), `TitleBar.tsx`, `NavSidebar.tsx`, `ThemeEngine.tsx`,
-  `ErrorBoundary.tsx`, `pageLayout.ts` (shared `PAGE_CONTENT_MAX_W`).
-- **Player**: `PlayerOverlay.tsx` (~4.3k LOC in-player UI), `SourceSwitcher.tsx`, `SubtitlePicker.tsx`,
-  `AniSkipMenu.tsx`, `EosSpotlight.tsx` (end-of-stream next-up / end-card), `NextUpCta.tsx`,
-  `ResumePrompt.tsx`, `PlaybackEngineGate.tsx`.
-- **Views (`src/views/`)**: Home, Library, Queue, Discover, Live, Calendar, History, Detail, Search,
-  Addons, Settings, Onboarding, CatalogPage. Live subviews in `src/views/live/`
-  (Guide, MultiView, PlaylistForm).
-- **Detail hero backdrop**: `heroBackdrop.ts` (the per-title override store and the synchronous,
-  network-free candidate list) and `HeroBackdropPicker.tsx` (the portalled picker panel), raised by
-  right-clicking bare hero area on the detail page. The override is read at every hero latch site
-  (see "Hero art latch" in `DetailView.tsx`).
-- **Service status**: `ServiceStatusChip.tsx` (the title-bar chip and its panel, which replaced
-  `SyncStatusChip.tsx`), `serviceStatusStore.ts` (App publishes the addon list there instead of
-  threading a prop through `TitleBar`).
-- **Subsystem modules**: live TV in `src/iptv/*` (M3U / Xtream / XMLTV parse, EPG store + worker),
-  watch-together in `src/watchTogether/*` (WebSocket to the `watch-relay/` Cloudflare Workers + DO
-  relay), casting via `cast.ts` + `useCastSession.ts`, notifications in `Notifications*.tsx`
-  (ring buffer + background scanner), updater in `updater*.ts` + `UpdatePopup.tsx` + `Changelog.tsx`.
-- **Downloads**: `downloadsStore.ts` (projection of the Rust list),
-  `downloadsPanel.ts` (open/closing/closed), `DownloadsButton.tsx`,
-  `DownloadsPanelHost.tsx` (portalled to body), `DownloadRow.tsx`,
-  `downloadsMenu.tsx` (the shared stream-row menu builder),
-  `DownloadsClosePrompt.tsx`, `DownloadsRelinkBridge.tsx`.
-- **Data / caching**: `metaCache.ts`, `persistentCache.ts`, `libraryNormalize.ts`, `auraSettings.ts`,
-  `settingsTransfer.ts`, `sessionRoute.ts`, `catalogHoverStore.ts`, `releaseSignalStore.ts`,
-  `historyStore.ts` (mirror of the Rust `history_store.rs` file), `streamMeta.ts`, `aiometadata.ts`, `mangaChapters.ts`. See "Caching boundaries".
-- **Addon election**: `addonElection.ts` owns "which addons can answer this, in what order":
-  Stremio's resource / type / id-prefix gates (failing open on empty cached fields) in plain
-  addon order, except meta, which is tiered (declared prefix match, then the pinned or
-  first-declared provider for ids nobody declares, then prefix-less catch-alls, then stale
-  entries). Also the fail-closed search election, the Settings overrides (`applyOverride`,
-  which `streamQueryAddons` wraps) and the provider-picker predicates.
-
-## Floating surfaces: use `.aura-float-glass`
-
-Every element that FLOATS over content uses one class, `.aura-float-glass` (`src/App.css`).
-Tooltips, context menus and submenus, the Home search bar and its recents dropdown, the three side
-pills, the notifications panel and thought bubble, the profile popover, the watch-together panel,
-the source popup, the subtitle picker, and the detail page's Back / Close / Library / Queue /
-Trailer buttons all already route through it. New floating UI should too, rather than inventing a
-sixth glass recipe. The one deliberate exception is the player's top-left stack (skip prompt, Next-Up
-card, tail pill): `.aura-stack-surface`, near-opaque black so the prompt's large type reads over any
-frame.
-
-What it is and why, because both halves are load-bearing:
-
-- A BAKED DARK GRADIENT plus blur and saturate, not blur alone. Three themes (`midnight`,
-  `contrast`, `contrast-azure`) set `--ln-blur: 0px`, so a surface built on `backdrop-filter` alone
-  is fully see-through on them. The class carries an opaque `--ln-panel-solid` override for exactly
-  those three.
-- NOT `.glass-panel-elevated`. That composites `--ln-glass-3`, which is TINTED PER THEME (the warm
-  themes push it toward orange). Over a wide element on bright key art that reads as an
-  accent-coloured fill, and accents mark things rather than filling areas. This is the tint that had
-  to be removed from the recents dropdown.
-- An inset bright top hairline plus an inset dark bottom one plus a drop shadow. The lit top edge is
-  what reads as refraction; without it the surface is just a flat tint.
-
-One trap worth knowing before you add a panel: **`ContextMenuHost` renders its
-menu INLINE at `z-[200]`, not through a portal** (only its hover SUBMENU
-portals, to `document.body`), and it sits inside `.aura-app-shell`, which is its
-own stacking context (`position: relative; z-index: 0`). A floating panel
-rendered in that same context at any z-index therefore paints OVER any
-right-click menu raised from its own rows, while that menu's submenu appears
-from nowhere. Portal the panel to `document.body` and exempt
-`[data-aura-context-menu]` from its outside-click guard (see
-`DownloadsPanelHost.tsx`).
-
-Two practical notes. The class sets `background`, `border` and `box-shadow` in one shorthand, so
-drop any `bg-*` / `border-*` / `shadow-*` utility you are replacing rather than leaving it to fight
-the class (it wins today only because it is declared later in the sheet). And it is a plain class,
-so it composes with layout utilities normally: `className="aura-float-glass fixed z-[200] rounded-xl"`.
+- **Floating surfaces use `.aura-float-glass`** (`src/App.css` GLASS SYSTEM): menus, popovers, panels,
+  dialogs; `+ .aura-glass-control` for floating controls, `+ .aura-glass-tip` for tooltips / toasts;
+  `.aura-glass-flat` / `.aura-glass-field` for in-page controls; `.aura-glass-player` (material only, no
+  backdrop: the rail's A face at a denser 0.86 tint, `src/styles/glass-player.css`) for ANYTHING over
+  the mpv video. Two materials, Frosted (shown as "Matte", formerly "Translucent"; kept by
+  installs from before the choice) and Liquid (shown as "Clear", formerly "Glass"; default for new installs; never show "Frosted"), picked
+  under Settings > Theme > "Material style" with a "Cursor glow" toggle (and, under it, Edge highlights / Surface glow / Glow size: `glassGlowTune`, portable and synced, default 125% / 25% / 300 px with a `rev` migration from the old 100% / 100%) (`<html data-glass>`,
+  `src/glassStyle.ts`; refraction filters `src/liquidGlass.ts`, cursor light `src/glassGlint.ts` + the `aura-rim` paint worklet `public/aura-glass-rim.js` (a crisp cool glint on the rim point nearest the pointer; every ring one 1.5 px rrect stroke so corner arcs light): every VISIBLE surface within 300 px lights while the pointer is over the window (performance rules, round 12: never light what is out of sight, hold during a user scroll, a light frame skipped when under 4.5 ms after the last (every other frame at 240 Hz), sheets lit through an overlay layer, only the bezel lit on a Continue Watching card; frontend-ui.md "The cursor light"), rim-only surfaces opt in with `data-glass-light="rim"`, text with `data-glass-light="text"` (every page title; the Home row titles also take the hero bleed's colour through `src/bleedTint.ts`; no title shimmer since round 11), and one that sets its own `background` puts `var(--lg-rim-layer)` FIRST in it, or its ring is lost). Not `.glass-panel-elevated` (tinted per theme). Drop any `bg-*` / `border-*` /
+  `shadow-*` / `ring-*` utility it replaces and set the `--lg-*` hooks instead; a dialog's dim + blur is
+  a SIBLING of the card, never its wrapper. The player's top-left stack (skip prompt, Next-Up card)
+  is `.aura-glass-player.aura-stack-surface` (the player face at a denser 0.9 tint); over the video
+  every text clears 4.5:1 on a white frame, so new player text sits on a player surface, never on the
+  bare scrim. The ONE exception (user's call, 2026-11-22) is the title / SxxEyy block beside the
+  icon-only back button (the old "Exit playback" pill, still `.aura-glass-player`): plain text on the
+  top scrim + corner shade with a dense tight shadow (`.aura-player-title`, glass-player.css; measured
+  numbers in frontend-ui.md). Lists and rows on a page are content (`.aura-content-group` /
+  `.aura-content-row`), never glass. Catalog cards are content too: a rim-only bezel, `.aura-frost`
+  badges on the art, never a backdrop pass on the card itself. An in-page section or card ON a page
+  (Settings sections and TOC, empty / error states, Calendar cells) is a SHEET, `sheet()` from
+  `src/glassSheet.ts` (`styles/glass-pages.css`): the A face with NO backdrop pass; never `.glass-panel`.
+  The Detail page's two panels are menu-tier `.aura-float-glass` sheets and its episode and stream
+  lists are content rows under one sliding droplet (`styles/glass-detail.css`); a list holding a
+  droplet is `relative`, so landing code measures rows from rects, never `offsetTop`. Text on glass
+  is white 0.55 or brighter (sheets and the Detail panels floor `text-white/30` to `/50` in CSS).
+  Page titles (`.aura-row-title`) are a static near-white fill (no shimmer) lit by the cursor
+  (`data-glass-light="text"`); only Home's take the bleed colour. User-visible copy says
+  "Watch Party", never "Watch Together" (code identifiers keep `watchTogether`).
+  Every on/off switch is `ToggleSwitch` and every segmented control `SegmentedControl`
+  (`src/settingsControls.tsx`), over the video too: never hand-roll `.aura-glass-toggle` or
+  `.aura-glass-seg` markup: rim-lit tracks (`data-glass-light="rim"`), a raised thumb on
+  `--lg-springy`, a radiogroup with arrow keys. A switch drawn inside a row or pill that carries
+  `role="switch"` is `<ToggleSwitch decorative size="sm|xs" />` (aria-hidden; the owner's focus
+  rings the switch).
+  Navigation is ONE floating glass rail (`.aura-rail`, `NavSidebar.tsx`, Direction A): Notifications
+  (the very top), User Panel, Watch Party and the nav are rows on it under ONE hover droplet that
+  slides across every hairline (the old `SidePill` pills are gone); popups
+  opened from its rows portal beside it through `RailPopup`, never inside it (its backdrop-filter
+  would contain and blur them). Notifications are a side sheet and an arrival bubble that both grow
+  out of the Notifications row (`styles/glass-notify.css`): the sheet is DOCKED to the rail's height,
+  both sit flush with its top and grow downward, arrivals MERGE into one bubble (count + bump), and nothing on that
+  row loops. Small accent marks on glass (dots, badges) use `--ln-accent-mark`, never the raw accent
+  (a dark custom accent vanished).
+  `ContextMenuHost` renders INLINE at `z-[200]` inside `.aura-app-shell`'s stacking context, so a new
+  floating panel must be portalled to `document.body` and exempt `[data-aura-context-menu]` from its
+  outside-click guard (see `DownloadsPanelHost.tsx`). Why: `.claude/rules/frontend-ui.md`.
 
 ## Tailwind theme-scale gotchas (silent no-op classes)
 
@@ -869,495 +422,60 @@ the UI:
    new off-scale opacity, ADD it there (or use an arbitrary `/[0.07]`), then rebuild and confirm it
    emitted by grepping `dist/assets/index-*.css`.
 
-## MPV stability landmines (DO NOT re-introduce)
+## Windowing: fullscreen, minimize, tray
 
-These are mistakes with specific, hard-to-diagnose symptoms.
+Full measurements and the refuted experiments: `.claude/rules/windowing.md` (read it before
+investigating anything about restore animation or latency; do not re-run the refuted A/B tests).
 
-1. **Property writes go through a dedicated set-property path, never `command("set_property", [name, value])`.**
-   The command form silently no-ops on this libmpv build ("volume slider snaps back" / "speed does
-   not change"). In the engine that means submitting `EngineCommand::SetProperty{...}` (a typed
-   `mpv_set_property`), not `Command(vec!["set_property", ...])`.
-2. **Never enable `audio-exclusive=yes` or `audio-spdif=...` by default.** Locks the WASAPI device
-   system-wide; other media apps cannot open it until reboot if Aura crashes. (They may return as
-   explicit Settings opt-ins.)
-3. **Do not poll `get_property` during libmpv state transitions.** Three faces of one race:
-   (a) before `duration > 0` libmpv is still inside its loadfile critical section; gate polling on
-   `playbackReady` / `duration > 0`. (b) During a seek (e.g. an AniSkip Lua `seek` clearing an
-   OP/ED) a concurrent `get_property` poll lands in libmpv's seek critical section and crashes with a
-   `-1` dispatch-table deref. (c) A single `get_tracks` fans out to ~7 `get_property` calls; a 500 ms
-   `setInterval` of those was the dominant AniSkip-skip crash for several builds. Track reads are now
-   a one-shot after `duration > 0` + 1.5 s grace, refreshed only on `aura:tracks-refresh` window
-   events fired by track-mutating actions (`set_audio_track`, `set_subtitle_track`,
-   `add_subtitle_to_mpv`). The old `sub-visibility` poll was removed for the same reason; both
-   deletions are required. The same rule applies to `chapter-list` reads in
-   `App.tsx::mergeChapterSkipWindows`: the 600 ms x 10 polling MUST use `string` format only; `node`
-   format hits the same dispatch-table fault as `track-list/node`.
-4. **Do not extend `observed_properties` casually.** On this libmpv build, requesting
-   `track-list (node)`, `aid (string)`, `sid (string)`, `core-idle (flag)`, or
-   `paused-for-cache (flag)` breaks the ENTIRE event channel: no property events fire at all. Working
-   set: `pause`, `time-pos`, `duration`, `volume`, `speed`, `frame-drop-count`,
-   `decoder-frame-drop-count`. Everything else is polled.
-5. **Do not reapply Mica on every pause.** The DWM backdrop ends up over the MPV child surface; looks
-   like "MPV renders behind everything".
-6. **Do not unmount `<TitleBar>` during windowed playback.** It stays visible (with the `opaque`
-   prop) in windowed; only unmount in true OS fullscreen. PlayerOverlay's top action bar must offset
-   36 px in windowed mode to avoid overlapping it.
-7. **Do not use `data-tauri-drag-region` for the title bar, and do not start the drag on
-   `pointerdown`.** `data-tauri-drag-region` leaves the cursor stuck on simple clicks. Starting the
-   drag (either `startDragging()` OR the custom capture) on `pointerdown` enters the OS modal
-   `SC_MOVE` loop / captures the pointer immediately and **swallows the second click of a
-   double-click**, silently breaking double-click-to-maximize. So `TitleBar.tsx` only ARMS on
-   `onPointerDown` and **defers the real drag to the first `pointermove` past a 4px threshold** - a
-   plain click / double-click then never starts a drag and reaches the webview as ordinary
-   click / dblclick (native `onDoubleClick` -> `toggleMaximize`, no synthesis needed). Past that
-   threshold the path forks by OS: Windows 11 (and any non-Windows / maximized window) calls
-   `getCurrentWindow().startDragging()` (native caption drag, keeps Aero Snap); **Windows 10 uses a
-   custom coalesced pointer-drag** (`setPointerCapture` + one `setPosition` per rAF) because the
-   native modal loop recomposites the transparent WebView2 + mpv d3d11 child on every move step and
-   stalls on Win10's older DWM + weak GPUs (window crawls behind a captured cursor). The gate is the
-   `is_windows_10` command (`win32::is_windows_10`, `RtlGetVersion` build < 22000, the WebView2 UA
-   can't tell Win10 from Win11). Do NOT move drag initiation back to `pointerdown` (re-breaks
-   double-click) and do NOT collapse the Win10 custom path back to `startDragging` (re-introduces the
-   Win10 lag).
-8. **Do not set `glsl-shaders` via `set_property`.** Use `change-list glsl-shaders set "<forward-slash-path>"`
-   and strip `\\?\` UNC prefixes from the path first. Same class of bug applies to other option-list
-   properties.
-9. **Tear mpv down synchronously in `CloseRequested`.** `tauri::async_runtime::spawn_blocking` returns
-   immediately; the process can exit before WASAPI is released. The engine shutdown joins the engine
-   thread, whose teardown does the right sequence (mute -> stop -> `mpv_terminate_destroy`).
-10. **Do not reparent the MPV child to top-level.** Tried (`SetParent(NULL)` + `WS_POPUP`) for "true
-    exclusive fullscreen"; libmpv's context did not survive the reparent and video disappeared. Stick
-    with the child-window architecture; `win32::enter_native_fullscreen` resizes the PARENT to the
-    monitor rect with `WS_POPUP` + monitor `rcMonitor` instead.
-11. **Never hand mpv a remote URL for `sub-add`, and never let anything slow run on the engine
-    thread.** The engine thread executes every mpv FFI call INLINE inside its command drain, and
-    that drain runs to completion BEFORE `drain_mpv_events`. It is therefore the sole producer of
-    `playback-update` and `cache-state`. Anything that blocks it freezes the clock, the scrubber,
-    the pause icon, the buffer readout and the geometry pump, while mpv itself keeps decoding on its
-    own threads, so the picture keeps moving and only the UI looks dead. `sub-add <https url>` makes
-    libmpv do the HTTPS GET synchronously inside `mpv_command`: measured 1.4-3.2 s per subtitle, and
-    a burst of picks blocked the pump for 9.07 s continuously. `subtitles.rs` now downloads to
-    `app_data_dir()/subtitles` first and passes mpv a LOCAL path. Two corollaries: keep
-    `submit_get_property`'s `recv_timeout` (a bare `recv()` parks the caller forever behind a wedged
-    command), and remember that a stalled pump silently disarms App.tsx's stream-lost watchdog
-    escape hatches -- `paused` and `lastBufferProgressAtRef` are fed by the SAME pump, so a long
-    block can raise a "stream connection lost" modal on a perfectly healthy stream.
+- Fullscreen goes through `win32::enter_native_fullscreen` (monitor `rcMonitor`, `WS_POPUP`); Tauri's
+  `setFullscreen` stops at the work area. Windowed mode clips the mpv child to keep it off a hardware
+  overlay plane (true black on OLED).
+- 1 ms timer resolution is scoped to a loaded file (`win32::set_high_timer_resolution`); never re-pin
+  `timeBeginPeriod(1)` at startup.
+- Off-focus frame drops are the NVIDIA "Background Application Max Frame Rate" setting, not Aura.
+- **Every path that shows the main window calls `window_logic::unpark_main_webview` BEFORE `show()` /
+  `unminimize()`**, and every park / unpark / re-park runs on the main thread. A restore site on another
+  thread (the OAuth landing in `oauth_callback.rs` is a tokio handler) does the whole unpark + `show()`
+  + `unminimize()` sequence in ONE `run_on_main_thread` closure, or a close-to-tray can park in between
+  and leave a blank window with no tray icon. Restore order is `show()` THEN `unminimize()`.
+- Close-to-tray parks the webview (WebView2 `IsVisible = false`: 48.5% of a core in the tray unparked,
+  0.2% parked) only when `window_logic::park_blocker()` returns None (a loaded file, a watch-together
+  room, casting, a History scrobble run block it). A parked page's timers are clamped, so a new feature
+  that must keep running while the window is in the tray adds itself to `park_blocker`, and any path
+  that clears a blocker calls `window_logic::repark_if_tray_hidden`.
+- **Every webview is built in Rust with `lib.rs::webview_browser_args()`**: every webview sharing the
+  main user data folder needs the SAME WebView2 arguments (WebView2 refuses a second environment with
+  different options, so the window silently fails to open while Hardware acceleration is off). Never use
+  the JS `new Webview()` / `new WebviewWindow()` API; popups go through `open_oauth_popup_webview`. wry
+  ignores `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS`.
+- **A thread that owns a child of the main window never sleeps without a message wait**
+  (`MsgWaitForMultipleObjects`); the mpv pump sleeping in `park_timeout` is what broke the restore
+  animation. The main webview's auto-resize is off (`fit_main_webview` skips the minimize resize) and
+  `install_iconic_frame_guard` handles `WM_NCCALCSIZE` while iconic.
 
-## Win32 fullscreen reality check
+## Caching and stored data
 
-`win32::enter_native_fullscreen` is the canonical fullscreen path: Tauri's `setFullscreen` lands at
-the work-area rect (taskbar showing through), not the full monitor. The Win32 path resolves the
-monitor via `MonitorFromWindow`, `SetWindowPos` to its full `rcMonitor` (covers the taskbar area),
-`SWP_FRAMECHANGED` + bring-to-front. Companion helpers in `win32.rs`:
+Every cache is bounded (size cap AND eviction or TTL). The full list of caches, keys, TTLs and caps,
+and the long rules below, are in `.claude/rules/caching.md`: read it before touching any cache, sync.ts,
+backups, history or the Stremio collection write. Rules that cause data loss when broken:
 
-- `resize_mpv_child_to_parent` dynamically loads user32, enumerates children, skips WebView2 hosts by
-  class name (`Chrome_WidgetWin_*`, `Microsoft.UI.Content.*`, `Intermediate D3D Window`, `tauri_*`,
-  `wry_*`), and resizes the remaining (mpv VO) child to the parent client area minus the title-bar
-  inset.
-- Windowed mode applies an MPO "poison" clip to the mpv child so it is disqualified from a hardware
-  overlay plane and DWM-composites instead, which restores true black on OLED in windowed playback.
-- `parent_display_refresh_hz` reads the monitor's real refresh from `DEVMODEW.dmDisplayFrequency`;
-  `set_motion_interpolation` uses it to pin mpv's `display-fps-override` (an embedded `--wid` mpv
-  cannot estimate refresh on its own).
-- `apply_playback_perf_opts` (and `pin_process_scheduling`) clear Win11 EcoQoS execution-speed
-  throttling + raise the process priority class. They NO LONGER pin `timeBeginPeriod(1)` for the
-  process lifetime: 1 ms timer resolution is now demand-scoped to active playback via
-  `win32::set_high_timer_resolution(bool)`, which the engine pump asserts while a file is loaded and
-  releases when idle (so a menu-bound / tray Aura returns to the OS-default ~15 ms timer and idles
-  deeper). It is ref-count-safe (one outstanding claim); do NOT re-pin `timeBeginPeriod(1)` at startup.
-
-Note: the historical "off-focus frame drops" (worse with motion interpolation on) were NOT a DWM or
-render-path limitation. They were root-caused to the NVIDIA Control Panel "Background Application Max
-Frame Rate" setting misclassifying `aura.exe` as a background app and capping its frame rate when it
-loses foreground. The fix is a per-app NVIDIA profile (or turning that global setting off); it is a
-per-machine driver config, not an Aura bug, and needs no render rewrite. The opt-outs above and the
-`display-fps-override` pin are sound but were never the fix for those drops.
-
-The taskbar bleed-through on an "always show taskbar" setting is a Windows compositor heuristic limit:
-auto-hide only triggers for users with "Automatically hide the taskbar" enabled. The `Shell_TrayWnd`
-`SW_HIDE` workaround was tried and reverted (broke secondary-monitor tray icons). True DXGI exclusive
-fullscreen would require a render rewrite and is deferred.
-
-## Restore from minimize / tray: the animation runs, the content is just late
-
-**Update, found later: the "tiny box flies to the corner" restore WAS an Aura bug, in three parts,
-all fixed and runtime-confirmed (taskbar and tray both animate the real window now).**
-1. The page shrank while minimized. The `unstable` Tauri feature (needed for `add_child`) builds the
-   main webview as a CHILD webview, so wry attaches no parent resize handler and Tauri's auto-resize
-   is the only thing sizing the page; it ran on the minimize `Resized` too, and a minimized
-   borderless window reports its iconic 160x28 rect as client area (measured: `WRY_WEBVIEW`
-   3440x1392 -> 160x28 inside the `SIZE_MINIMIZED` `WM_SIZE`). Setup turns auto-resize off and
-   `window_logic::fit_main_webview` sizes the page on every resize EXCEPT a minimize.
-2. A minimized window had a 160x28 CLIENT area, because tao's borderless `WM_NCCALCSIZE` also
-   answers while iconic. `win32::install_iconic_frame_guard` hands `WM_NCCALCSIZE` to
-   `DefWindowProc` while `IsIconic`, so a minimized Aura has no client area like any window.
-3. THE ONE THAT MADE THE ANIMATION WORK: the restore stalled on the mpv engine thread. Its host
-   window is a child of the main window owned by that thread, and a restore/show SENDS the child
-   synchronous messages. The pump slept in `park_timeout` (150 ms `HIDDEN_TICK`), which does not
-   wake for messages, so each send waited up to a tick; the OS animation then started with no
-   restored frame and flew the minimized caption, and a tray restore took about a second. The pump
-   now waits in `MsgWaitForMultipleObjects(QS_ALLINPUT)` and `wake_and_resync` posts `WM_NULL`.
-   Cross-process `SW_RESTORE` dropped to 13-25 ms at both 1 s and 20 s dwell (was 60-125 ms).
-   NEVER make a thread that owns a child of the main window sleep without a message wait.
-The engine pump also holds its geometry while the parent `IsIconic`. The findings below were
-measured with all three bugs present; the latency and "no hotspot" conclusions are superseded.
-
-**Tray webview parking: every path that shows the main window must call
-`window_logic::unpark_main_webview` BEFORE `show()` / `unminimize()`.** Hiding the window to the
-tray hides only the native window, and WebView2 does not infer visibility from its host, so the
-page kept producing frames for every running animation at the display refresh: measured in the
-tray on Home, 48.5% of one core (renderer 45%); after parking, 0.2%. The close-to-tray branch sets
-the controller's `IsVisible = false` through `with_webview` (NOT wry's `set_visible`, which also
-`SW_HIDE`s the WRY_WEBVIEW container and would disturb the window tree the restore animation
-relies on). It parks only when nothing in the page needs live timers (a hidden page's timers are
-clamped): no file loaded (`set_media_loaded`, from `load_video` / `stop_video`), not in a
-watch-together room (`set_party_keep_alive`'s `in_room`), not casting, no History scrobble run.
-The restore sites today: `tray::show_main_window`, the single-instance handler in `lib.rs`, and
-the OAuth landing in `oauth_callback.rs`. A new one that skips the unpark restores a window with a
-page Chromium still thinks is hidden. Every park, unpark and re-park runs on the MAIN thread (the
-OAuth landing is a tokio handler, so it does its whole unpark-show sequence in one
-`run_on_main_thread` closure; otherwise a close-to-tray could park between its unpark and its
-show and leave a blank window with no tray icon). A blocker that clears while the window is in
-the tray (`stop_video`, leaving a room, the bulk scrobble run ending) calls
-`repark_if_tray_hidden`, which parks then; `TRAY_HIDDEN` is cleared by the unpark, so a restore
-always wins. Runtime-checked: each of those three re-parks drops the tray to 0.0-0.2% of a core.
-
-Symptom, and it is real: restoring from the taskbar button or the tray icon looks sudden and
-jarring, with no visible zoom. It is NOT a missing animation. Frame capture through a real restore:
-`SW_RESTORE` at 121 ms, nothing on screen at 193 and 222 ms, an empty near-black full-screen
-rectangle at 258 and 296 ms, the OS animation ends around 330 ms, and the complete UI appears in one
-step at 357 ms. The user sees the terminal pop.
-
-Three deliberate choices compound, and not one of them is a bug. (1) The top-level window owns ZERO
-opaque pixels: transparency is what lets the mpv child show through (blur-behind per-pixel alpha,
-NULL class brush, and the mpv host wndproc does BeginPaint/EndPaint with no GDI work), so DWM has a
-live surface to scale but nothing in it until WebView2 paints. (2) WebView2's first post-restore
-frame is late. (3) Every theme's `--ln-bg` is `transparent`, a 45%-alpha near-black, or a near-black
-/ `#000000` (`src/App.css`; max channel across the whole palette is `0x14`) against a dark desktop,
-so even the fallback fill is invisible. Firefox is the control that isolates it: Firefox shows a
-visible mid-grey rectangle at 213 ms with no page content, i.e. the SAME late content, just opaque
-and high-contrast enough that a human reads it as an animation.
-
-Refuted by controlled A/B, not by argument. DO NOT re-run these: transparency does not disable the
-animation (a transparent window WITH content animates identically); DWM animates the live surface,
-not a stale pre-minimize snapshot; Mica is not a lever; supplying an iconic bitmap
-(`DWMWA_HAS_ICONIC_BITMAP` + `DWMWA_FORCE_ICONIC_REPRESENTATION`) does nothing because DWM already
-holds a pixel-perfect representation and never sent the messages (the tray-hidden taskbar thumbnail
-shows Aura's full live UI, which is the same fact from the UI side); and a black GDI `PrintWindow`
-at flags=0 proves nothing, since every Chromium / Electron app on the machine prints black too and
-still animates. The environment is stock: `MinAnimate=1`, `DWMWA_TRANSITIONS_FORCEDISABLED=0`,
-`GetWindowRgn` 0, `GWL_STYLE=0x15CF0000` (WS_CAPTION present, no WS_POPUP - tao keeps WS_CAPTION on
-undecorated top-level windows and goes borderless via `WM_NCCALCSIZE`, so this is not the Electron
-frameless case), `GWL_EXSTYLE=0x00040110` (no LAYERED, no NOREDIRECTIONBITMAP).
-
-Restore LATENCY is a separate finding, and DWELL is its dominant variable. A cross-process
-`ShowWindow(SW_RESTORE)` is an inter-thread send, so its block time measures how late the window is.
-How long the window sat minimized dominates that: interleaved 1 s vs 45 s dwells inside one run give
-Aura **60.8 -> 125.0 ms (+64)**, Firefox 38.5 -> 47.7 (+9), opaque native (Telegram) 5.3 -> 19.1 (+14).
-Every app degrades after a long minimize (OS working-set trimming, DWM releasing resources for a
-long-hidden window); what is Aura-specific is the SIZE. This is most likely what "it looks jarring"
-actually is: a recently-used Aura restores in ~60 ms and looks fine, one that sat in the tray for
-minutes takes ~125 ms and lands its content after the animation ended. MEASURE WITHIN ONE RUN ONLY -
-absolute figures on this machine drift badly between runs (Firefox measured 61.6 ms in one session
-and 38.5 ms an hour later, unchanged), so cross-run comparisons are worthless and an earlier one here
-was withdrawn.
-
-`src-tauri/src/win_probe.rs` (dev-only wndproc subclass, armed with `AURA_WIN_PROBE=1 pnpm tauri dev`,
-logs under the `wintiming` label; the Tauri-side split lives in the `Resized` arm of
-`window_logic.rs`) shows where the time goes: Aura's own window-event callback costs **0.0-0.8 ms**,
-the whole wndproc chain is busy 38-41 ms over ~14 messages (dominated by the top-level `WM_PAINT` at
-25.7-28.7 ms), and the remaining ~60 ms is gaps between messages in win32k / DWM with no Aura frame on
-the stack. There is NO hotspot to delete. Two specific dead ends: the `save_window_state` synchronous
-disk write in the `Resized` arm fired on one restore in six and cost 0.8 ms, and pinning the WebView2
-runtime back to 151.0.4129.107 (from 152.0.4191.53) with `WEBVIEW2_BROWSER_EXECUTABLE_FOLDER` changed
-nothing (86.6 / 131.5 ms against 88.9 / 131.5 at the two dwells).
-
-Two changes shipped alongside this investigation and NEITHER fixes the animation, so do not describe
-them that way. `tray.rs::show_main_window` minimizes before hiding to tray and restores with `show()`
-THEN `unminimize()` - the order is load-bearing, because tao applies its whole window-flag diff in one
-pass ending in an unconditional `SW_HIDE` when the new flags lack VISIBLE, so `unminimize()` first
-would `SW_RESTORE` and then immediately re-hide. And `mpv::engine::wake_and_resync` unparks the
-geometry pump on restore, because the pump is otherwise asleep on a 150 ms `HIDDEN_TICK` and its
-geometry pass is edge-triggered on a CHANGED rect, so a same-size restore issued no `SetWindowPos` at
-all.
-
-Full write-up, including the remedies that were considered and rejected:
-`docs/research/2026-09-03-restore-animation.md`.
-
-## Caching boundaries
-
-Bound every cache (see Performance & memory).
-
-- **Library**: localStorage warm-start in `App.loadLibrary` (keyed by `auth_key.slice(0, 12)`), plus
-  a 5-minute focus-refetch debounce, plus a 5-minute `recentlyCleared` overlay that re-zeroes
-  `state.timeOffset` for ids cleared in the last window (Stremio's `datastoreGet` is eventually
-  consistent on `_mtime`, so a fresh fetch within the window can return stale non-zero state).
-- **metaCache.ts** (`aura:meta-cache:v2`): TTL 4 h series/anime, 7 d movies, 90 s nulls; cap ~800
-  entries (~1.5 MB); 500 ms write debounce; null entries not persisted. A meta whose videos embed
-  their own streams lives 3 min (`TTL_EMBEDDED_STREAMS_MS`) and is never persisted.
-- **persistentCache.ts**: generic TTL + size-capped store (AniSkip uses it at 3 days / 600 entries,
-  dropping the oldest 25% on overflow; negative misses are never cached).
-- **IntroDB** (`aura:introdb-cache:v1`, `src/introdb.ts`): positive answers only, 3 days / 600
-  entries, keyed `${imdb}:${season}:${episode}` per numbering asked. Rust (`introdb.rs`) keeps an
-  in-memory map capped at 400 (oldest quarter evicted): hits 3 days, "no data" 30 minutes,
-  network / 429 / 5xx never cached. A successful submit drops that key on both sides. Segments are
-  cached WITHOUT the per-file duration check; `fitCrowdToDuration` (`src/skipWindows.ts`) applies it to every crowd source inside
-  `mergeChapterSkipWindows` once the duration is known (and again in `finishWithChapters` when mpv
-  reports the duration only after the chapter poll gave up: the crowd rows are re-fitted and the
-  chapter windows re-derived against it).
-- **Skip detection** (Rust, under `app_data_dir()`, atomic writes, oldest first, one process lock):
-  `animethemes-v1.json` (MAL -> theme list; hits 7 d, misses 1 d, network errors never cached, cap
-  300), `theme-fp/<audio_id>.bin` (fingerprint + valid mask + length + audible lead / trail, never
-  the audio; 90 d, cap 400) and `skipdetect-v1.json` (the final per-file result keyed by Stremio id,
-  release identity and duration to 0.1 s, a duration within 0.03 s of a bucket boundary also
-  reading the ONE adjacent bucket, accepted only when that entry was keyed within the same 0.03 s
-  (`cache::neighbour_duration`, `Snapshot::keyed_duration`); 30 d, an abstention 24 h; a Layer 3 window standing in for
-  a theme the cour's list does not have lives no longer than that list answer: 24 h after a list miss,
-  7 d when the list answered without a theme of that kind; cap 2000). An entry records the kinds and MAL id it was computed
-  for and answers only a request it covers. The result cache is the only fix for a slow link. No in-memory mirror of results, so Settings > Storage's "Skip detection cache"
-  clear cannot be undone by a stale copy; the one in-memory state is the pre-scan's `PRESCANNED`
-  session record (what was pre-scanned, never results), which the clear empties through
-  `forget_prescanned`; any new path that deletes `skipdetect-v1.json` must call it too. A result
-  write from a job that started before a clear is refused (`cache::put_result_since`, the clear
-  generation checked under the cache lock), so a write already in flight cannot refill it. Excluded from backups by construction.
-- **Episodes available early** (`aura:available-early:v1`, `src/availableEarly.ts`, cap 200, device-local):
-  an episode whose stream fetch (detail page, Next-Up pre-resolve) returned streams while its listed
-  `released` was still ahead, by at most 4 days. `releasedMs` (the date every aired / next-to-air read
-  goes through: `isVideoAired`, `nextAiringEpisode`, `airingInfo`, Next-Up, the CW countdown) then
-  counts it aired from that moment; an entry is dropped once its listed date passes. Why: AIOMetadata
-  dated TYBW S4E10 1.5 days after Cinemeta, and CW counted down to an episode the user could play.
-  Read new aired checks through `releasedMs`, never a bare `Date.parse(v.released)`.
-  The airing check (`src/airingCheck.ts` pass, `src/useAiringStreamCheck.ts` hook in App.tsx) feeds it
-  without the user opening anything: every 10 min while visible, never while playing or hidden, a library
-  series whose next main-run episode is LISTED within 24 h gets one `fetch_streams` for it, at most once
-  an hour per episode, 6 queries and 10 meta fetches per pass (a show without a cached detail is fetched
-  only when it is in Continue Watching or the cloud's next_aired is in the window). Each query is a full
-  stream-addon fan-out (debrid checks included): keep those caps. DevConsole `[airing-check]`.
-  During playback (a binge, when the check is paused) `resolveNextEpisode` covers it: caught up, it probes
-  the next episode listed within 24 h (`probeListedNext`, at most every 5 min per episode, so the early
-  pre-scan lookup, the 50 % retry and the end screen each get one) and hands the stream it picked on, so a
-  hit costs one fan-out, not two. The end screen never waits on it: it shows its caught-up card from the
-  cached meta (`{ probe: false }`), then runs `probeNextEpisode` and swaps in the Next-Up card on a hit.
-  The cloud's `next_aired` ids follow the cloud's own source's numbering, not the local meta addon's, so "is the cloud's next episode already out" goes through `cloudNextIsOut`
-  (by id, else by date against a recorded local episode), never a bare `availableEarlyAt(sig.id)`.
-- **Calendar meta**: 24-hour module-level `Map` keyed by `${addonUrl}::${type}::${id}`.
-- **Movie release dates** (`src-tauri/src/release_dates.rs`, `src/releaseDates.ts`, `src/movieRelease.ts`): the
-  frontend caches per IMDb id (cap 500): 5 min for an all-null answer or one whose TMDB lookup FAILED (`tmdb:
-  "failed"`), 6 h otherwise. Rust has no cache. The source order is TMDB's per-country release_dates for the
-  Windows "Country or region" (`GetUserGeoID` + `GetGeoInfoW`, else the locale's country, else US; NEVER
-  `GetUserDefaultGeoName`, a Win10 1709+ load-time import that stops aura.exe starting on older Win10), then US, then the
-  earliest country, then MDBList, then the +45-day estimate. MDBList is the LAST source on purpose: it gave Nolan's
-  The Odyssey a digital date of 2026-11-07 against TMDB's and Universal's 2026-11-17, and Aura then showed the film
-  as already digital. Never let a failed TMDB answer be cached long: it is answered from MDBList alone. The film is
-  found by `/find` on the IMDb id only, never the addon meta's `tmdb_id` (it can be a SERIES id). Re-release rows
-  and rows over 730 days after the first of their kind are not the release; another country's digital date before
-  the user's OWN theatrical run is dropped. Dates are local calendar days (local midnight), not UTC instants. Every
-  date shows its basis: Confirmed (a TMDB row), Reported (MDBList or the addon), Estimate. "In Theaters" lasts
-  until a known digital date (365 days at most), else 120 days; no source publishes a run's end, and its hover
-  says so. Devlog label `[release-dates]`.
-- **Movies out early** (`aura:movie-early:v1`, `src/movieEarly.ts`, cap 100, device-local): a film whose copies are
-  out before its official digital date (Nolan's The Odyssey leaked 2026-11-07, ten days before its US digital day).
-  A leak never moves the official date; the Digital countdown shows "Out early" beside it. The check is the DETAIL
-  PAGE's own movie stream fetch (user's call: no background fan-out); the Digital countdown says "Checking for early
-  copies" while it runs, and the hover panel only reads what it left. Evidence, strongest first: AIOStreams' "Early
-  Release" notice (`streamData.code: "earlyRelease"` + `data`) or a stream it flagged (`streamData.earlyRelease =
-  { source, evidence }`, Rust `StreamEntry.early_release`) is Verified with source leakDetected / leakRecord or a
-  proof file (`evidence: true`, a runtime match), else (source "bypass") Unverified; without AIOStreams, home-release
-  rows (WEB-DL, BluRay, REMUX, ...) are Unverified (a same-name film's files or another country's real release look
-  the same, so the bare scene tag WEB counts), theater rows (CAM, TS, TC) and unlabelled rows are notes. Only an
-  AIOStreams-backed record (Verified, Unverified-by-bypass) holds against a weaker answer; a guessed one is replaced
-  by the next real answer. An answer missing an addon that was asked (`StreamMetadata.failed_addons`: send error,
-  non-2xx, bad JSON, a panic; such failures leave no message) records only an early release. The check runs once the
-  dates have landed, against the Digital countdown day; on the +45-day Estimate (no digital date announced) the record
-  carries `estimate` and a find reads "Streams available", never "Out early" (nothing official to be early against).
-  Readers show a record only for the same day AND basis it was checked against (`earlyRecordFor`), and a hold applies
-  only within one. The hover panel shows a quiet "Not checked for early copies yet" ("... for streams yet" on the Estimate) line under the
-  Digital countdown for a film it could show a check for and has none; each countdown has its own line there and on the
-  detail page (under the facts row), so a countdown never shares a wrapped line with another. The stream-list note describes the list shown, not the stored record. The dedup in
-  `fetch_streams` carries a dropped duplicate's `early_release` onto the kept row. An early release lasts until the
-  official day (at most 120 days); anything else 6 h. AIOStreams
-  sends `streamData` only with PROVIDE_STREAM_DATA on (or to an "AIO" User-Agent). Notices are matched by
-  `StreamMessage.code` ("digitalReleaseFilter", "earlyRelease"), never by wording, except an older AIOStreams with
-  no code (`isDigitalReleaseFilterNotice`). A pseudo-stream with a code and no address is a notice whatever its
-  `type`; one with an address stays a stream.
-- **sessionRoute.ts** (`sessionStorage`): active nav tab + open detail target so Ctrl+R/F5 restores
-  the page you were on; cleared on app close (cold start opens Home).
-- **Notifications** (`aura:notifications:v1`): ring buffer capped at 200 entries.
-- **Watch history** (`history_store.rs` + `src/historyStore.ts`): user data, NOT a cache, and
-  deliberately UNCAPPED. One gzip file per scope, `app_data_dir()/history/<scope>.history.gz`:
-  a versioned compact form (every string interned once, field names and kinds stored once per
-  row shape, an ISO timestamp kept as a ms delta ONLY when it round-trips byte-exactly through
-  JS `toISOString`, else as a string, since `played_at` is half of the removal key), measured
-  25.8 KB for the real 650-row history (380 KB as JSON), 229 KB at 10k rows, 2.2 MB at 100k.
-  Rust owns the file and holds ONE scope resident; writes are coalesced (1.5 s) and atomic, with
-  a synchronous flush on exit (`flush_blocking`, CloseRequested) and before an updater install.
-  "Durable" means LANDED, not snapshotted: the exit flush, a scope swap and the migration go
-  through `make_durable` (holds WRITES, so it waits out a write in flight, then compares the
-  resident generation with the one on disk), a swap whose old scope cannot be written is
-  REFUSED rather than dropping its rows, and after `flush_blocking` every call writes before
-  returning. A file that EXISTS but cannot be read (AV / backup / OneDrive holding it, an I/O
-  error) is never an empty history: the scope is resident as unreadable, nothing is written
-  for it, `load` and every op but `append` fail (the frontend retries forever, 30 s apart after
-  three quick tries, and the History view says so), and appends are kept and also written on
-  every append to a sidecar, `<scope>.history.pending.gz` (a crash or updater relaunch has no exit
-  path), merged where the scope next becomes resident and removed only by a landed write holding
-  its rows. A play whose scope swap was refused is parked in Rust (`PARKED`, cap 500) until the
-  swap or the exit flush. A file that does not decode is set aside as `.gz.bad` only if that rename
-  works (else unreadable), and the load reports `recovered`: sync.ts then pulls history with no
-  If-None-Match and nothing is pushed until a cloud merge (or a 404) lands. That latch is persisted
-  (`<scope>.history.recovering` beside the file, written before the rename, none for a guest): a
-  restart or scope swap reports it again, even once a play has written a new file, and it goes only
-  when the merged rows are on disk or the pull found no cloud copy (`cloud_absent`). A signed-in
-  scope with NO file takes the same latch at discovery, on whichever op reads first, because a
-  persisted etag vouches for a file that is gone (`latch_missing_file`). MergeCloud writes
-  synchronously when rows changed, so an etag never gets ahead of its rows. Each set-aside records
-  its time in `<scope>.history.setaside` (guests too, up to 3), and backup.rs `prune_dir` keeps the
-  newest auto snapshot older than each time, so snapshots of a near-empty history cannot roll out
-  the last good one. A history Clear PUBLISHES the empty list and takes a snapshot first
-  (`clearHistoryChecked`, which aborts without one); the Storage clears of manual-state, skip-marks
-  and notifications stay local.
-  The frontend keeps the synchronous API over an array hydrated by `load` and sends only small
-  mutations, all through ONE promise chain; while a load / carry-over / cloud merge is in flight
-  later writes are logged and replayed onto its result (do not "simplify" that away: it is what
-  keeps a play made during startup or a pull). Anything that treats the list as authoritative
-  (cloud push or merge, backups) awaits `historyReady()`; an empty pre-hydration list must never
-  be pushed. Migration: the first load sends the scope's old localStorage copy
-  (`aura:history:<scope>`), Rust unions it in, writes, reads back, and only on `verified` is the
-  key removed (idempotent, so a crash just repeats it); if that write did not verify, a scoped
-  `flush` is retried (and right after every remove / clear) and the key goes once it verifies,
-  because a key left for the next launch would union back every row removed meanwhile. Cloud
-  `history` blob: a JSON ARRAY of the newest rows in plain form (<= 500 / 256 KiB) followed by
-  ONE element `{"v":2,"enc":"gzip-b64","n":N,"data":...}` holding the rest, built and read in
-  Rust (history_store.rs "WIRE SHAPE"); legacy plain arrays and a bare envelope still read. The
-  plain head is load-bearing: v2.2.4 pushes its whole list on its first local edit and merges
-  only arrays, so a bare envelope let a fresh old install replace the cloud copy with its next
-  play alone. That needs it to take a 200, so the history etag is stored under its own field
-  (`history:v2` in `aura:sync:etags:<scope>`, read from nowhere else; a `history` there is v2.2.4's
-  and is stripped on load, never adopted), at the cost of one full pull after upgrading. A push with
-  a null If-Match overwrites unconditionally, so history sends one only when the last pull answered
-  404 (`historyCloudAbsent`): an etag-less device whose pull failed or whose merge threw holds the
-  push with the unpushed marker set, and a double 412 keeps the etag of the copy it merged, so the
-  next attempt merges again. A guest never encodes. When
-  the blob would pass the 1 MiB limit the CLOUD copy keeps the newest rows that fit (~24k of
-  real rows) and the local file keeps all (Settings > Cloud Sync says so, from
-  `aura:sync:history-trim:<scope>`, written when a push lands); a newer client that
-  pulls an old client's plain array unions it and re-publishes (sync.ts "MIXED VERSIONS"). A
-  pull merges history only into the history scope captured BEFORE its fetch, and every pull or
-  push drops what it fetched once the account changed (`accountGen`, bumped by
-  `clearSyncEtags`). Change events carry a `reason`; only `"mutation"` pushes or snapshots.
-  The envelope and the file parse through `PlainValue` (`parse_capped`), never `Value`'s own
-  `Deserialize`: tauri and axum force serde_json's `raw_value` on, which makes `Value` re-parse the
-  string under the key `$serde_json::private::RawValue`, past the budget the text was charged.
-  Backups get history from the store in Rust (`historyFromStore`, same JSON-array string under
-  `values.history`; with the file unreadable an automatic snapshot is skipped rather than roll good
-  ones out, and a user-initiated one is written without history and flagged `historyUnavailable`,
-  so restoring it leaves history untouched). A Restore reads its target first, then takes the
-  pre-restore snapshot with `protect` naming the target (still counted in the bucket's cap so its
-  own prune cannot delete it), and stops if that snapshot fails. Snapshot writes remove their tmp on
-  failure, and a prune sweeps tmp files older than an hour (younger ones may be in flight), and
-  backup bodies are now gzipped under their OWN suffix `.aura-backup.json.gz` (readers accept
-  both suffixes and both bodies): an older Aura's prune reads a gzipped body as text, finds no
-  reason and would delete manual snapshots as auto, and its suffix filter skips `.gz`. `serde_json`'s `float_roundtrip` feature is
-  on so floats survive the Rust round trip exactly; the migration's read-back depends on it.
-  `scrobbledStore.ts`'s mark cap follows the history size (floor 4500, ceiling 30k, orphans
-  evicted first).
-- **EPG** (`src/iptv/epgStore.ts`): localStorage, ~4-week retention, parsed off-thread in a worker.
-- **Story arcs**: `aura:story-arcs:v8` (24 h TTL, cap 60) holds the joined arcs per series; the TTL is
-  short deliberately because an ongoing show gains an episode weekly and a stale arc would be missing
-  it. `aura:arc-mode:v1` (cap 200) remembers the Seasons/Arcs choice per series. Rust side:
-  `arcs-cache-v1.json` (TMDB payloads, 24 h, cap 40) and `arc-art-v3.json` (Fandom art, cap 60, keyed
-  per show AND arc-name set so each grouping gets its own map; a hit lives 30 d, an empty map is a
-  cached MISS honoured for only 24 h, because it is ambiguous between "this wiki has no arc art" and
-  "Fandom was down when we asked"; so is a hit whose arc-title probe went unanswered, since that
-  falls back to the similarity match the probe replaces). A show in the curated wiki table is not
-  proof it HAS arc art.
-  Bleach was taken off the art path for that reason (it is back in the table as `chapters_only`,
-  for its episode pages): it never produced any art (no arc category, and 9 of 21 arc names
-  redirect to one generic Episodes page), and the names that do reach a real page land on event
-  pages whose lead images are episode screenshots, some of them spoilers. `arc-art-v3.json` entries
-  also carry each arc's resolved PAGE (`pages`, for manga chapter ranges); an entry written before
-  that field existed is recomputed on the first page lookup.
-- **Manga chapters**: `manga-chapters-v1.json` (Rust, one file, per-entry TTL, cap 5000, oldest
-  first): MangaUpdates series matches 7 d (misses 1 d), arc-page infobox ranges and episode pages
-  30 d (misses 1 d; an episode that aired in the last 60 days is kept only a day, because new pages
-  are created before their chapter field is filled). Frontend `mangaChapters.ts` holds at most 24
-  series in memory for the session and nothing on disk.
-- **Hero backdrop choice**: `aura:hero-backdrop:v1` (365 d TTL, cap 300) holds the backdrop URL the
-  user picked for a title's detail hero (`heroBackdrop.ts`), validated on read, and forgets one whose
-  image failed to load on two opens in a row (the count is stored with it). Device-local like
-  `aura:arc-mode:v1`: not cloud-synced, not in settings export/import. Settings > Storage clears it
-  through `clearPersistentCache` (every `PersistentCache` registers by storage key), because a bare `removeItem` under a live `PersistentCache` is written
-  back, cleared entries included, by the cache's next save.
-- **Addon manifest fields**: `AddonEntry`'s capability fields (`resources`, `types`, `id_prefixes`,
-  `stream_types`, `stream_id_prefixes`, `has_search`) are populated at install/sync time and REBUILT
-  by a manifest refresh (`refresh_addon_manifest`: the Refresh button, or the silent refresh after
-  Configure), with the same builder `add_addon` uses. The rebuild is persisted to `addons.json` for
-  guests. For a signed-in user (AddonsView passes `authKey`) the refresh also writes the manifest,
-  VERBATIM as the addon served it (never an Aura struct), into that addon's entry of the Stremio
-  collection, the snapshot the official apps and `get_synced_addons` read. The maintainer's condition
-  is "definitely accurate and not potentially harmful", so a guard in doubt refuses (harmless: the
-  rebuild then lasts the session only, and the stored snapshot wins again at the next launch). The
-  guards (`write_refreshed_manifest`, `apply_refreshed_manifest`): the collection is re-read under the
-  lock and must hold every url the addon list shows, exactly one entry must match, not `protected` and
-  at the literal url fetched, and the manifest must parse in stremio-core within 32 levels of nesting
-  and 1 MiB (`check_collection_manifest`; ONE unparseable entry locks the user's list in every
-  official app), keep the stored `id`, not declare `configurationRequired`, differ from the stored
-  one, and take nothing away (`manifest_reduction`: no resource, type, catalog, addon catalog or
-  manifest-level idPrefix dropped, no resource serving fewer types or ids, no catalog or addon
-  catalog kept by id and type that loses an extra name, gains a required extra or empties a required
-  extra's options, no manifest-level ids narrowed from every id to a list, no lower semver), with
-  both of those last compares made in stremio-core terms on BOTH sides (`stremio_core_manifest`),
-  because the official apps store entries re-serialized and AIOMetadata stamps a per-request
-  `_timestamp` into every manifest. A resource is read as stremio-core's `is_resource_supported`
-  reads it: short form takes the manifest's `types` / `idPrefixes`, full form only its own (no
-  `types` is none; null or [] ids is every id), and only the FIRST resource of a name counts. A
-  catalog's extras are read as `ManifestExtra::iter` yields them (short form: the `extraSupported`
-  names, required when `extraRequired` also names them, no options), because `is_extra_supported`
-  stops sending a request whose extra is gone or whose required extra is missing, and a required
-  extra with no options leaves `default_required_extra` nothing to send, so the Board drops the
-  catalog. The no-reduction rule exists because an addon that wraps others (AIOStreams) answers 200
-  with the same id while an upstream is down, and it declares types and ids per resource only, so
-  the loss often shows up nowhere but a stream resource's `idPrefixes` (or, for an addon deriving
-  its extras from an upstream, a catalog's extras); reinstalling the addon is how a user makes a
-  reduction stick. Only that entry's `manifest` changes, and the silent post-Configure refresh
-  passes `report: false` so it never waits for the write. All four collection writers (add, remove,
-  reorder, this one) hold one `COLLECTION_WRITE_LOCK` from read to push and refuse with "Your
-  Stremio account changed; reload the addon list and try again" when the read lacks a url the
-  frontend shows (`check_collection_read`: a partial read pushed back deletes the rest on every
-  device, and `addonCollectionGet` has returned one); add, remove and reorder also refuse an EMPTY
-  read whatever the list says (a real collection keeps Stremio's protected defaults). An expected
-  url is compared exactly as Rust handed it to the frontend, never normalized a second time, and an
-  addon Aura itself removed in the last 60 s (`RECENT_REMOVALS`) is excused, so a write queued
-  behind Aura's own remove is not refused. Remove and reorder likewise match a url EXACTLY before
-  normalizing it (an entry at `.../manifest.json/manifest.json` reaches the frontend as
-  `.../manifest.json`, its sibling's address), and so does the frontend's reorder, so neither
-  entry of such a pair is removed, merged or dropped in the other's place; remove never tries the
-  normalized form for an entry Aura itself just removed (a second remove of that row writes
-  nothing, where the fallback would have reached the sibling). The partial-read guard
-  is only as good as the list the frontend sends, so THAT LIST IS NEVER SHRUNK BY AN UNCONFIRMED
-  READ: no signed-in collection write is issued until a `get_synced_addons` has answered this
-  session and left a non-empty list shown (`App.isAddonListSynced`; before that add, remove and
-  reorder say so and do nothing, a refresh writes no account, and the check itself starts a
-  re-sync so a later press goes through), and both paths that replace the list from a read, the
-  sign-in / restore sync (`App.syncAddonList`) and the reload that answers a refusal
-  (`App.handleAccountChanged`), follow one rule: never adopt an empty read over a shown list,
-  adopt a read holding every shown url at once, adopt one lacking any only when a second read
-  1.5 s later is non-empty and identical, and adopt nothing if the list changed locally meanwhile
-  (`addonsGenRef`, which sign-in and sign-out also move) or a drag's write has not settled
-  (`reorderInFlightRef`); otherwise the shown list stays, which only makes the guard stricter. The
-  reload exists because nothing else re-reads the account mid-session. Add also runs the parse guard and refuses
-  `configurationRequired`, remove refuses a `protected` entry, and reorder is a pure permutation
-  that refuses a url matching nothing.
-  `account_api_error` reads the API's object-shaped `{ error: { message, code } }` as well as a bare
-  string, so "Session does not exist" signs out instead of reading as a failed write.
-  One cap differs between the builders: the live one keeps the first 16 manifest-level
-  `id_prefixes` (`GUEST_ID_PREFIXES_CAP`), the cloud ones keep all of them. The entry a refresh
-  hands back keeps all of them, so a refresh never SHORTENS a signed-in user's list (the prefix gates
-  treat a non-empty list as complete, so a cut list rejects real ids); only what it saves for a guest
-  keeps the cap. `has_search` follows ONE rule on every path (`manifest_declares_search` in `stremio.rs`:
-  a catalog `search` extra OR a `search` resource); the cloud paths used to check the extra only.
-  `fetch_streams` and `src/addonElection.ts` read these fields directly and never re-fetch
-  manifests per request (a transient failure during that re-probe used to kill all stream lookups).
+- **Watch history is user data, not a cache, and is uncapped.** Rust owns it (`history_store.rs`, one
+  gzip file per scope); an unreadable file is NEVER an empty history; anything that treats the list as
+  authoritative awaits `historyReady()`, and an empty pre-hydration list is never pushed.
+- **Stremio collection writes** (add, remove, reorder, manifest refresh) hold `COLLECTION_WRITE_LOCK`,
+  refuse partial reads, and the shown addon list is never shrunk by an unconfirmed read. One manifest
+  stremio-core cannot parse locks the user's addon list in every official app.
+- Cloud sync: a push with no etag sends a null If-Match (an unconditional overwrite), so it is held
+  unless the last pull answered 404.
+- Machine-local settings (`download_dir`, `screenshot_dir`, and `gpu_acceleration`, `hdr_mode`,
+  `hdr_enabled`, `hdr_target_peak_nits`, whose home is `render.json`) never sync. Leaving a key out of `PORTABLE_*_FIELDS` is NOT enough (those gate file
+  export / import only, and `update_settings` shallow-merges whatever the cloud sends): a new
+  machine-local key is deleted from the outbound blob in `readSettingsBlob`, pinned to the LOCAL value in
+  `writeSettingsBlob`'s patch, and listed in `MACHINE_LOCAL_BACKEND_KEYS` (all in `sync.ts`).
+- Skip detection result cache: any path that deletes `skipdetect-v1.json` must call `forget_prescanned`.
+- A failed TMDB release-date lookup is never cached long. "Is it aired" reads go through `releasedMs`,
+  never a bare `Date.parse(v.released)`.
+- A `removeItem` under a live `PersistentCache` is written back; clear it through `clearPersistentCache`.
 
 ## Performance and memory (build every feature memory-conscious)
 
@@ -1376,318 +494,53 @@ creep degrades the experience. When adding ANY feature:
 - **Always clean up.** `addEventListener` / `setInterval` in an effect must return a cleanup;
   `useSyncExternalStore` subscribers must unsubscribe. And never add `get_property` polling during
   MPV state transitions (landmines).
+- **The playhead is not React state.** mpv's `time-pos` (~30 Hz) lives in `src/playbackClock.tsx`
+  (`setPlaybackTime` is written only by `usePlayback`). A component that draws it calls
+  `usePlaybackTime()` (PlayerOverlay) or wraps just that piece in `<PlaybackTimeView>`; per-tick logic
+  in App is a `usePlaybackClock(fn, deps)` subscription, and a callback reads `getPlaybackTime()`.
+  Never pass the position down from App as a prop or keep it in App state: that re-renders App and
+  everything under it on every tick.
 - **Tune buffers consciously.** The demuxer read-ahead and any in-memory stream buffer have deliberate
   caps (see the engine init options); surface the UX tradeoff when changing them.
 
-## Where to look first by symptom
-
-- "Volume slider snaps back" / "speed does not change" -> the `set_*` Tauri commands in `lib.rs`;
-  verify they submit a typed `SetProperty`, not `Command(vec!["set_property", ...])`.
-- "MPV renders behind UI" / black bar at top -> `App.tsx` TitleBar `opaque` prop, body `hidden` class
-  while playing, and `.aura-app-shell` background must be transparent always.
-- "MPV does not fill window after fullscreen toggle" -> the engine's geometry pump in `mpv/engine.rs`
-  (polls parent rect + fullscreen state every ~5 ms and resizes host + child via
-  `win32::resize_mpv_child_to_parent`). `refresh_video` only does the video-zoom nudge now.
-- "App crashes on play" (STATUS_ACCESS_VIOLATION) -> MPV property race; check polling and
-  observed-property formats. The tail of `%USERPROFILE%\aura-mpv.log` usually pinpoints it.
-- "Native browser context menu appears" -> `main.tsx` capture-phase `contextmenu` listener; must
-  install BEFORE React mounts.
-- "Streams from addon X do not appear" -> DevConsole filter for `[X]`; `fetch_streams` logs the
-  manifest gate decisions.
-- "Stream chips missing / wrong" (no audio-channel or seeder chips, size chip showing the FOLDER
-  size, raw glyph text under the title) -> `src/streamMeta.ts`. See the parsing invariant below.
-- "Anime ratings differ between the hover card and the detail page" -> `CatalogHoverCard.tsx`'s
-  ratings effect. Both surfaces must elect the same metadata addon AND must not fetch before the
-  meta detail resolves; a detail-less fetch sends null anime ids and falls through to the title
-  search, which can elect the wrong MAL entry. The session cache is keyed on the ids the answer was
-  computed from for exactly this reason. DevConsole `[aniskip]` logs the elected id and score.
-- "A movie's digital / theatrical date is wrong or shows Reported" -> DevConsole `[release-dates]` prints the
-  region asked, which source and country each date came from, and the TMDB outcome (`N rows`, `no match`, `find
-  failed`, `deadline failed`, `no key`). Reported means TMDB had no row of that kind for any country. Story Arcs and
-  this share the TMDB key (`arcs::tmdb_key`, keyring override).
-- "A leaked / early film still shows a Digital countdown" -> `src/movieEarly.ts`. The check runs only on the detail
-  page (open it once); DevConsole `[release-dates]` logs "early-release check says <kind>". No "Out early" without
-  AIOStreams' signal or a home-release label on a row: check that PROVIDE_STREAM_DATA is on and that the AIOStreams
-  build sends `code: "earlyRelease"`. The copies only count on the film's OWN id (a same-name knockoff whose date
-  has passed never shows it).
-- "Ratings missing/sparse" -> `ratings.rs`: the MDBList branch needs a `tt`-prefixed IMDb id and a
-  non-empty `AURA_MDBLIST_KEY` (baked from `.env.local`); the MAL/AniList branch needs a resolvable
-  anime id. Non-tt non-anime ids get only addon-supplied `detail.ratings`. OMDb is fully removed.
-- "Detected OP/ED missing or wrong" -> DevConsole `[skipdetect]`: the cour MAL id and its source,
-  the mapped audio track, S and the read origin, the media end, and every theme tried (run, BER,
-  margin, soft42, verdict). An abstain is usually a gate doing its job; do not loosen a gate to make
-  one episode match (the margin and soft42 thresholds are measured, see "Skip detection").
-- "Next-Up card appears / auto-advances too early" -> `src/nextUpGate.ts`. The card appearing at
-  the ED start is intended; an advance before EOS means a countdown was put back into
-  `NextUpCta.tsx`. A card raised well before the credits means `nextUpEnding` elected a wrong
-  ending: the `[next-up] timing` line prints the elected ending's source and `[basis: level]`
-  (the `[auraskip]` stamp line shows only the payload, so it never has an ending gathered while
-  Endings is Off).
-- "A skip only PROMPTS although its kind is on Auto" -> the `[auraskip]` stamp line prints each
-  window's `hold`, its `[basis: level]` (every Risky window only prompts) and the theme match's
-  per-kind state; `skipPromptOnlyReason` (`src/skipSource.ts`)
-  words it in the AuraSkip menu and the prompt. Read "Layer 1's verdict holds the crowd" and "Crowd
-  rows are checked against THIS file" before loosening any of them: each was measured against both
-  corpora.
-- "Skip windows missing" -> `aniskip.rs` / `publicmetadb.rs` / `introdb.rs`; `AURA_PUBLICMETADB_KEY`
-  must be baked. IntroDB needs an IMDb (`tt`) root and a season/episode >= 1; DevConsole `[introdb]`
-  logs which numbering matched (or every numbering that missed), a window dropped for not fitting
-  the file's duration, and a lookup that missed the 5 s wait (`INTRODB_WAIT_MS`).
-- "Skip markers off by tens of seconds on a later season of an anime" -> the AniSkip MAL id paired
-  with the wrong episode. AniSkip timings belong to ONE MAL entry and its LOCAL episode, and a
-  multi-season show's series-level ids (`detail.mal_id`, kitsu/anidb/anilist, the title search) all
-  name the FIRST cour: Bleach TYBW S3E7 was stamped with part 1 ep 7's opening. The pipeline
-  (`App.tsx`, "Step 0") now prefers the playing video's own pair from the addon (`mal_id` +
-  `mal_episode` from AIOMetadata's `_malId` / `_malEpisode`, else `anilist_id` + `anilist_episode`),
-  used only whole; for a tt-keyed season > 1 it NEVER falls back to series-level ids
-  (`laterSeasonTt`), and the Fribb resolver uses the strict `lookup_mal_for_season`. Keep two
-  numbers: MAL-local `episodeNum` for AniSkip, addon-season `seasonEpisodeNum` for PublicMetaDB
-  (TMDB-keyed). Each AniSkip window carries `skip_ref` ("mal:episode"); the AuraSkip menu adopts
-  it and shows vote arrows only on a matching window, because a vote goes to AniSkip by `skip_id`
-  alone. DevConsole `[aniskip]` logs which step resolved the id.
-- "No Seasons/Arcs toggle on an anime" -> `arcs.rs`. In order: `AURA_TMDB_KEY` baked (or a user key in
-  the keyring), a resolvable TMDB id (`MetaDetail.tmdb_id`, else the `/find` by IMDb id), and a TMDB
-  episode group of `type == 5` that clears the coverage bar. Most shows have no arcs at all: arcs are
-  a property of long-running manga, so the toggle is *supposed* to be absent nearly everywhere.
-  DevConsole `[arcs]` logs the grouping choice and the alignment score.
-- "An arc says Filler but its episodes are not" (or vice versa) -> that label
-  comes from TMDB's arc NAME and is unreliable; `arcKindSummary` derives it from
-  Aura's own episode data instead. Check whether the show has any filler data at
-  all first, since with none Aura deliberately falls back to TMDB's marker.
-- "Arc shows the wrong episodes" / "arc is off by one" -> read the story-arcs section above. This is
-  the failure the aligner exists to prevent; check the `[arcs]` min-score log before touching
-  anything else.
-- "Manga chapters missing" -> `manga_chapters.rs`, DevConsole `[manga]`. By grain: the detail line
-  needs an anime series, a MangaUpdates series matched EXACTLY (MAL's "Adaptation" title first) and
-  an `anime` field that parses; it is withheld on purpose when a part has started without an end
-  (Bleach: TYBW part 4 at 661), and nothing is shown for a light-novel or original source. Arc
-  ranges need the show in `arc_art.rs`'s wiki table, the arc resolved to its own page (`[arcs]`
-  logs "pages for N"), and a closed range in that page's infobox (an ongoing arc has none). Episode
-  hover chapters need an `episodes` entry for that wiki AND air dates on both sides: `[manga]` logs
-  pages fetched, joined by air date, and with chapter data. A low join count means the addon's
-  dates are off by more than a day; do NOT "fix" that with a number join.
-- "Live Sync cue list is empty / will not scroll" -> `subsync.rs` for the cue source (bitmap PGS /
-  VobSub tracks can never yield text and are a deliberate disabled state), and the non-passive wheel
-  handler in the panel: the overlay's volume-wheel handler steals wheel events without it.
-- "Subtitle download fails / path rejected" -> `subtitles.rs`; downloads must land in
-  `app_data_dir()/subtitles` and `add_subtitle_to_mpv` enforces containment.
-- "A Tailwind class has no effect" -> check the theme-scale gotchas; confirm against
-  `dist/assets/index-*.css`.
-- "Restore from minimize / tray has no animation" / "a tiny box flies to the corner" -> read the
-  Update at the top of the restore section: in order, a thread that owns a child window sleeping
-  without a message wait, the main webview following the minimize resize, tao's iconic
-  `WM_NCCALCSIZE`. Otherwise read that section BEFORE investigating, and note that the nearby restore-latency cost is
-  not in Aura's code either. Instrument with `AURA_WIN_PROBE=1 pnpm tauri dev` (`wintiming` label).
-- "Next Up / auto-advance plays a different source than the top of the switcher list" -> read the two
-  stream-list invariants above. In order: `sanitize_stream` emitting an unplayable entry,
-  `fetch_streams` returning completion order, and `pickFirstStreamForEpisode` scoping its query
-  differently from the switcher. All three are fixed; a recurrence means one was undone.
-- "Library page blank" -> `<ErrorBoundary scope="Library">` surfaces the render error.
-- "A Settings row or section is missing" (provider pickers, buffers, API keys, Storage, the whole
-  System group) -> it is behind "Show advanced settings", under the Settings search box; searching
-  for it reveals it without the switch. The Conventions entry on advanced rows has the rules.
-- "A no-providers warning opens the wrong page" -> `emptyElectionCause` (`src/addonElection.ts`).
-  It routes to Settings only when that job's override is in force and leaves out an installed addon
-  that could do the job; otherwise to the Addons page (`aura:open-addons`), since Settings cannot
-  fix a missing addon.
-- "A download fails instantly at 0 bytes" -> the container refinement in
-  `downloads/mod.rs::refine_extension`. It renames the partial, so the worker
-  must use the paths it RETURNS, not its own clone of the job.
-- "A download will not pause" / "the window will not close" -> a single-pass HLS
-  job (`JobKind::HlsPassthrough`) cannot be paused. Everything that must reach
-  `active_count() == 0` cancels those instead, and the quit prompt says so.
-- "The downloaded file is corrupt in the middle" -> the resume validator in
-  `downloads/http.rs`. A host with no `ETag` needs the tail-hash compare; a 206
-  alone proves nothing about WHICH file answered.
-- "A download sits Queued with nothing running" -> `manager::pump`. A collapsed
-  pump request must be DEFERRED via `PUMP_AGAIN`, never dropped.
-
-## Stream chip parsing: split lines into SEGMENTS, never dispatch on the first character
-
-`src/streamMeta.ts` turns an addon's stream text into the chips in the stream list. It targets
-AIOStreams' "TamTaro" formatter, which tags values with leading glyphs (`▣` codec, `✦` HDR,
-`♬` audio, `♯` channels, `◈`/`❖` size, `⇄` seeders, `⛿`/`✓` languages, `⛊`/`⛉` VPS proxy).
-
-**TamTaro packs SEVERAL tagged segments onto ONE physical line** - `▣ HEVC ✦ HDR ♬ DD+ ♯ 5.1` is
-a single line. The parser therefore splits each line on the glyph set (`splitSegments`) and handles
-every segment. An earlier version dispatched on the line's FIRST character and consumed the rest,
-which silently dropped everything after the first segment: audio channels and seeders never
-populated at all, and visual tags vanished whenever a codec was present. Do not reintroduce
-first-character dispatch, and do not let a glyph branch consume past its own segment.
-
-Two related rules:
-
-- **A fallback that fills a field with the WRONG value is worse than an empty field.** When
-  TamTaro started emitting `◈ 12.6 / 45.2 GB` (unit stripped off the file size when it matches the
-  folder size), the size parse returned null and the `fullBody` regex fallback then re-filled
-  `size` with the first size-shaped token in the body - the FOLDER size. The chip showed a
-  plausible but wrong number. `parseSizeLine` now inherits the unit across the `/`.
-- **Upstream reshuffles this template.** Aura must keep parsing BOTH the current and older shapes,
-  since users run whatever AIOStreams version they have and can write custom formatters. Glyphs
-  are load-bearing, so pin them by codepoint in comments; `➤` U+27A4 (preloading) and `✓` U+2713
-  (languages-with-subtitles) were both added by upstream after the parser shipped. `✓` is generic
-  enough that other addons use it for "✓ Verified", so it is accepted as the language glyph only
-  when the body actually looks like language codes (`looksLikeLanguageCodes`).
-
-AIOStreams structured facts beat the text where the text is lossy (`applyStreamFacts`, Rust `StreamFacts` from
-`streamData`: field names per AIOStreams `ParsedStreamSchema`): release group, indexer and seeders replace the text
-(a formatter truncates and joins them: "CiNEPHiLES · The Pirate Ba..." was ONE chip); size, folder size, age and cache
-state only fill a gap; the running time (`duration`) exists only there. The facts also untruncate the title line from
-`parsedFile.title` (only when it starts the same way), and give the ranked expression names one chip each
-(`expressions`; the text runs them together as "WEB T2 WEB T6") plus the expression score (the trailing number, which is
-AIOStreams' stream expression score, not a Stremio Enhanced one). An indexer field can list several (`indexerNames`:
-"stremthru-corpus,zilean,nyaa", "StremThru|Knaben"). Text rules learned from live output (2026-11-09): small capitals
-map a WORD at a time before NFKC (the formatter writes s / x / q plain, so "sᴇᴀᴅᴇx" read "sEADEx"); a subtitle code
-keeps its superscript qualifier ("ᴇɴᶠᵒʳᶜᵉᵈ" is "EN forced", not "ENFORCED"); the size line can end in the age
-("· 352d"); zero-width joiners are stripped (they sat inside "Web-dl"); a fact's age rounds DOWN like the formatter; a fact's size is DECIMAL units at three significant digits ("6.45 GB"),
-as the formatter prints it, and it beats the body-wide size guess (which can be the pack size).
-
-The stream row never wraps a chip line and never clips (user's call; a scrolling marquee was tried and dropped): the
-header (badge, stars) and the footer (group, indexer, score, VPS) are IN the flow (an absolute footer grew left over the
-quality box), the footer is one line whose group and indexer chips truncate, and each chip line is a `ChipRow`
-(DetailView.tsx): one line, a chip that reaches the edge truncates when a useful width is left, anything after it hides
-behind a "+N" chip whose hover lists it, and every chip's hover carries its full value. One shared ResizeObserver
-re-fits the rows; hidden chips keep their place (visibility only) so a fit never moves anything. The size chip carries
-the pack or folder size as a dim tail ("6.45 GB of 159 GB"), the subtitles are ONE chip ("SUB EN · EN forced"), and the
-running time sits beside the episode tag. An early release tints the whole row (emerald verified, dashed amber
-unverified) with a calendar icon in the title line.
-
-There are no tests here; the practical check is to run the real `parseStream` over hand-rendered
-old-format and new-format samples and diff the field sets. Node runs the `.ts` file directly.
-
 ## Conventions
 
-- Ctrl+F focuses the search box on screen and the native find bar is off (`src/searchHotkey.ts`,
-  popups through `POPUP_NO_FIND_SCRIPT`). A new search box only needs `data-aura-search` on its
-  `<input>`. Do not use WebView2's `AreBrowserAcceleratorKeysEnabled`: it also kills F5.
-- Where an episode list lands (`src/seasonScroll.ts`, both episode panels and `ArcGrid`): on a season pick, on opening
-  an arc and on leaving Arcs for Seasons, the latest watched episode, else the top (nothing watched, or everything).
-  A SKIPPED episode does not count (a skip is stored as a watched mark: "Skip the filler" at Naruto E110 marks filler
-  through E220).
-  The grid lands on the arc holding that episode, read in BROADCAST order (Naruto's "Various Filler" is the last tile and
-  scattered, so walking the tiles lands past every arc the user has not reached). Each landing runs once per opening: a
-  library refresh must not move a list being read. A resume target, a notification's ringed row and, in the player
-  drawer, the playing episode (the arc grid too, through `pinnedEpisodeId`) outrank it. `useStoryArcs`' `loading` is derived from the request, true from the first
-  commit that has it, because one commit of the season list in a remembered Arcs mode spends the resume target. Anything
-  that opens an arc once waits out `arcResultIsInterim`: arc ids are per grouping, so one opened from the result the
-  default grouping is about to replace vanishes.
-- The hover meta panel opens on a side that covers no other card when one fits, else behind the
-  cursor's travel (`src/hoverPlacement.ts`, once per card, never flipped live). In hover mode it
-  ALWAYS lets the pointer through, over free space too (user's call: the first and last cards of a
-  short search row took the pointer while the rest did not); holding Alt freezes it and lets it
-  take the pointer.
-- Alt+~ (the `perf-monitor` keybinding, Shift tolerated since ~ is Shift+`) opens the Performance
-  Monitor (`src/PerfMonitor.tsx`, `src/perfSeries.ts`, `src-tauri/src/perf_monitor.rs`). Closed, it
-  costs nothing: the panel unmounts and Rust holds no thread, timer or PDH query; pdh.dll and dxgi.dll
-  load by hand on the first sample. Figures cover the process TREE (aura.exe holds mpv, WebView2 and
-  ffmpeg are children). Video figures come ONLY from the engine's gated cache poll
-  (`publish_video`), never a `get_property` from the sampler (landmine 3). I/O is files AND pipes, and
-  Network is the stream plus downloads: Windows has no per-process disk or network figure without
-  elevation, so do not relabel either as if it did. It sits above every z-index but cannot cover a
-  native child webview (the source popup). A floating surface that hit-tests the page should look
-  through `[data-perf-monitor]`, as `searchHotkey.ts` and `CatalogHoverCard.tsx` do; a capture-phase dismiss
-  listener must exempt it, because the monitor's React stopPropagation only shields bubble listeners. The Video
-  figure is the video's own frame rate (`estimated-vf-fps`), not a presentation rate (`display-fps` is pinned
-  through `display-fps-override`, so it measures nothing); the dropped-frame counts are the health signal and run
-  since the last seek or load. The Buffer bar fills against the engine's live `cache-secs`, not the setting. The
-  Frame line plots main-thread stalls through a `longtask` observer. A sample more than 5 s after the last one is a
-  new baseline. The Shift tolerance yields when another action holds the Shift chord, and a plain or Shift-only
-  binding stands aside inside text boxes. The crash reporter counts as Core.
-- The player keybindings are enabled only while a player is active. Off the player every bound key belongs to the
-  page, and `isChordBound` is false, so Ctrl+F always reaches the search box there.
-- Esc layering: a layer above a page or the player takes Escape in a window CAPTURE listener with stopPropagation,
-  because a bubble stop does not stop App's sibling listener on window. Capture listeners on window are siblings too
-  and run in registration order, so a panel hosting a nested layer yields to it explicitly (the Downloads and Service
-  status panels check `[data-aura-context-menu]`). Every docked player menu that owns its open state calls
-  `useMenuEscape` (`src/playerMenu.tsx`), except the hover-opened VolumeControl.
-- A title-bar panel keeps Space / Enter on its controls and Up / Down from the player keybindings through
-  `keepPanelKeysFromPlayer` (`downloadsPanel.ts`), stopping at the document because dnd-kit's keyboard drag listens
-  there. Both title-bar panels hold "closing" for at least a macrotask (`anyMenuOpen` must stay true through a
-  dismissing mousedown). `Tooltip` blurs the active element only after a mouse click (click detail above 0).
-- Mouse wheel scrolling. Do not judge it by rAF: compositor scrolling draws an even 4.2 ms while rAF reads 90 fps
-  (measure `Display::DrawAndSwap` gaps in a trace). What read as jitter was the motion: Chromium plays each notch as
-  a separate curve back to rest, and no flag changes that (`ImpulseScrollAnimations` was removed upstream). So
-  `src/wheelSmooth.ts` takes whole notches (`wheelDeltaY` a multiple of 120, setting `smoothWheelScroll`, never with
-  reduced motion) and drives `scrollTop` from a critically damped spring on the main thread; touchpads and free-spin
-  wheels stay native. It keeps its own wheel latch, stops at a fixed ancestor (the native chain follows the containing
-  block, and modals render inside page scrollers) and leaves a non-overflowing `overscroll-behavior` element to the
-  browser. Because it runs on the main thread, `src/scrollPause.ts` sets `data-aura-scrolling` on `<html>` during a
-  scroll the user is driving, which pauses every decorative loop (Library rAF 55 to 227 fps; no single loop accounts
-  for it) and freezes `.card-grow` hover. A hover panel's open timer waits for it. The rule in App.css is a LIST of
-  loops, never `*`: a universal selector recalculates the whole document each flip, an 8-12 ms stall the spring shows
-  as a skip. A new loop that repaints belongs in that list. The spring's tail closes at a steady speed (`nextStep`),
-  because with whole-pixel offsets its own tail plays as lone 1 px steps up to 46 ms apart. A page's main scroller takes `.aura-page-scroller` (`will-change: scroll-position`):
-  below 150% scale Chromium otherwise re-rasters a non-opaque scroller as it moves (3.2 raster tasks per frame, 0.12
-  with it; text rendering unchanged). Small card controls take no `backdrop-blur`. Row stride is unrounded
-  (`parseFloat` of the computed height, never the rect, which includes a hover scale).
-- Settings sync. `aura:backend-settings-changed`, detail `{ keys?, fromCloud? }`, fires AFTER a backend write lands
-  (`applyBackendPatch` in SettingsView, `ThemeEngine.setTheme`, onboarding, the trailer quality write, a reset with no
-  keys, `writeSettingsBlob` with fromCloud), and `keys` lists only keys whose value really changed, so an empty list
-  is a no-op. Sync stamps and pushes on it (not fromCloud, not machine-local keys), App's settings effect reloads on
-  it through a key list beside the loader, ThemeEngine re-reads for `theme`. ANY new `update_settings` or `set_theme`
-  caller must dispatch it. Sync no longer listens to `aura:keybindings-changed`. The last-writer-wins stamp is per sync
-  scope (`aura:settings-updated-at:<scope>`, `setSettingsStampScope`); a guest never stamps; the old global key is
-  adopted once, only when the scope entered still has persisted etags. `aura:sync:settings-unpushed:<scope>` marks an
-  edit the cloud has not taken and arms a push only in a pull's 304 or 404 branch, never at the end of a pull, because
-  a push with no etag sends a null If-Match, which overwrites unconditionally. So a push with no etag is held unless
-  the last pull answered 404 (`settingsCloudAbsent`), and a 200 received with no etag held means this device never
-  merged this account's copy: the cloud wins outright, whatever the stamps say. `clearSyncEtags` must be followed in
-  the same tick by `setSyncActiveScope`; stored etags, stamp and marker drop only when that call changes scope (a
-  StrictMode re-apply keeps them). Known gaps: signing out inside the 5 s debounce or offline discards an unpublished
-  edit (accepted: the mechanism that used to save it was the guest-edit bug), and a scope with no settings file still
-  inherits the previous cache in `settings.rs::load`, so after a first pull answering 404 the next edit publishes
-  those values.
-- Settings import: `providers.occurrences` is optional and additive (repeated manifest ids resolve by occurrence, a
-  fallback is reported as ambiguous). A stream or search list where nothing resolves is left out of the patch, so it
-  cannot empty the override and turn off every installed addon. A rejected backend patch retries field by field.
-- Library loads are latest-request-wins (`libraryLoadGenRef`, bumped through `invalidateLibraryLoads` BEFORE anything
-  swaps the manual-watched scope). The warm cache paints only when this account's list is not on screen; a failed
-  refetch never repaints. A failed write rolls itself back in its own handler. Views read `libraryKnown`
-  (`libraryLoaded || (authChecked && !session)`); App's raw flag stays false for a guest on purpose, for the Queue
-  prune. Queue renders planned ids with no library record as stubs from the meta cache.
-- FilterState's default year range is unbounded (-Infinity / Infinity), clamped only for display: never JSON-serialize
-  it as is.
-- Auto-remove: a series is tombstoned only through `seriesFinishCheck` (`libraryActions.ts`). Every elected meta addon
-  is asked; at least one answer must have videos, none may date a future episode, and the cloud signal must agree. A
-  provider that claims the id and gives no list keeps the show; a catch-all's silence does not. Most-videos
-  (`getRichestMetaDetail`) must not decide "nothing is coming", because it can elect an aired-only list. The not-found
-  test in `askMetaAddon` matches Rust's `fetch_meta_detail` error strings: change them together.
-- F12 opens the in-app DevConsole (ring buffer, level filters, search). Rust logs arrive via the
-  `crate::devlog!` macro, which mirrors to stderr AND emits a `dev-log` Tauri event.
-- Rust log labels to grep in the DevConsole or `aura-mpv.log`: `[bridge]`, `[player]`, `[streams]`,
-  `[meta]`, `[catalog]`, `[search]`, `[subtitles]`, `[ratings]`, `[rpc]`, `[win32]`, `[smtc]`,
-  `[scrobble]`, `[publicmetadb]`, `[mpv]` (the playback engine), `[cast]`, `[iptv]`, `[sync]`,
-  `[aniskip]`, `[introdb]`, `[skipdetect]` (the layered OP/ED detector), `[arcs]`, `[release-dates]` (movie digital / theatrical dates), `[subsync]`, `[downloads]`, `[history]` (the watch-history store), `[status]` (the service status probes),
-  `[backup]` (the user-data snapshot ledger), `[perf]` (the Performance Monitor's GPU counters), `[tenrai]` (the MyAnimeList client), `[manga]` (manga chapters: MangaUpdates + Fandom), `[airing-check]` (frontend, the stream check for an
-  airing show's next episode), `[extras]` (frontend,
-  the anime metadata tabs on the detail page), `[next-up]` (frontend, the Next-Up card's timing
-  inputs: the elected ending with its source and level, trusted end, preview, media end).
-- libmpv writes its own verbose log to `%USERPROFILE%\aura-mpv.log` (truncated each MPV init, rotated
-  to `.old` past 50 MB). The last few lines usually pinpoint a STATUS_ACCESS_VIOLATION.
-- Discord RPC uses application ID `1499651271357890610` (`window_logic.rs`). Browse states are gated
-  on the `discord_rpc_browse_states` setting; playback states honor `discord_rpc_show_titles` + the
-  per-title blocklist.
-- Themes are driven by `data-theme` on `<html>` (round-tripped through the Rust `set_theme` command).
-  The valid set lives in `ThemeEngine.tsx`; do not hardcode it elsewhere.
-- No em-dashes (or en-dashes) anywhere: code comments, commit messages, UI copy, release notes,
+The full list (keybindings, Esc layering, title-bar panels, wheel scrolling, the Performance Monitor,
+Settings sync internals, library loads, auto-remove, episode-list landing) is in
+`.claude/rules/conventions.md`. The ones that apply to most changes:
+
+- **No em-dashes (or en-dashes) anywhere**: code comments, commit messages, UI copy, release notes,
   prose. Use a hyphen, colon, parentheses, or a sentence break.
 - Any Settings-page change must be evaluated for export/import (`PORTABLE_AURA_FIELDS` /
-  `PORTABLE_BACKEND_FIELDS` in `settingsTransfer.ts`) and cloud-sync sharability, to stop the drift
-  that left prefs unsharable.
-- A new Settings row is visible by default. A provider override or power-user knob goes behind
-  "Show advanced settings" (`AuraSettings.showAdvancedSettings`) instead: wrap it, with the divider
-  that separates it from its neighbour, in `<AdvancedOnly>`, or mark its `TOC_GROUPS` leaf
-  `advanced: true` when EVERY row of the section is advanced (the section, its TOC entry and, when
-  a group empties, the page group header then hide together). Every searchable row must keep
-  `data-settings-row` / `data-settings-label` / `data-settings-description` on its outermost
-  element: settings search finds hidden advanced rows by walking those attributes (units are
-  mounted `hidden` while a query is active), and a row without them can never be revealed. A
-  search or an `aura:open-settings` deep link reveals rows temporarily and never writes the
-  switch. A unit that has been on screen stays mounted (`hidden`) for the rest of the visit
-  rather than unmounting, so in-flight state (a component download) survives the query
-  clearing. Copy elsewhere that names a hidden control must say to turn the switch on.
-  Design and as-built notes: section 7 of
-  `docs/superpowers/specs/2026-09-11-addon-election-and-advanced-settings-design.md`.
+  `PORTABLE_BACKEND_FIELDS` in `settingsTransfer.ts`) and cloud-sync sharability.
+- A new Settings row is visible by default; a provider override or power-user knob goes in
+  `<AdvancedOnly>`. Every searchable row keeps `data-settings-row` / `data-settings-label` /
+  `data-settings-description` on its outermost element.
+- Write backend settings through `patchBackendSettings` (`src/backendSettings.ts`, shared by Settings and
+  onboarding): it diffs, fires the narrow side events and the changed-keys dispatch. Settings controls
+  (`SettingToggle`, `SettingDropdown`, ...) live in `src/settingsControls.tsx`, the AniList / Simkl row in
+  `src/ScrobbleAuthRow.tsx`, the language list in `src/languages.ts`, import in `applySettingsImport`.
+- ANY new `update_settings` or `set_theme` caller must dispatch `aura:backend-settings-changed`
+  (detail `{ keys?, fromCloud? }`) after the write lands, listing only keys that really changed.
+- A new search box only needs `data-aura-search` on its `<input>` (Ctrl+F). Never use WebView2's
+  `AreBrowserAcceleratorKeysEnabled` (it kills F5).
+- A layer above a page or the player takes Escape in a window CAPTURE listener with stopPropagation.
+- A new decorative animation loop that repaints belongs in the `data-aura-scrolling` pause list in
+  App.css (a list, never `*`). A slow drift (a sweep over many seconds) runs at about 30 `steps()` a
+  second, never per display frame: every damaged frame redraws every backdrop pass on the page
+  (`.claude/rules/frontend-ui.md` "Home performance"). Keep a bound Liquid filter's images small: a
+  backdrop filter's bitmaps are re-sent with every frame.
+- Themes are `data-theme` on `<html>`; the valid set lives only in `ThemeEngine.tsx`. A theme's accent
+  can be overridden per theme (`AuraSettings.themeAccents`, synced, drawn ONLY by `src/themeAccent.ts`
+  as inline `--ln-accent*` on `<html>`, plus `data-accent-light` for a very light one, which edges
+  the Matte switch knob): derive accent tokens from `--ln-accent-rgb`, never a colour
+  literal, and put text on a solid accent fill in `text-ln-accent-ink`, never `text-black`
+  (`.claude/rules/frontend-ui.md` "Custom accent colour").
+- FilterState's default year range is unbounded (-Infinity / Infinity): never JSON-serialize it as is.
+- F12 opens the DevConsole. Rust logs go through `crate::devlog!` with a `[label]`; grep the label (the
+  full label list is in `.claude/rules/conventions.md`). Log a request by addon label plus `{type}/{id}`,
+  never its URL.
+- Debugging a reported symptom: `docs/agents/symptoms.md` maps symptoms to the code to read first.
 
 ### Native dependencies and runtime binaries
 
@@ -1710,26 +563,6 @@ the CONTAINER duration, and plain `-sseof` restarts timestamps at 0).
   (trailers) are NOT bundled. They are fetched on demand from a GitHub `runtime-deps` prerelease, SHA-verified
   (`runtime_deps.rs`). Absent -> the dependent feature ships inert rather than crashing.
 
-## Network tuning notes for power users (host-level, cannot ship from inside the app)
-
-Most users need none of this; Aura's defaults work on a stock Windows install. Try these only on a
-high-BDP link (>=100 Mbps x >=30 ms RTT) that rebuffers mid-playback despite the demuxer cache.
-
-- **Windows** (admin `cmd`/PowerShell; inspect with `netsh int tcp show global`):
-  `netsh int tcp set global autotuninglevel=experimental` (higher receive-window ceiling);
-  `netsh int tcp set supplemental Internet congestionprovider=bbr2` (helps on lossy-but-fast links;
-  revert with `cubic`); confirm Receive-Side Scaling is enabled; optionally
-  `netsh int tcp set global ecncapability=enabled` for ECN-honoring (e.g. Cloudflare) origins.
-- **Linux** (Wine / unofficial build), `/etc/sysctl.conf`: `net.core.default_qdisc=fq`,
-  `net.ipv4.tcp_congestion_control=bbr`, and raise `rmem_max` / `wmem_max` / `tcp_rmem` / `tcp_wmem`
-  to 16 MiB; `sudo sysctl -p`.
-- **Router**: Smart Queue Management (cake / fq_codel) kills buffer bloat; a fast resolver
-  (1.1.1.1 / NextDNS) speeds the cold-start DNS lookup. Aura's preheat fetch (`Range: bytes=0-65535`
-  in `App.handlePlayStream`) warms the TLS session but cannot help DNS.
-- **What NOT to do**: do not disable `https_only`; do not lower `network-timeout` below 60 s (debrid
-  hosts can take 30+ s to mux a fresh chunk); do not watch on a Windows "metered connection" (it
-  disables TCP autotuning).
-
 ## Log files and sensitive data
 
 - `%USERPROFILE%\aura-mpv.log` (verbose libmpv) records every loaded URL verbatim, including
@@ -1739,7 +572,9 @@ high-BDP link (>=100 Mbps x >=30 ms RTT) that rebuffers mid-playback despite the
   every URL in those lines goes through `redact_sensitive_url` (`stremio.rs`: opaque path segments,
   userinfo, secret-named query values, nested URLs) or `redact_urls_in_text` for libmpv's prose.
   Keep it that way: log a request by addon label plus `{type}/{id}`, a reqwest error through
-  `reqwest_err_for_log` (its Display appends the URL), and never feed a log label into data.
+  `reqwest_err_for_log` (its Display appends the URL), and never feed a log label into data. An error
+  string RETURNED to the frontend never embeds a reqwest error's Display either (the catalog / meta /
+  search errors are "Catalog fetch <kind>", "Meta HTTP error: <status>" and the like): pages show it.
 - `%USERPROFILE%\aura-panic.log` (Rust panic backtraces) is smaller surface (no URL leakage in normal
   operation).
 - Both inherit the `%USERPROFILE%` DACL, which on a default install grants only the owning user (plus
@@ -1756,7 +591,7 @@ Pick the version from what the release CONTAINS, never from the adjective in the
 
 **Default is a patch bump (`x.y.Z`).** This project's bar for a minor is high, and the history is
 the evidence: `1.0.7` shipped the entire Watch Trailer feature, `1.0.9` gave every theme its own
-accent colour, and `1.5.4` replaced the whole Trakt / AniList sign-in with a browser OAuth flow.
+accent colour, and `1.5.4` replaced the whole scrobble sign-in with a browser OAuth flow.
 All three were patches.
 
 **Bump the minor (`x.Y.0`) only when the release's headline is a NEW named surface** the user did
@@ -1778,11 +613,29 @@ The one-line test: *does the notes' lead sentence name something the user could 
 No means patch. If it is genuinely borderline, ask rather than guess, since the tag, the signed
 artifacts and the updater feed all bake the number in and a published version cannot be recalled.
 
-## Docs to consult
+## Subsystem docs
 
-- `ROADMAP.md` for feature phases (note: it stops around 5.8 and many "TODO" items there have since
-  shipped; trust the code over the roadmap).
-- `src-tauri/permissions/player.toml` + `src-tauri/capabilities/default.json`: the permission ledger,
-  and the usual silent failure mode for a new command.
-- `docs/research/` for one-off forensic deep-dives (e.g. the off-focus frame-drop analysis, and the
-  restore-animation investigation).
+Read the matching file before changing that area. A `.claude/rules/` file loads by itself only when a
+file in its `paths` list is read or edited (`App.tsx` is in none of them, though it drives the skip
+chain, playback and sync), so name it explicitly when a change crosses into its area. When a rule
+grows a new file, add the file to its `paths`.
+
+| File | Covers |
+|------|--------|
+| `.claude/rules/skip-detection.md` | Skip detection end to end: layers, gates, holds, merge ranks, confidence levels, Next-Up timing, ffmpeg passes, cancellation, pre-scan, AnimeThemes API rules |
+| `.claude/rules/downloads.md` | Download manager: HLS modes, resume validation, path safety, machine-local settings |
+| `.claude/rules/mpv.md` | mpv engine internals, init options, and the full landmine stories |
+| `.claude/rules/streams.md` | Stream-list invariants, stale urls, stream chip parsing, AIOStreams stream facts |
+| `.claude/rules/aiostreams.md` | AIOMetadata inside AIOStreams, rate limits, nested addon status |
+| `.claude/rules/story-arcs.md` | TMDB arc alignment and filler labels |
+| `.claude/rules/caching.md` | Every cache and store: history, sync, backups, manifest refresh, collection writes, release dates, early releases |
+| `.claude/rules/conventions.md` | All UI / settings / input conventions and the devlog label list |
+| `.claude/rules/windowing.md` | Fullscreen, minimize and tray restore investigation |
+| `.claude/rules/frontend-ui.md` | The glass system: Frosted / Liquid, which class, hooks, Liquid filter registry, the A control tier, the cursor light (reach, rim worklet, idle rim), the Home hero bleed / underglow, the Home cards, the left rail, custom accent colours and their sync, player material-only rule |
+| `docs/agents/codebase-map.md` | Per-module detail for every Rust and frontend file group |
+| `docs/agents/symptoms.md` | Where to look first by symptom |
+| `docs/agents/network-tuning.md` | Host-level network advice for power users |
+
+Also: `ROADMAP.md` (stops around 5.8; trust the code over it), `src-tauri/permissions/player.toml` +
+`src-tauri/capabilities/default.json` (the permission ledger), `docs/research/` (forensic deep-dives),
+`docs/superpowers/specs/` (design specs).

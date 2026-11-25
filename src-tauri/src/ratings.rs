@@ -4,7 +4,7 @@
 // ---------------------------------------------------------------------------
 // Multi-source ratings aggregator.
 //
-// Folds MDBList (IMDb / RT & Metacritic audience / TMDB / Trakt /
+// Folds MDBList (IMDb / RT & Metacritic audience / TMDB /
 // Letterboxd) and the anime pair Tenrai (MyAnimeList score, weighted
 // score, popularity rank) + AniList (averageScore) into a single
 // normalized list the DetailView renders. The MDBList key is baked at
@@ -22,7 +22,7 @@
 //
 // Sources supported here:
 //   • MDBList (mdblist.com/api)      — IMDb + Rotten Tomatoes & Metacritic
-//                                       AUDIENCE + TMDB + Trakt + Letterboxd,
+//                                       AUDIENCE + TMDB + Letterboxd,
 //                                       one call by IMDb id. Key baked at
 //                                       build time (build.rs, git-ignored
 //                                       file → cargo:rustc-env). Replaced
@@ -56,7 +56,7 @@ fn client() -> &'static reqwest::Client {
             .tcp_keepalive(Duration::from_secs(60))
             .pool_max_idle_per_host(1)
             .pool_idle_timeout(Duration::from_secs(30))
-            .user_agent("Aura/0.6.6 ratings-aggregator")
+            .user_agent(concat!("Aura/", env!("CARGO_PKG_VERSION"), " ratings-aggregator"))
             .build()
             .expect("Ratings HTTP client init failed")
     })
@@ -84,8 +84,8 @@ pub struct AggregateRating {
 // file — never in the repo; empty key → branch no-ops cleanly.
 //
 // We surface the AUDIENCE score per brand (one chip each): RT audience
-// (not the Tomatometer), Metacritic user (not the Metascore), TMDB /
-// Trakt user scores, IMDb, Letterboxd. Pure-critic rows
+// (not the Tomatometer), Metacritic user (not the Metascore), TMDB
+// user score, IMDb, Letterboxd. Pure-critic rows
 // (tomatoes/metacritic critic, rogerebert) and myanimelist are skipped
 // - MAL is owned by the richer Tenrai branch below (score + rank +
 // popularity, and it works for kitsu/mal-id anime MDBList can't key);
@@ -151,7 +151,6 @@ async fn mdblist_to_aggregate(imdb_id: &str) -> Vec<AggregateRating> {
             "tomatoesaudience" => Some(("Rotten Tomatoes", pct(r.score),  92, "audience")),
             "metacriticuser"   => Some(("Metacritic",      pct(r.score),  80, "audience")),
             "tmdb"             => Some(("TMDB",            pct(r.score),  70, "audience")),
-            "trakt"            => Some(("Trakt",           pct(r.score),  65, "audience")),
             "letterboxd"       => Some(("Letterboxd",      ten(r.value),  60, "audience")),
             _ => None,
         };
@@ -350,7 +349,7 @@ pub async fn fetch_aggregate_ratings(
 ) -> Result<Vec<AggregateRating>, String> {
     let mut out: Vec<AggregateRating> = Vec::new();
 
-    // ── MDBList branch (IMDb / RT+Metacritic AUDIENCE / TMDB / Trakt /
+    // ── MDBList branch (IMDb / RT+Metacritic AUDIENCE / TMDB /
     //    Letterboxd) — by IMDb id ─────────────────────────────────────────
     if let Some(imdb) = input.imdb_id.as_deref().filter(|s| s.starts_with("tt")) {
         out.extend(mdblist_to_aggregate(imdb).await);

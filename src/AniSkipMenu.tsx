@@ -33,6 +33,7 @@
 // ---------------------------------------------------------------------------
 
 import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
+import { SegmentedControl, type SegmentOption } from "./settingsControls";
 import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import type { ActiveScrobbleTarget } from "./useScrobble";
@@ -79,8 +80,10 @@ interface Props {
   onClose: () => void;
   /** Currently-playing target. Drives the malId/episode resolution. */
   activeTarget: ActiveScrobbleTarget | null;
-  /** Live playback time — used by the "Now" buttons in the submit form. */
-  time: number;
+  /** The live playhead, read when a "Now" button is pressed. A getter, not
+   *  the value, so this menu (and the More menu that hosts it) is not
+   *  re-rendered on every playback tick. */
+  getTime: () => number;
   /** Stream duration in seconds — passed to AniSkip as `episodeLength`
    *  on submission so the server stores the correct ratio. */
   duration: number;
@@ -143,7 +146,7 @@ function skipLabel(kind: string): string {
 }
 
 export default function AniSkipMenu({
-  open, onClose, activeTarget, time, duration, windows, superseded = [], isFullscreen = false,
+  open, onClose, activeTarget, getTime, duration, windows, superseded = [], isFullscreen = false,
 }: Props) {
   // ── MAL resolution ───────────────────────────────────────────────
   // Cour-specific id derived from the video id when it's anime-prefix
@@ -423,6 +426,20 @@ export default function AniSkipMenu({
     cooldownUntil: number;
   }>>({});
   const VOTE_COOLDOWN_MS = 3000;
+  // The arrows read the cooldown during render, and this menu no longer
+  // re-renders on every playback tick (it takes `getTime`), so schedule one
+  // re-render at the soonest pending cooldown end or the arrows stay disabled.
+  const [cooldownTick, setCooldownTick] = useState(0);
+  useEffect(() => {
+    const now = Date.now();
+    let next = Infinity;
+    for (const v of Object.values(voteState)) {
+      if (v.cooldownUntil > now && v.cooldownUntil < next) next = v.cooldownUntil;
+    }
+    if (!Number.isFinite(next)) return;
+    const id = window.setTimeout(() => setCooldownTick((t) => t + 1), next - now + 20);
+    return () => window.clearTimeout(id);
+  }, [voteState, cooldownTick]);
 
   const handleVote = useCallback(async (
     skipId: string | null | undefined,
@@ -519,15 +536,20 @@ export default function AniSkipMenu({
       {/* Panel */}
       <div
         className="aura-modal-card-in relative w-[min(560px,92vw)] max-h-[82vh] flex flex-col
-                   rounded-2xl aura-glass-menu shadow-glass-edge overflow-hidden"
+                   rounded-[20px] aura-glass-player overflow-hidden"
         onClick={(e) => e.stopPropagation()}
+        // App's window keybindings ignore defaultPrevented: an arrow on the
+        // focused skip-mode control would also seek or change the volume, and
+        // Space on a focused button would toggle pause. Function keys go
+        // through (F12: DevConsole); Escape is taken above in capture.
+        onKeyDown={(e) => { if (!/^F\d{1,2}$/.test(e.key)) e.stopPropagation(); }}
         role="dialog"
         aria-label="AuraSkip"
       >
         <div className="flex items-center justify-between gap-3 pl-5 pr-3 pt-4 pb-3 border-b border-white/8">
           <h2 className="text-white text-[16px] font-semibold tracking-tight">AuraSkip</h2>
           <div className="flex items-center gap-2">
-            <span className="text-white/45 text-[12px] font-mono tabular-nums">
+            <span className="text-white/60 text-[12px] font-mono tabular-nums">
               {`${segmentCount} segment${segmentCount === 1 ? "" : "s"}`}
             </span>
             <button
@@ -548,7 +570,7 @@ export default function AniSkipMenu({
           {/* ── Segments ─────────────────────────────────────────── */}
           <SectionLabel>Segments</SectionLabel>
           {orderedWindows.length === 0 && (
-            <div className="py-6 text-center text-white/45 text-[13px]">
+            <div className="py-6 text-center text-white/60 text-[13px]">
               No segments for this episode yet.
             </div>
           )}
@@ -580,12 +602,12 @@ export default function AniSkipMenu({
                       {skipLabel(w.type)}
                     </span>
                     <span className={`text-[12.5px] font-mono tabular-nums
-                                      ${w.superseded ? "text-white/45" : "text-white/70"}`}>
+                                      ${w.superseded ? "text-white/55" : "text-white/70"}`}>
                       {fmtTime(w.start)} - {fmtTime(w.end)}
                     </span>
                   </div>
                   {song && (
-                    <p className="text-white/45 text-[11.5px] leading-snug line-clamp-1 mt-0.5" title={song}>
+                    <p className="text-white/60 text-[11.5px] leading-snug line-clamp-1 mt-0.5" title={song}>
                       {song}
                     </p>
                   )}
@@ -728,15 +750,12 @@ export default function AniSkipMenu({
                   <select
                     value={formType}
                     onChange={(e) => setFormType(e.target.value as SkipType)}
-                    className="w-full h-8 mt-1 bg-white/8 border border-white/12 rounded-lg px-2.5
-                               text-[13px] text-white/90 outline-none focus:border-white/30 transition-colors
-                               appearance-none cursor-pointer"
-                    style={{
-                      backgroundImage: `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 24 24' fill='rgba(255,255,255,0.5)'%3E%3Cpath d='M7 10l5 5 5-5z'/%3E%3C/svg%3E")`,
-                      backgroundRepeat: "no-repeat",
-                      backgroundPosition: "right 8px center",
-                      paddingRight: "24px",
-                    }}
+                    // A glass select: the chevron rides --lg-deco (an inline
+                    // backgroundImage would erase the glass layers);
+                    // aura-select-compact tightens it for this narrow column.
+                    className="aura-glass-flat aura-glass-select aura-select-compact appearance-none
+                               w-full h-8 mt-1 rounded-lg px-2.5
+                               text-[13px] text-white/90 outline-none cursor-pointer"
                   >
                     <option value="op">Opening</option>
                     <option value="mixed-op">Opening (mixed)</option>
@@ -745,25 +764,23 @@ export default function AniSkipMenu({
                   </select>
                 </div>
                 <TimeField label="Start" value={startInput} onChange={setStartInput}
-                           placeholder="0:00" onNow={() => setStartInput(fmtTime(time))} />
+                           placeholder="0:00" onNow={() => setStartInput(fmtTime(getTime()))} />
                 <TimeField label="End" value={endInput} onChange={setEndInput}
-                           placeholder="1:30" onNow={() => setEndInput(fmtTime(time))} />
+                           placeholder="1:30" onNow={() => setEndInput(fmtTime(getTime()))} />
               </div>
 
               <button
                 type="button"
                 onClick={handleSubmit}
                 disabled={submitting || ((malId == null || courEpisode == null) && !idbAvailable)}
-                className="w-full h-8 px-3 rounded-lg border border-ln-accent/40
-                           bg-ln-accent/15 text-ln-accent text-[13px] font-semibold
-                           hover:bg-ln-accent/25 transition-colors
+                className="aura-glass-flat is-primary w-full h-8 px-3 rounded-lg text-[13px] font-semibold
                            disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 {submitting ? "Submitting…" : "Submit segment"}
               </button>
 
               {malResolving && (
-                <p className="text-white/50 text-[12px]">Resolving MAL id…</p>
+                <p className="text-white/60 text-[12px]">Resolving MAL id…</p>
               )}
               {!malResolving && malId == null && !idbAvailable && (
                 <p className="text-amber-300/90 text-[12px] leading-snug">
@@ -778,7 +795,7 @@ export default function AniSkipMenu({
                 </p>
               )}
               {(!malResolving && malId != null) || (idbAvailable && idbNumbering) ? (
-                <p className="text-white/40 text-[11.5px] font-mono">
+                <p className="text-white/60 text-[11.5px] font-mono">
                   {[
                     !malResolving && malId != null ? `mal ${malId} · ep ${courEpisode}` : null,
                     idbAvailable && idbNumbering
@@ -792,7 +809,7 @@ export default function AniSkipMenu({
         </div>
 
         <div className={`px-5 py-2.5 border-t border-white/8 text-[12px]
-                         ${flash ? "text-ln-accent" : "text-white/40"}`}>
+                         ${flash ? "text-ln-accent" : "text-white/60"}`}>
           {flash ?? "Esc to close"}
         </div>
       </div>
@@ -820,7 +837,7 @@ type ChipTone = "source" | "status" | "neutral";
 const CHIP_TONES: Record<ChipTone, string> = {
   source:  "bg-white/6 text-white/75 border-white/14",
   status:  "bg-white/10 text-white/85 border-white/20",
-  neutral: "bg-white/4 text-white/55 border-white/12",
+  neutral: "bg-white/4 text-white/60 border-white/12",
 };
 
 /** A small status pill, the same size and shape as the stream-quality chips
@@ -848,15 +865,14 @@ function TimeField({
   return (
     <div>
       <FieldLabel>{label}</FieldLabel>
-      <div className="mt-1 flex items-stretch h-8 rounded-lg bg-white/8 border border-white/12
-                      focus-within:border-white/30 transition-colors overflow-hidden">
+      <div className="aura-glass-field mt-1 flex items-stretch h-8 rounded-lg overflow-hidden">
         <input
           value={value}
           onChange={(e) => onChange(e.target.value)}
           placeholder={placeholder}
           aria-label={`${label} time`}
           className="min-w-0 flex-1 bg-transparent px-2.5 text-[13px] font-mono text-white/90
-                     outline-none placeholder:text-white/30"
+                     outline-none placeholder:text-white/50"
         />
         <button
           type="button"
@@ -872,9 +888,13 @@ function TimeField({
   );
 }
 
-/** One row of the skip-mode toggles: an off / prompt / auto pill group,
- *  styled like Settings > Anime OP/ED Skip's `SkipModeRow`. Colourless on
- *  purpose: green / amber / red in this panel mean confidence levels. */
+/** One row of the skip-mode toggles: the shared SegmentedControl (Off /
+ *  Prompt / Auto), the same control as Settings > Anime OP/ED Skip's
+ *  `SkipModeRow`: one springy thumb, the cursor light on its rims, arrow
+ *  keys / Home / End. Material only like the rest of this player panel (no
+ *  backdrop pass); glass-player.css gives it the player's label colours.
+ *  Colourless on purpose: green / amber / red in this panel mean confidence
+ *  levels. */
 function ModeRow({
   label, value, onChange, disabled,
 }: {
@@ -883,42 +903,20 @@ function ModeRow({
   onChange: (v: SkipMode) => void;
   disabled?: boolean;
 }) {
-  const opts: { id: SkipMode; label: string; tone: string }[] = [
-    { id: "off",    label: "Off",    tone: "text-white" },
-    { id: "prompt", label: "Prompt", tone: "text-white" },
-    { id: "auto",   label: "Auto",   tone: "text-white" },
+  const opts: SegmentOption<SkipMode>[] = [
+    { value: "off",    label: "Off",    disabled },
+    { value: "prompt", label: "Prompt", disabled },
+    { value: "auto",   label: "Auto",   disabled },
   ];
   return (
     <div className="flex items-center justify-between gap-3">
       <span className="text-[13.5px] text-white/90">{label}</span>
-      <div
-        className="flex-shrink-0 inline-flex rounded-full overflow-hidden
-                   bg-white/5 border border-white/12 p-0.5 gap-0.5"
-        role="radiogroup"
-        aria-label={`${label} skip`}
-      >
-        {opts.map((o) => {
-          const active = value === o.id;
-          return (
-            <button
-              key={o.id}
-              type="button"
-              role="radio"
-              aria-checked={active}
-              onClick={() => onChange(o.id)}
-              disabled={disabled}
-              className={`px-3.5 py-1 rounded-full text-[12px] font-medium tracking-wide
-                          transition-colors duration-150
-                          ${active
-                            ? `bg-ln-accent/25 ${o.tone}`
-                            : "text-white/55 hover:text-white/90"}
-                          disabled:opacity-50 disabled:cursor-not-allowed`}
-            >
-              {o.label}
-            </button>
-          );
-        })}
-      </div>
+      <SegmentedControl<SkipMode>
+        value={value}
+        options={opts}
+        onChange={onChange}
+        ariaLabel={`${label} skip`}
+      />
     </div>
   );
 }

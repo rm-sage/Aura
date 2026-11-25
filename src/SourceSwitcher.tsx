@@ -19,6 +19,7 @@
 import { useEffect, useMemo } from "react";
 import type { StreamEntry } from "./types";
 import { parseStream, chipStyleFor, type ChipKind } from "./streamMeta";
+import { useListDroplet } from "./glassListDroplet";
 
 /** Stable identity for a stream row — used for the "now playing" + resolving
  *  markers. Mirrors how App keys the swap. */
@@ -120,6 +121,9 @@ export default function SourceSwitcher({
     return [...byAddon.values()].flat();
   }, [streams]);
 
+  // One sliding hover droplet over the rows (Liquid; inert in Frosted).
+  const droplet = useListDroplet(".aura-glass-item");
+
   if (!open) return null;
 
   return (
@@ -134,26 +138,29 @@ export default function SourceSwitcher({
       {/* Panel */}
       <div
         className="aura-modal-card-in relative w-[min(560px,92vw)] max-h-[78vh] flex flex-col
-                   rounded-2xl aura-glass-menu shadow-glass-edge overflow-hidden"
+                   rounded-[20px] aura-glass-player overflow-hidden"
         onClick={(e) => e.stopPropagation()}
         role="dialog"
         aria-label="Switch source"
       >
         <div className="flex items-baseline justify-between px-5 pt-4 pb-3 border-b border-white/8">
           <h2 className="text-white text-[16px] font-semibold tracking-tight">Switch source</h2>
-          <span className="text-white/45 text-[12px] font-mono tabular-nums">
+          <span className="text-white/60 text-[12px] font-mono tabular-nums">
             {loading ? "finding…" : `${streams.length} source${streams.length === 1 ? "" : "s"}`}
           </span>
         </div>
 
-        <div className="overflow-y-auto px-2 py-2 aura-scroll">
+        <div className="relative overflow-y-auto px-2 py-2 aura-scroll" {...droplet.listProps}>
+          {/* Liquid's sliding hover droplet over the source rows (inert in
+              Frosted), inset to the rows' 8 px. */}
+          <span ref={droplet.ref} aria-hidden className="aura-glass-hl aura-player-hl" style={{ left: 8, right: 8 }} />
           {loading && streams.length === 0 ? (
-            <div className="py-10 flex flex-col items-center gap-3 text-white/50">
+            <div className="py-10 flex flex-col items-center gap-3 text-white/60">
               <Spinner />
               <span className="text-[13px]">Finding other sources…</span>
             </div>
           ) : streams.length === 0 ? (
-            <div className="py-10 text-center text-white/45 text-[13px]">
+            <div className="py-10 text-center text-white/60 text-[13px]">
               No other sources available.
             </div>
           ) : (
@@ -167,11 +174,11 @@ export default function SourceSwitcher({
                   type="button"
                   disabled={isCurrent || resolving}
                   onClick={() => onPick(s)}
-                  className={`w-full text-left rounded-xl px-3 py-2.5 mb-1 flex items-center gap-3
-                              transition-colors
-                              ${isCurrent
-                                ? "bg-ln-accent/10 cursor-default"
-                                : "hover:bg-white/[0.07] focus:bg-white/[0.07] focus:outline-none"}`}
+                  // The playing source is SELECTED (GLASS SYSTEM): an accent
+                  // wash in Frosted, a raised face in Liquid.
+                  className={`aura-glass-item w-full text-left rounded-xl px-3 py-2.5 mb-1 flex items-center gap-3
+                              focus:outline-none focus-visible:ring-1 focus-visible:ring-white/30
+                              ${isCurrent ? "is-selected cursor-default" : ""}`}
                 >
                   <div className="min-w-0 flex-1">
                     <div className="flex items-center gap-2">
@@ -205,7 +212,7 @@ export default function SourceSwitcher({
                       </div>
                     )}
                     {s.description && (
-                      <p className="text-white/40 text-[11.5px] leading-snug line-clamp-1 mt-0.5">
+                      <p className="text-white/60 text-[11.5px] leading-snug line-clamp-1 mt-0.5">
                         {s.description}
                       </p>
                     )}
@@ -217,7 +224,7 @@ export default function SourceSwitcher({
           )}
         </div>
 
-        <div className="px-5 py-2.5 border-t border-white/8 text-white/35 text-[11px]">
+        <div className="px-5 py-2.5 border-t border-white/8 text-white/60 text-[11px]">
           Click a source to swap in place · Esc to close
         </div>
       </div>

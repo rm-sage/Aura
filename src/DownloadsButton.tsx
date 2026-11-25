@@ -180,7 +180,7 @@ export default function DownloadsButton() {
               className="absolute -top-1 -right-1.5 min-w-[14px] h-[14px] px-[3px]
                          rounded-full flex items-center justify-center
                          text-[9px] font-semibold leading-none
-                         bg-ln-accent text-black aura-bell-badge-pop"
+                         bg-ln-accent text-ln-accent-ink aura-bell-badge-pop"
             >
               {active > 9 ? "9+" : active}
             </span>

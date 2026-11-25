@@ -10,11 +10,13 @@ import { shrinkPoster } from "../posterSize";
 import ErrorBoundary from "../ErrorBoundary";
 import WatchedBadge from "../WatchedBadge";
 import { FilterMenu, applyFilters, DEFAULT_FILTERS, type FilterState } from "../FilterBar";
+import { useListDroplet } from "../glassListDroplet";
 import { useHoverCardActivation } from "../useHoverCardActivation";
 import { closeHoverNow } from "../catalogHoverStore";
 import { useRowWindow } from "../useRowWindow";
 import { PAGE_CONTENT_MAX_W } from "../pageLayout";
 import { mayServe } from "../addonElection";
+import { sheet } from "../glassSheet";
 
 // ---------------------------------------------------------------------------
 // DiscoverView — browse any addon's catalogs, including ones the addon has
@@ -286,10 +288,10 @@ function DiscoverBody({ addons, onSelectMeta }: Props) {
           {/* Header */}
           <div className="flex items-end justify-between gap-4 flex-wrap">
             <div>
-              <h1 className="aura-row-title text-3xl font-semibold tracking-tight">
+              <h1 data-glass-light="text" className="aura-row-title text-3xl font-semibold tracking-tight">
                 Discover
               </h1>
-              <p className="text-white/35 text-sm mt-1">
+              <p className="text-white/55 text-sm mt-1">
                 Browse every catalog your addons expose, including the ones
                 hidden from your home page.
               </p>
@@ -337,14 +339,14 @@ function DiscoverBody({ addons, onSelectMeta }: Props) {
           </div>
 
           {manifestErr && (
-            <div className="glass-panel rounded-2xl px-5 py-4 border border-red-400/25">
+            <div {...sheet("rounded-[20px] px-5 py-4", { tone: "danger" })}>
               <p className="text-red-300/85 text-xs font-mono break-all">
                 Couldn't load addon manifest: {manifestErr}
               </p>
             </div>
           )}
           {itemsErr && (
-            <div className="glass-panel rounded-2xl px-5 py-4 border border-red-400/25">
+            <div {...sheet("rounded-[20px] px-5 py-4", { tone: "danger" })}>
               <p className="text-red-300/85 text-xs font-mono break-all">
                 Couldn't load catalog: {itemsErr}
               </p>
@@ -353,7 +355,7 @@ function DiscoverBody({ addons, onSelectMeta }: Props) {
 
           {/* Grid */}
           {!selectedAddon || !selectedCatalog ? (
-            <div className="glass-panel rounded-2xl px-6 py-10 text-center">
+            <div {...sheet("rounded-[20px] px-6 py-10 text-center")}>
               <p className="text-white/55 text-sm">
                 Pick an addon and a catalog to browse its full list.
               </p>
@@ -361,7 +363,7 @@ function DiscoverBody({ addons, onSelectMeta }: Props) {
           ) : items === null ? (
             <SkeletonGrid />
           ) : filtered.length === 0 ? (
-            <div className="glass-panel rounded-2xl px-6 py-10 text-center">
+            <div {...sheet("rounded-[20px] px-6 py-10 text-center")}>
               <p className="text-white/55 text-sm">
                 {items.length === 0
                   ? "No items returned by the addon for this catalog."
@@ -372,7 +374,7 @@ function DiscoverBody({ addons, onSelectMeta }: Props) {
             <div ref={gridWrapperRef} style={{ position: "relative", height: win.totalHeight }}>
               <div
                 ref={gridRef}
-                className="grid gap-5"
+                className="grid gap-5 aura-poster-grid"
                 style={{
                   position: "absolute",
                   top: win.offsetY,
@@ -431,6 +433,8 @@ function PillDropdown({
 }) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
+  // Liquid's shared hover droplet over the options (inert in Frosted).
+  const droplet = useListDroplet<HTMLDivElement>();
 
   useEffect(() => {
     if (!open) return;
@@ -452,16 +456,21 @@ function PillDropdown({
         type="button"
         onClick={() => !disabled && setOpen((o) => !o)}
         disabled={disabled}
-        className={`flex items-center gap-2 pl-3 pr-2 py-1.5 rounded-full
-                    border transition-colors min-w-[180px]
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        // A flat glass control (App.css GLASS SYSTEM); open is a brighter
+        // neutral face (aria-expanded, src/styles/glass-search.css), never
+        // an accent: it marks a menu, not a choice.
+        className={`aura-glass-flat aura-pill-dd flex items-center gap-2 pl-3 pr-2 py-1.5 rounded-full
+                    min-w-[180px]
                     ${disabled
-                      ? "bg-white/3 border-white/8 text-white/30 cursor-not-allowed"
+                      ? "text-white/30 cursor-not-allowed opacity-60"
                       : open
-                        ? "bg-white/12 border-white/25 text-white"
-                        : "bg-white/5 border-white/12 hover:bg-white/10 text-white/85"
+                        ? "text-white"
+                        : "text-white/85"
                     }`}
       >
-        <span className="text-[10px] font-semibold tracking-[0.18em] uppercase text-white/40">
+        <span className="text-[10px] font-semibold tracking-[0.18em] uppercase text-white/60">
           {label}
         </span>
         <span className="text-[12.5px] font-medium truncate max-w-[260px]">{value}</span>
@@ -475,8 +484,15 @@ function PillDropdown({
         <div
           role="listbox"
           className="absolute left-0 mt-1 w-[320px] max-h-[60vh] overflow-y-auto z-30
-                     aura-glass-menu rounded-xl p-1.5"
+                     aura-float-glass aura-glass-pop-in rounded-xl p-1.5"
+          {...droplet.listProps}
         >
+          <span
+            ref={droplet.ref}
+            aria-hidden
+            className="aura-glass-hl"
+            style={{ left: 6, right: 6, borderRadius: 6 }}
+          />
           {options.map((o) => {
             const active = o.id === activeId;
             return (
@@ -486,11 +502,10 @@ function PillDropdown({
                 role="option"
                 aria-selected={active}
                 onClick={() => { onPick(o.id); setOpen(false); }}
-                className={`w-full text-left px-3 py-2 rounded-md flex items-center gap-2
-                            transition-colors
-                            ${active
-                              ? "bg-ln-accent/15 text-ln-accent"
-                              : "text-white/85 hover:text-white hover:bg-white/[0.16]"}`}
+                // .aura-glass-row: hover and the selected face (aria-selected)
+                // come from the class, never an accent fill.
+                className={`aura-glass-row relative w-full text-left px-3 py-2 rounded-md flex items-center gap-2
+                            ${active ? "" : "text-white/85 hover:text-white"}`}
               >
                 <span className="text-[13px] font-medium truncate flex-1 min-w-0">{o.label}</span>
                 {o.badge && (
@@ -563,17 +578,18 @@ const DiscoverPosterCard = memo(function DiscoverPosterCard({
             No poster
           </div>
         )}
-        <WatchedBadge metaId={meta.id} mediaType={meta.media_type}
-          className="absolute top-1.5 left-1.5" />
+        <WatchedBadge metaId={meta.id} mediaType={meta.media_type} material="frost"
+          className="absolute top-2 left-2 z-10" />
+        <span aria-hidden className="aura-card-bezel" data-glass-light="rim" />
       </div>
       {/* Fixed-height label block so every card is the SAME total height —
           the windowing hook derives row stride from one measured card. */}
       <div className="px-0.5 h-14 overflow-hidden mt-2">
-        <p className="text-white/85 text-[13px] mx-1 line-clamp-2 leading-snug">
+        <p className="aura-poster-title text-white/85 text-[13px] mx-1 line-clamp-2 leading-snug">
           {meta.name}
         </p>
         {meta.release_info && (
-          <p className="text-white/40 text-[11px] font-mono mx-1">{meta.release_info}</p>
+          <p className="text-white/55 text-[11px] font-mono mx-1">{meta.release_info}</p>
         )}
       </div>
     </button>

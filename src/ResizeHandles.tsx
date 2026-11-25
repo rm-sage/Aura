@@ -1,7 +1,7 @@
 // Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useCallback } from "react";
+import { memo, useCallback } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
 // `ResizeDirection` is declared in @tauri-apps/api/window's .d.ts but not
@@ -60,7 +60,7 @@ function Handle({ className, cursor, direction }: HandleProps) {
   );
 }
 
-export default function ResizeHandles() {
+function ResizeHandles() {
   return (
     <>
       {/* Edges — 6 px deep along each side, inset to leave the 16 px corners */}
@@ -76,3 +76,9 @@ export default function ResizeHandles() {
     </>
   );
 }
+
+// Memoized: App renders this host with no props (or only primitives / its own
+// stable state) and re-renders on every playback-update tick. The host is
+// driven by its own state and store subscriptions, so skipping those renders
+// changes nothing on screen.
+export default memo(ResizeHandles);

@@ -203,7 +203,7 @@ fn client() -> &'static reqwest::Client {
             // pool made every one of them pay a fresh TLS handshake.
             .pool_max_idle_per_host(4)
             .pool_idle_timeout(Duration::from_secs(30))
-            .user_agent("Aura/0.6.6")
+            .user_agent(concat!("Aura/", env!("CARGO_PKG_VERSION")))
             .build()
             .expect("AniSkip client init failed")
     })

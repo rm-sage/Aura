@@ -70,15 +70,16 @@ export default function PersonGrid({ entries, onClickName, badgeFor }: {
           // is an invalid content model (a button takes phrasing content only),
           // and browsers recover from it by closing the button early, which
           // silently breaks the click target it was supposed to define.
-          <div key={`${e.name}-${i}`} className="min-w-0 group">
+          <div key={`${e.name}-${i}`} className="aura-tile min-w-0 group">
             <button
               type="button"
               onClick={onClickName ? () => onClickName(e.name) : undefined}
               title={onClickName ? `Search for "${e.name}"` : undefined}
+              // The art box carries the card bezel (a rim-only cursor-light
+              // surface) instead of a border and a hover ring (round 11).
               className={"block w-full aspect-[2/3] rounded-lg overflow-hidden "
-                + "bg-white/6 border border-white/8 relative p-0 "
-                + "focus:outline-none focus-visible:ring-1 focus-visible:ring-white/40 "
-                + "group-hover:ring-1 group-hover:ring-white/25 transition-shadow "
+                + "bg-white/6 relative p-0 "
+                + "focus:outline-none focus-visible:outline focus-visible:outline-1 focus-visible:outline-white/50 "
                 + (onClickName ? "cursor-pointer" : "cursor-default")}
             >
               {e.photo ? (
@@ -96,22 +97,25 @@ export default function PersonGrid({ entries, onClickName, badgeFor }: {
                 </span>
               )}
               {badge && (
-                <span className="absolute top-1.5 left-1.5 px-1.5 py-0.5 rounded
-                                 bg-black/70 text-white/85 text-[9px] font-mono
+                // Frost look, FAUX inside the panel (glass-detail.css).
+                <span data-glass-light="rim"
+                      className="aura-frost absolute top-1.5 left-1.5 px-1.5 py-0.5 rounded-[6px]
+                                 text-white/90 text-[9px] font-mono
                                  uppercase tracking-[0.14em]">
                   {badge}
                 </span>
               )}
+              <span aria-hidden data-glass-light="rim" className="aura-card-bezel" />
             </button>
 
             {/* Both lines are fixed, mirroring the character card: the person
                 leads, the role sits under them. Nothing swaps on hover,
                 because there is no second image to swap to. */}
-            <p className="text-white/85 text-[11.5px] leading-tight mt-1.5 line-clamp-2">
+            <p className="aura-tile-name text-white/85 text-[11.5px] leading-tight mt-1.5 line-clamp-2">
               {e.name}
             </p>
             {e.character && (
-              <p className="text-white/35 text-[10.5px] leading-tight mt-0.5 truncate">
+              <p className="text-white/60 text-[10.5px] leading-tight mt-0.5 truncate">
                 {e.character}
               </p>
             )}

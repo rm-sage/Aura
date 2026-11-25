@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import {
+  memo,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -15,7 +16,7 @@ import { listen } from "@tauri-apps/api/event";
 import Tooltip from "./Tooltip";
 import SubtitlePicker from "./SubtitlePicker";
 import type { StreamHash } from "./subtitleExtras";
-import CinemaSuite from "./CinemaSuite";
+import CinemaSuiteBase from "./CinemaSuite";
 import ImageLoader from "./ImageLoader";
 import type { ActiveScrobbleTarget } from "./useScrobble";
 import type { AddonEntry, ExternalSubtitle, LibraryItem, TrackEntry, VideoEntry } from "./types";
@@ -42,6 +43,10 @@ import {
 import { recommendUpscaler } from "./upscalerRecommend";
 import { noteEndingAutoSkipSeek } from "./nextUpGate";
 import { copyTextToClipboard } from "./clipboard";
+import { isSubtitlesOff } from "./languages";
+import { useRealGlass } from "./realGlass";
+import { subtitleLiftTarget, SUB_LIFT_FALLBACK } from "./subtitleLift";
+import { usePlaybackTime } from "./playbackClock";
 
 // Max volume the slider / wheel / keys can reach. mpv's `volume-max` init option
 // (engine.rs) must match. >100 is a soft boost (~+3.5 dB at 150) for quiet
@@ -182,9 +187,10 @@ const ShaderIcon = () => (
     <path d="M12 3c-4.97 0-9 4.03-9 9s4.03 9 9 9 9-4.03 9-9-4.03-9-9-9zm0 16c-3.86 0-7-3.14-7-7s3.14-7 7-7 7 3.14 7 7-3.14 7-7 7zm-1-11h2v6h-2zm0 8h2v2h-2z" />
   </svg>
 );
-const ExitIcon = () => (
-  <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
-    <path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" />
+// The same Material back arrow DetailView and CatalogPageView draw.
+const BackIcon = () => (
+  <svg width="22" height="22" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+    <path d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20z" />
   </svg>
 );
 const FullscreenIcon = () => (
@@ -252,6 +258,23 @@ const LoudnormIcon = () => (
   </svg>
 );
 
+// playback-update re-renders PlayerOverlay about 30 times a second. The bar's
+// menus, the picker and the OSD are memoized so they skip those renders, which
+// only works if their props keep their identity: hence the hoisted icon
+// elements below and `useLatestCallback` for the inline handlers.
+const AUDIO_ICON_EL = <AudioIcon />;
+const SUBS_ICON_EL = <SubsIcon />;
+const CinemaSuite = memo(CinemaSuiteBase);
+
+/** A function whose identity never changes but which always runs the latest
+ *  `fn` (the ref is refreshed after every commit, before any handler can
+ *  fire). For event handlers handed to a memoized child. */
+function useLatestCallback<A extends unknown[], R>(fn: (...args: A) => R): (...args: A) => R {
+  const ref = useRef(fn);
+  useLayoutEffect(() => { ref.current = fn; });
+  return useCallback((...args: A) => ref.current(...args), []);
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -298,14 +321,34 @@ function useAutoHide(
       }
       return () => setCursorHidden(false);
     }
+    // mousemove fires every frame while the pointer moves. Each wake used to
+    // call setVisible(true) and re-arm the timer; with playback-update keeping
+    // the overlay's update queue busy, React could not bail out of the no-op
+    // setState eagerly, so moving the mouse re-ran the whole overlay body
+    // every frame. Now a wake only stamps the time; the state and cursor class
+    // change on a real show, and the one timer re-arms itself for whatever is
+    // left, so the bar still hides exactly `delayMs` after the last activity.
+    let shown = false; // false: the first wake() below re-asserts both
+    let last = 0;
+    const fire = () => {
+      const left = delayMs - (performance.now() - last);
+      if (left > 0) {
+        timer.current = setTimeout(fire, left);
+        return;
+      }
+      timer.current = null;
+      shown = false;
+      setVisible(false);
+      setCursorHidden(true);
+    };
     const wake = () => {
-      setVisible(true);
-      setCursorHidden(false);
-      if (timer.current) clearTimeout(timer.current);
-      timer.current = setTimeout(() => {
-        setVisible(false);
-        setCursorHidden(true);
-      }, delayMs);
+      last = performance.now();
+      if (!shown) {
+        shown = true;
+        setVisible(true);
+        setCursorHidden(false);
+      }
+      if (!timer.current) timer.current = setTimeout(fire, delayMs);
     };
     const wakeFromKey = (e: KeyboardEvent) => {
       // Suppress wake for caller-listed codes — used so volume arrow
@@ -323,6 +366,7 @@ function useAutoHide(
       window.removeEventListener("mousedown", wake);
       window.removeEventListener("keydown", wakeFromKey);
       if (timer.current) clearTimeout(timer.current);
+      timer.current = null;
       setCursorHidden(false);
     };
   }, [delayMs, forceVisible]);
@@ -396,7 +440,7 @@ function RecChip({ traced, title, children }: {
   );
 }
 
-function ShaderPicker({ activeTarget, loadKey, isAnime, readGate, controlsVisible }: {
+const ShaderPicker = memo(function ShaderPicker({ activeTarget, loadKey, isAnime, readGate, controlsVisible }: {
   activeTarget: ActiveScrobbleTarget | null;
   /** The overlay's per-load key (title, stream url, reload nonce): a source
    *  switch or a recovery reload keeps the title but can change the size. */
@@ -732,12 +776,12 @@ function ShaderPicker({ activeTarget, loadKey, isAnime, readGate, controlsVisibl
         onClick={() => setOpen((v) => !v)}
         title={highlightRec ? `Upscaler: ${recommended.reason}` : "Upscaling / Shader Profile"}
         style={pillTraceStyle}
-        className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-full text-xs font-medium
-                    transition-all duration-150 border ${traceOn ? "aura-rec-trace" : ""}
-                    ${open || active !== 0
-                      ? "bg-ln-accent/20 text-ln-accent border-ln-accent/30"
-                      : "bg-white/5 text-white/55 border-white/10 hover:bg-white/10 hover:text-white/85"
-                    }`}
+        // A glass item (glass-misc.css .aura-player-pill gives it its resting
+        // rim): open or on is marked with is-selected, which the GLASS SYSTEM
+        // draws as an accent wash in Frosted and a raised face in Liquid.
+        className={`aura-glass-item aura-player-pill flex items-center gap-1.5 px-2.5 py-1.5 rounded-full
+                    text-xs font-medium ${traceOn ? "aura-rec-trace" : ""}
+                    ${open || active !== 0 ? "is-selected" : "text-white/60 hover:text-white/85"}`}
       >
         <ShaderIcon />
         <span className="font-mono tracking-wider">{activeName}</span>
@@ -868,7 +912,7 @@ function ShaderPicker({ activeTarget, loadKey, isAnime, readGate, controlsVisibl
       )}
     </div>
   );
-}
+});
 
 // ---------------------------------------------------------------------------
 // PanscanButton — toggles MPV's `panscan` between 0.0 (default; letterbox /
@@ -882,7 +926,7 @@ function ShaderPicker({ activeTarget, loadKey, isAnime, readGate, controlsVisibl
 // (e.g. a 21:9 movie's fill setting would re-apply to a 16:9 episode).
 // ---------------------------------------------------------------------------
 
-function PanscanButton({ activeTarget }: { activeTarget: ActiveScrobbleTarget | null }) {
+const PanscanButton = memo(function PanscanButton({ activeTarget }: { activeTarget: ActiveScrobbleTarget | null }) {
   const [on, setOn] = useState(false);
 
   useEffect(() => {
@@ -923,7 +967,7 @@ function PanscanButton({ activeTarget }: { activeTarget: ActiveScrobbleTarget | 
       </button>
     </Tooltip>
   );
-}
+});
 
 // ---------------------------------------------------------------------------
 // SubtitleStyleMenu — expose all six subtitle style settings inline from
@@ -941,12 +985,22 @@ interface SubStyle {
   subtitle_font: string;
 }
 
-function SubtitleStyleMenu() {
+const SubtitleStyleMenu = memo(function SubtitleStyleMenu({ onOpenChange }: {
+  /** Reports the menu's open state: while it is open the subtitle lift
+   *  follows the Vertical position slider instead of the bar clamp. */
+  onOpenChange?: (open: boolean) => void;
+} = {}) {
   const [open, setOpen] = useState(false);
   const [style, setStyle] = useState<SubStyle | null>(null);
   const ref = useRef<HTMLDivElement>(null);
   useMenuOpenSync(open);
   useMenuEscape(open, setOpen);
+  const onOpenChangeRef = useRef(onOpenChange);
+  onOpenChangeRef.current = onOpenChange;
+  useEffect(() => {
+    onOpenChangeRef.current?.(open);
+  }, [open]);
+  useEffect(() => () => onOpenChangeRef.current?.(false), []);
 
   useEffect(() => {
     invoke<SubStyle>("get_settings").then(setStyle).catch(() => {});
@@ -1028,7 +1082,7 @@ function SubtitleStyleMenu() {
       )}
     </div>
   );
-}
+});
 
 function InlineHexInput({
   label, value, onChange,
@@ -1054,8 +1108,8 @@ function InlineHexInput({
         onKeyDown={(e) => { if (e.key === "Enter") (e.currentTarget as HTMLInputElement).blur(); }}
         spellCheck={false}
         aria-label={label}
-        className="w-full h-8 bg-white/8 border border-white/14 focus:border-white/30
-                   rounded-lg px-2.5 text-[13px] font-mono outline-none transition-colors"
+        className={`aura-glass-field w-full h-8 rounded-lg px-2.5 text-[13px] font-mono outline-none
+                    ${draft !== value && !valid ? "is-invalid" : ""}`}
         style={{ color: "var(--text-primary)" }}
       />
     </div>
@@ -1079,8 +1133,7 @@ function InlineTextInput({
         onKeyDown={(e) => { if (e.key === "Enter") (e.currentTarget as HTMLInputElement).blur(); }}
         spellCheck={false}
         aria-label={label}
-        className="w-full h-8 bg-white/8 border border-white/14 focus:border-white/30
-                   rounded-lg px-2.5 text-[13px] font-mono outline-none transition-colors
+        className="aura-glass-field w-full h-8 rounded-lg px-2.5 text-[13px] font-mono outline-none
                    placeholder:text-white/55"
         style={{ color: "var(--text-primary)" }}
       />
@@ -1149,8 +1202,8 @@ interface Props {
   /** Change the trailer quality (re-resolves + swaps in place at the playhead). */
   onSetTrailerQuality?: (quality: string) => void;
 
-  // Playback state
-  time: number;
+  // Playback state (the playhead itself is read from playbackClock, so App
+  // does not re-render on every tick)
   duration: number;
   paused: boolean;
   volume: number;
@@ -1180,6 +1233,10 @@ interface Props {
   /** Mirrors the overlay's auto-hide `controlsVisible` to the parent, so the
    *  sibling PlayerPartyHud pill can fade in lockstep with the player chrome. */
   onControlsVisibleChange?: (visible: boolean) => void;
+
+  /** A cast session is active or connecting: the local video is not what the
+   *  user watches, so "Real glass over video" stands down (realGlass.ts). */
+  castActive?: boolean;
 
   // Handlers
   togglePause: () => void;
@@ -1279,7 +1336,7 @@ interface Props {
 // exact same coordination AniSkipMenu / SubtitlePicker use.
 // ---------------------------------------------------------------------------
 
-function EpisodeEdgeTrigger({
+const EpisodeEdgeTrigger = memo(function EpisodeEdgeTrigger({
   seriesId, mediaType, addons, currentEpisodeId, nextEpisodeId,
   isFullscreen, libraryById, seriesArt, onPlayEpisode, controlsVisible,
 }: NonNullable<Props["episodePanel"]> & { controlsVisible: boolean }) {
@@ -1363,12 +1420,9 @@ function EpisodeEdgeTrigger({
             opacity: controlsVisible ? 1 : 0,
             pointerEvents: controlsVisible ? "auto" : "none",
           }}
-          className="fixed top-1/2 -translate-y-1/2 right-0 z-[9998]
+          className="aura-glass-player aura-player-handle fixed top-1/2 -translate-y-1/2 right-0 z-[9998]
                      h-28 w-[10px] hover:w-[16px] rounded-l-lg
-                     bg-white/10 hover:bg-white/20 backdrop-blur-sm
-                     border-y border-l border-white/10
                      flex items-center justify-center
-                     transition-[width,background-color,opacity] duration-150
                      group"
         >
           <svg
@@ -1407,7 +1461,7 @@ function EpisodeEdgeTrigger({
       </div>
     </>
   );
-}
+});
 
 // 5× was removed: at 5× a 4K HEVC stream can't keep up — the VO drops
 // hundreds of frames/sec and audio/video desyncs. 4× is the smooth
@@ -1424,9 +1478,10 @@ export default function PlayerOverlay({
   trailerMaxHeight = 2160,
   isTrailerResolving = false,
   onSetTrailerQuality,
-  time, duration, paused, volume, speed, buffering, bufferPct, seekLoading = false, firstFrameSeen,
+  duration, paused, volume, speed, buffering, bufferPct, seekLoading = false, firstFrameSeen,
   partyFollower = false,
   onControlsVisibleChange,
+  castActive = false,
   togglePause, seekRelative, seekAbsolute, commitVolume, commitSpeed,
   onExitPlayback,
   subsOpen, setSubsOpen, downloadsOpen = false,
@@ -1438,6 +1493,9 @@ export default function PlayerOverlay({
   skipKeybinding = "KeyX",
   episodePanel,
 }: Props) {
+  // The playhead, from its own store (playbackClock.tsx): this overlay
+  // re-renders per tick, App does not.
+  const time = usePlaybackTime();
   // Manga chapters for the playing episode ("Ch. 590"), read from what the
   // detail page or the episode drawer already fetched (mangaChapters.ts). The
   // player never fetches it: no data, no label.
@@ -1474,6 +1532,19 @@ export default function PlayerOverlay({
   // Publish controls-visibility to the parent so the sibling PlayerPartyHud pill
   // can fade with the chrome (it lives outside this overlay).
   useEffect(() => { onControlsVisibleChange?.(controlsVisible); }, [controlsVisible, onControlsVisibleChange]);
+
+  // "Real glass over video" (opt-in, realGlass.ts): an mpv shader blurs the
+  // live video under the control bar and open docked menus. Only with a
+  // first frame up and nothing being cast; the hook clears it otherwise.
+  // Shelved (realGlass.ts REAL_GLASS_AVAILABLE false): the hook is inert.
+  const overlayRootRef = useRef<HTMLDivElement | null>(null);
+  const glassBarRef = useRef<HTMLDivElement | null>(null);
+  useRealGlass({
+    rootRef: overlayRootRef,
+    barRef: glassBarRef,
+    active: firstFrameSeen && !castActive,
+    controlsVisible,
+  });
 
   // Scrub state — `scrubValue` is set while the user drags the slider; we
   // commit on pointer-up so we don't seek-storm.
@@ -1606,11 +1677,13 @@ export default function PlayerOverlay({
     // Turning subs off on one title therefore left mpv hiding them on the NEXT
     // title played, while a freshly-mounted overlay showed subsMuted=false and
     // the menu showed a track selected. Symptom: "subtitles just stopped
-    // working" with nothing in the UI to explain it. Re-enable per file; the
-    // persisted per-title "off" preference re-applies it a moment later in the
-    // subtitle auto-select effect below, which runs after this one.
-    setSubsMuted(false);
-    invoke("set_subtitle_visibility", { visible: true }).catch(() => {});
+    // working" with nothing in the UI to explain it. The per-file write is the
+    // subtitles Off effect's job (below, after the guard re-arm): it runs in
+    // the same commit on every target or stream change and writes ONE value,
+    // visible or hidden by the preference. A second write here would be two
+    // concurrent invokes landing in either order, and a default-flagged track
+    // (mpv still picks one when `slang` matches nothing) could show behind a
+    // menu reading Off.
     // Keyed on the STREAM as well as the target. A source switch keeps the same
     // activeTarget.id but is a different release, and a subtitle correction
     // belongs to the release: carrying it over would silently mistime the new
@@ -1751,8 +1824,9 @@ export default function PlayerOverlay({
   // The control bar sits at the bottom of the player, in the same vertical
   // band where MPV draws subtitles by default (sub-pos ≈ 95). Without
   // intervention, the bar covers dialogue every time the user moves the
-  // mouse. Solution: when the bar appears, push subs UP by ~12 percentage
-  // points; when it hides, restore the user's chosen baseline.
+  // mouse. Solution: when the bar appears, push subs UP only as far as they
+  // need to clear the bar's measured top (not at all when they already sit
+  // above it); when it has faded out, restore the user's chosen baseline.
   //
   // Implementation notes:
   //   • Tracks the persisted baseline in state so a mid-playback slider
@@ -1782,18 +1856,84 @@ export default function PlayerOverlay({
     };
   }, [tracksReady]);
 
-  // The sub-pos value the lift last computed. Held in a ref so the re-assert
-  // effect below can re-apply the CURRENT target without re-subscribing.
+  // The sub-pos value last SENT to mpv (the one on screen). Held in a ref so
+  // the re-assert effect below can re-apply it without re-subscribing; it is
+  // written at the moment the invoke fires, so a seek during the delayed drop
+  // re-asserts the lift that is still showing, not the pending baseline.
+  //
+  // The lift is MEASURED (`subtitleLiftTarget`, src/subtitleLift.ts): a fixed
+  // 12 points fell short of the bar in short windows and moved subtitles that
+  // already sat high for nothing, so the target is the baseline when its
+  // bottom clears the bar's real top edge plus LIFT_GAP_PX, else exactly the
+  // percent that clears it (the bar stays laid out at opacity 0, so its rect
+  // is valid the moment it shows).
+  // sub-pos is a percent of the mpv host's height (sub-ass-force-margins yes,
+  // sub-margin-y 0), and the host starts 36 PHYSICAL px down in windowed mode
+  // (36 / dpr CSS px). The drop back to the baseline waits for the bar's 500 ms fade-out
+  // (and the real-glass shader's 0.47 s fade), so dialogue never slides under
+  // the still-visible bar; controls coming back inside that window cancel it.
+  // DOM rects only: no get_property polling (mpv landmine 3).
   const liftTargetRef = useRef(subBaseline);
+  // While the Subtitle style menu is open, the lift skips the bar clamp and
+  // uses the old fixed 12 points: each Vertical position step must visibly
+  // move the subtitles (with the clamp, every value whose lift reaches the bar
+  // landed on the same height). Closing the menu re-runs the effect, which
+  // re-applies the clamp.
+  const [subStyleOpen, setSubStyleOpen] = useState(false);
   useEffect(() => {
     if (!tracksReady) return;
-    const LIFT_AMOUNT = 12;
-    const target = controlsVisible
-      ? Math.max(0, subBaseline - LIFT_AMOUNT)
-      : subBaseline;
-    liftTargetRef.current = target;
-    invoke("set_subtitle_position_runtime", { percent: target }).catch(() => {});
-  }, [controlsVisible, tracksReady, subBaseline]);
+    const LIFT_GAP_PX = 12;       // clearance between the sub's bottom and the bar
+    const DROP_DELAY_MS = 520;    // the bar wrapper's duration-500 fade, plus a beat
+    const TITLE_BAR_PX = 36;
+    let sent: number | null = null;
+    const send = (target: number) => {
+      if (target === sent) return;
+      sent = target;
+      liftTargetRef.current = target;
+      invoke("set_subtitle_position_runtime", { percent: target }).catch(() => {});
+    };
+    if (!controlsVisible) {
+      // Nothing lifted (a fresh load, or already at baseline): no wait.
+      if (liftTargetRef.current >= subBaseline) {
+        send(subBaseline);
+        return;
+      }
+      const id = window.setTimeout(() => send(subBaseline), DROP_DELAY_MS);
+      return () => window.clearTimeout(id);
+    }
+    const measure = () => {
+      if (subStyleOpen) { send(Math.max(0, subBaseline - SUB_LIFT_FALLBACK)); return; }
+      const bar = glassBarRef.current;
+      // The engine's inset is 36 PHYSICAL px (applied to GetClientRect), so
+      // in CSS px it is 36 / dpr. A DPI change fires `resize`, re-measuring.
+      const hostTop = isFullscreen ? 0 : TITLE_BAR_PX / (window.devicePixelRatio || 1);
+      const hostH = window.innerHeight - hostTop;
+      send(subtitleLiftTarget({
+        baseline: subBaseline,
+        barTop: bar ? bar.getBoundingClientRect().top : null,
+        hostTop,
+        hostH,
+        gapPx: LIFT_GAP_PX,
+      }));
+    };
+    measure();
+    // Re-measure when the window or the bar changes size (a taller bar, a
+    // resize, a fullscreen switch), coalesced to one read per frame.
+    let raf = 0;
+    const schedule = () => {
+      if (raf) return;
+      raf = requestAnimationFrame(() => { raf = 0; measure(); });
+    };
+    window.addEventListener("resize", schedule);
+    const bar = glassBarRef.current;
+    const ro = bar && typeof ResizeObserver !== "undefined" ? new ResizeObserver(schedule) : null;
+    if (bar && ro) ro.observe(bar);
+    return () => {
+      window.removeEventListener("resize", schedule);
+      ro?.disconnect();
+      if (raf) cancelAnimationFrame(raf);
+    };
+  }, [controlsVisible, tracksReady, subBaseline, isFullscreen, subStyleOpen]);
 
   // Re-assert the lift after events that silently clobber the runtime sub-pos:
   //   • a SEEK — mpv re-renders subtitles at the new position and the ASS
@@ -1839,6 +1979,22 @@ export default function PlayerOverlay({
   // One-shot guards for the audio + subtitle auto-select effects further down.
   // Declared here (above the reset effect) so they re-arm per file.
   const subAutoSelectedRef = useRef(false);
+  // The title key a menu Off was persisted for in this session: the
+  // preferredSubLang prop is read at load, so it does not show an Off pressed
+  // during this file.
+  const subOffWrittenKeyRef = useRef<string | null>(null);
+  // A manual pick that turns subtitles back on with a track that carries no
+  // language tag (an untagged embedded track, an OpenSubtitles download)
+  // cannot write its language, so it clears a per-title Off instead: else the
+  // next episode would start hidden again. "" reads as "no override" (App
+  // falls back to the global preference); a tagged pick already overwrites it.
+  const clearTitleSubOff = () => {
+    if (!activeTarget) return;
+    const key = titleStateKey(activeTarget);
+    if (!isSubtitlesOff(preferredSubLang) && subOffWrittenKeyRef.current !== key) return;
+    subOffWrittenKeyRef.current = null;
+    setTitleState(activeTarget.media_type, key, { sub_lang: "" });
+  };
   const audioAutoSelectedRef = useRef(false);
   // Same for the external-sub fallback. An mpv `sub-add` does NOT survive a
   // loadfile, so a guard that armed once per MOUNT meant only the first
@@ -1895,6 +2051,32 @@ export default function PlayerOverlay({
     [tracks],
   );
 
+  // Subtitles Off (the global `subtitle_language` or a per-title `sub_lang`).
+  // Visibility follows the preference from the moment the file changes, not
+  // only after the track read, so a default-flagged or forced track that mpv
+  // selects on its own (`slang` "off" matches nothing, and mpv then falls back
+  // to the default / forced flags) is never on screen. Hiding through
+  // `sub-visibility` rather than `sid=no` covers forced tracks as well, which
+  // is the decision: Off means off, forced subtitles included. It mirrors the
+  // preference only until the file is decided (`subAutoSelectedRef`), because
+  // App loads the per-title override asynchronously: for a moment after a
+  // switch `preferredSubLang` can still be the previous title's value, and a
+  // per-title "en" over a global Off must win once it arrives. The decision is
+  // made by the auto-select effect below, or by any manual pick or Off in the
+  // Subtitles menu, which then holds for the rest of the file.
+  // No `reloadNonce` dep: `sub-visibility` is an option that survives
+  // loadfile, so an in-place reload (Replay, Reload stream, live reconnect)
+  // keeps whatever the user last chose. With it, a menu Off was turned back on
+  // by the reload while `preferredSubLang` still held the earlier value. A
+  // global Off still holds after a reload: the auto-select effect re-arms and
+  // marks the file decided without touching visibility.
+  useEffect(() => {
+    if (subAutoSelectedRef.current) return;
+    const off = isSubtitlesOff(preferredSubLang);
+    setSubsMuted(off);
+    invoke("set_subtitle_visibility", { visible: !off }).catch(() => {});
+  }, [preferredSubLang, activeTarget?.id, streamUrl]);
+
   // ── Subtitle auto-select: prefer Full over Signs & Songs ─────────
   // MPV's automatic track selection uses `slang` (set by us via
   // `apply_lang_defaults`) plus the file's default/forced flags. For
@@ -1907,12 +2089,10 @@ export default function PlayerOverlay({
   // source switch / unmount).
   useEffect(() => {
     if (subAutoSelectedRef.current) return;
-    // Persisted "off" — user previously disabled subs for this title.
-    // Hide them and bail out before any auto-select runs.
-    if ((preferredSubLang ?? "").toLowerCase() === "off") {
-      subAutoSelectedRef.current = true;
-      invoke("set_subtitle_visibility", { visible: false }).catch(() => {});
-      setSubsMuted(true);
+    // Off: the effect above already hid them; once the track list is in, the
+    // preference has settled, so the file is decided and nothing is selected.
+    if (isSubtitlesOff(preferredSubLang)) {
+      if (embeddedSubTracks.length > 0) subAutoSelectedRef.current = true;
       return;
     }
     if (embeddedSubTracks.length === 0) return;
@@ -2004,6 +2184,9 @@ export default function PlayerOverlay({
     // re-runs this through `extSubWaitExpiredGen` once the cap is hit.
     if (!externalSubsSettled && extSubWaitExpiredGen !== extSubFileGenRef.current) return;
     if (externalSubs.length === 0) return;
+    // Subtitles Off: never auto-load one (the list stays in the menu for a
+    // manual pick). A manual pick or Off in the menu also ends the fallback.
+    if (isSubtitlesOff(preferredSubLang) || subAutoSelectedRef.current) return;
 
     const pref = (preferredSubLang ?? "").toLowerCase();
     const match = pref
@@ -2196,7 +2379,9 @@ export default function PlayerOverlay({
     // self-gating: the bucket only has members when an OpenSubtitles addon is
     // installed (the API key is unrelated — it's only for MovieHash matching).
     const isOpenSubs = (s: ExternalSubtitle) => /opensubtitles/i.test(s.addon_name);
-    const prefLang = preferredSubLang ? preferredSubLang.toLowerCase() : null;
+    const prefLang = preferredSubLang && !isSubtitlesOff(preferredSubLang)
+      ? preferredSubLang.toLowerCase()
+      : null;
     const sortedSource = [...externalSubs].sort((a, b) => {
       const aOs = isOpenSubs(a) ? 0 : 1;
       const bOs = isOpenSubs(b) ? 0 : 1;
@@ -2337,6 +2522,192 @@ export default function PlayerOverlay({
   const logoForBuffer  = activeTarget?.logo ?? null;
   const titleForBuffer = activeTarget?.name ?? "";
 
+  // The two track menus are memoized (see useLatestCallback), so their
+  // handlers keep one identity across the per-tick renders.
+  const onAudioPick = useLatestCallback(async (id: number | null) => {
+    if (id == null) return;
+    try {
+      await invoke("set_audio_track", { track: id });
+      window.dispatchEvent(new Event("aura:tracks-refresh"));
+      const t = audioTracks.find((x) => x.id === id);
+      fireToast(`Audio · ${t?.title ?? t?.lang?.toUpperCase() ?? `#${id}`}`);
+      // Persist the picked LANGUAGE (not the numeric id:
+      // ids change between releases) so a sibling episode
+      // or a re-watch picks the same language automatically.
+      if (activeTarget && t?.lang) {
+        setTitleState(activeTarget.media_type, titleStateKey(activeTarget), {
+          audio_lang: t.lang.toLowerCase(),
+        });
+      }
+    } catch {}
+  });
+  const onSubOff = useLatestCallback(async () => {
+    // True off: hide subtitles entirely. We use sub-visibility
+    // because some libmpv builds reject `sid=no` after a sub-add.
+    // A manual choice decides this file: no later auto-select,
+    // external fallback or Off-preference mirror overrides it.
+    subAutoSelectedRef.current = true;
+    try {
+      await invoke("set_subtitle_visibility", { visible: false });
+      setSubsMuted(true);
+      setSelectedSubId(null);
+      fireToast("Subtitles off");
+      if (activeTarget) {
+        subOffWrittenKeyRef.current = titleStateKey(activeTarget);
+        setTitleState(activeTarget.media_type, titleStateKey(activeTarget), {
+          sub_lang: "off",
+        });
+      }
+    } catch {}
+  });
+  const onSubPick = useLatestCallback(async (id: number | null) => {
+    // Ignore picks while one is still landing. Adding an external
+    // subtitle occupies the engine thread, so before this guard a
+    // run of impatient clicks queued a run of blocking loads and
+    // stalled every other playback command behind them. The
+    // optimistic `setSelectedSubId` calls below are what make the
+    // wait visible, so the user has no reason to click again.
+    if (subPickBusyRef.current) return;
+    subPickBusyRef.current = true;
+    // A manual pick decides this file (see onOff above).
+    subAutoSelectedRef.current = true;
+    const prevSubId = selectedSubId;
+    try {
+    // Picking any track also re-enables visibility.
+    try {
+      await invoke("set_subtitle_visibility", { visible: true });
+      setSubsMuted(false);
+    } catch {}
+
+    if (id == null) {
+      setSelectedSubId(null);
+      invoke("set_subtitle_track", { track: "no" })
+        .then(() => window.dispatchEvent(new Event("aura:tracks-refresh")))
+        .catch(() => {});
+      return;
+    }
+    // Negative IDs are external addon entries (synthetic
+    // negative IDs we mint in `subDropdownItems`).
+    if (id < 0) {
+      const ext = subDropdownItems.find((t) => t.id === id);
+      const url = ext?.codec;
+      if (!url) return;
+      // If this URL has already been sub-added in this
+      // session, MPV has an embedded track for it. Find that
+      // track by matching title and just switch to it
+      // instead of re-adding (which would create a duplicate).
+      // The dedupe in `subDropdownItems` hides the external
+      // entry once a track-refresh picks up the new embedded
+      // track, but there's a brief window before that fires.
+      const matching = embeddedSubTracks.find(
+        (e) => e.title && e.title === ext?.title,
+      );
+      if (matching) {
+        try {
+          await invoke("set_subtitle_track", { track: matching.id });
+          setSelectedSubId(matching.id);
+          window.dispatchEvent(new Event("aura:tracks-refresh"));
+          fireToast(
+            `Subtitles · ${matching.title ?? matching.lang?.toUpperCase() ?? `#${matching.id}`}`,
+          );
+          if (activeTarget && matching.lang) {
+            setTitleState(activeTarget.media_type, titleStateKey(activeTarget), {
+              sub_lang: matching.lang.toLowerCase(),
+            });
+          } else {
+            clearTitleSubOff();
+          }
+        } catch {}
+        return;
+      }
+      try {
+        // Optimistic. Adding an external subtitle is not instant,
+        // and leaving the row on the OLD selection while it lands
+        // is precisely what reads as "the pick did nothing".
+        setSelectedSubId(id); // negative menu id until the refresh swaps in the live track
+        // Pass title + lang so MPV labels the new track
+        // sensibly (otherwise it auto-titles from the URL,
+        // which surfaces as e.g. "1958307247" in the
+        // dropdown). The title is also what powers the
+        // dedupe above on the next refresh, so it is pinned to
+        // this url for the rest of the file.
+        if (ext?.title) extTitleByUrlRef.current.set(url, ext.title);
+        await invoke("add_subtitle_to_mpv", {
+          path: url,
+          flag: "select",
+          title: ext?.title,
+          lang: ext?.lang ?? null,
+        });
+        window.dispatchEvent(new Event("aura:tracks-refresh"));
+        fireToast(`Subtitles · ${ext?.lang?.toUpperCase() ?? "external"}`);
+        if (activeTarget && ext?.lang) {
+          setTitleState(activeTarget.media_type, titleStateKey(activeTarget), {
+            sub_lang: ext.lang.toLowerCase(),
+          });
+        } else {
+          clearTitleSubOff();
+        }
+      } catch (e) {
+        setSelectedSubId(prevSubId);
+        if (ext?.title && extTitleByUrlRef.current.get(url) === ext.title) {
+          extTitleByUrlRef.current.delete(url);
+        }
+        console.error("sub-add failed", e);
+      }
+      return;
+    }
+    try {
+      setSelectedSubId(id);
+      await invoke("set_subtitle_track", { track: id });
+      window.dispatchEvent(new Event("aura:tracks-refresh"));
+      const t = subDropdownItems.find((x) => x.id === id);
+      fireToast(`Subtitles · ${t?.title ?? t?.lang?.toUpperCase() ?? `#${id}`}`);
+      if (activeTarget && t?.lang) {
+        setTitleState(activeTarget.media_type, titleStateKey(activeTarget), {
+          sub_lang: t.lang.toLowerCase(),
+        });
+      } else {
+        clearTitleSubOff();
+      }
+    } catch { setSelectedSubId(prevSubId); }
+    } finally {
+      subPickBusyRef.current = false;
+    }
+  });
+  const audioDelayRow = useMemo(() => ({
+    label: "Audio sync",
+    value: audioDelay,
+    onMinus: () => nudgeAudioDelay(-0.1),
+    onPlus:  () => nudgeAudioDelay(+0.1),
+    onReset: resetAudioDelay,
+  }), [audioDelay, nudgeAudioDelay, resetAudioDelay]);
+  const openSyncPanel = useCallback(() => setSyncOpen(true), []);
+  const closeSubsPicker = useCallback(() => setSubsOpen(false), [setSubsOpen]);
+  const onSubsLoaded = useLatestCallback(() => {
+    // A manual load decides this file and must be visible, also when
+    // subtitles were Off (sub-visibility is independent of the track).
+    subAutoSelectedRef.current = true;
+    setSelectedSubId(null);
+    setSubsMuted(false);
+    invoke("set_subtitle_visibility", { visible: true }).catch(() => {});
+    clearTitleSubOff();
+    window.dispatchEvent(new Event("aura:tracks-refresh"));
+  });
+  // MoreMenu (AniSkip's "Now" buttons) reads the playhead only on a click, so
+  // it gets a getter instead of `time` and stays out of the per-tick render.
+  const timeRef = useRef(time);
+  timeRef.current = time;
+  const getTime = useCallback(() => timeRef.current, []);
+  const closeSyncPanel = useCallback(() => setSyncOpen(false), []);
+  const subDelayRow = useMemo(() => ({
+    label: "Subtitle sync",
+    value: subDelay,
+    onMinus: () => nudgeSubDelay(-0.1),
+    onPlus:  () => nudgeSubDelay(+0.1),
+    onReset: resetSubDelay,
+    onLiveSync: openSyncPanel,
+  }), [subDelay, nudgeSubDelay, resetSubDelay, openSyncPanel]);
+
   // ── Click interaction layer ────────────────────────────────────────
   // An invisible absolute layer behind the controls (z-0 within the
   // overlay) that captures click events on the video region. Single click
@@ -2362,9 +2733,11 @@ export default function PlayerOverlay({
     // silently eaten. Latent while only `subsOpen` fed anyMenuOpen; reachable
     // every session once right-clicking over an open panel is a real gesture.
     if (e.button !== 0) return;
-    if (anyMenuOpenRef.current) {
-      dismissNextClickRef.current = true;
-    }
+    // ASSIGNED on every press, never only set: a flag armed by a press whose
+    // click never reached handleVideoClick (eaten by the Watch Party panel's
+    // dismiss while a title-bar panel was also closing, or a press dragged
+    // off the video) would otherwise eat the user's next deliberate click.
+    dismissNextClickRef.current = anyMenuOpenRef.current;
   }, []);
   const handleVideoClick = useCallback(() => {
     if (dismissNextClickRef.current) {
@@ -2404,6 +2777,7 @@ export default function PlayerOverlay({
   return (
     <MenuTrackerCtx.Provider value={menuTracker}>
     <div
+      ref={overlayRootRef}
       className="fixed inset-0 z-[9999] pointer-events-none"
       style={{ background: "transparent" }}
     >
@@ -2413,6 +2787,7 @@ export default function PlayerOverlay({
               so children intercept before reaching this layer. ── */}
       <div
         aria-hidden
+        data-player-click-layer
         onMouseDown={handleVideoMouseDown}
         onClick={handleVideoClick}
         onDoubleClick={handleVideoDoubleClick}
@@ -2443,13 +2818,11 @@ export default function PlayerOverlay({
         <div
           className="absolute left-1/2 -translate-x-1/2 z-30 pointer-events-none
                      px-5 py-2.5 rounded-full
-                     aura-glass-menu
-                     text-white text-[14px] font-medium tracking-wide
-                     shadow-glass-edge"
+                     aura-glass-player
+                     text-white text-[14px] font-medium tracking-wide"
           style={{
             top: isFullscreen ? "10%" : "calc(10% + 36px)",
             animation: "aura-toast-pop 220ms cubic-bezier(0.34, 1.56, 0.64, 1)",
-            textShadow: "0 1px 4px rgba(0,0,0,0.85)",
           }}
         >
           {toast}
@@ -2474,58 +2847,70 @@ export default function PlayerOverlay({
         skipModes={skipModes}
       />
 
-      {/* ── Top scrim — gradient fade from black to transparent so the
+      {/* ── Top scrim: a gradient fade from black to transparent so the
               title + episode info stay readable over bright backgrounds
               (e.g. anime opening sky shots). Sits BEHIND the title bar
-              (z-0) and fades with the controls. ── */}
+              (z-0) and fades with the controls. Windowed it starts under
+              the 36 px TitleBar (which is opaque there), so its densest
+              part lies behind the title instead of behind the bar. ── */}
       <div
-        className="absolute inset-x-0 top-0 h-40 pointer-events-none transition-opacity duration-500 ease-in-out"
+        className="aura-player-top-scrim absolute inset-x-0 pointer-events-none transition-opacity duration-500 ease-in-out"
         style={{
+          top: isFullscreen ? 0 : 36,
           opacity: controlsVisible ? 1 : 0,
-          background:
-            "linear-gradient(to bottom, rgba(0,0,0,0.65) 0%, rgba(0,0,0,0.45) 35%, rgba(0,0,0,0.0) 100%)",
         }}
       />
 
-      {/* ── Top bar: exit playback + prominent title + (optional) episode ──
-              In windowed mode the Aura TitleBar (36 px) sits above this
-              overlay. We push the controls down to 4 + 36 = 40 px so they
-              don't overlap. In fullscreen the TitleBar is unmounted, so
-              we revert to a clean 16 px inset. */}
+      {/* ── Top bar: back (exit playback) + prominent title + (optional)
+              episode. In windowed mode the Aura TitleBar (36 px) sits
+              above this overlay, so the row starts at 16 + 36 = 52 px; in
+              fullscreen the TitleBar is unmounted and it is a clean 16 px
+              inset. `left-6` is the top-left stack's own inset
+              (PlayerStackSlot, NextUpCta), so the back button's edge and
+              the skip card's edge line up. ── */}
       <div
-        className={`absolute left-4 right-4 flex items-start gap-4
+        className={`absolute left-6 right-6 flex items-center gap-3
                     pointer-events-auto transition-opacity duration-300`}
         style={{
           opacity: controlsVisible ? 1 : 0,
           top: isFullscreen ? 16 : 16 + 36,
+          // Faded out, the row takes no clicks: a blind click at the top left
+          // would otherwise exit playback through the invisible back button,
+          // and the title band would swallow the video layer's pause /
+          // fullscreen clicks. The first move wakes the row (EpisodeEdgeTrigger
+          // does the same).
+          pointerEvents: controlsVisible ? "auto" : "none",
         }}
       >
-        <button
-          onClick={onExitPlayback}
-          aria-label="Exit playback"
-          className="flex-shrink-0 mt-0.5 flex items-center gap-2 px-3 h-9 rounded-full
-                     bg-black/97 backdrop-blur-xl border border-white/30
-                     text-white/85 hover:text-white text-xs font-semibold tracking-[0.14em] uppercase
-                     transition-colors"
-        >
-          <ExitIcon />
-          <span>Exit playback</span>
-        </button>
+        {/* Icon only, still the player material (no backdrop over the
+            video). Esc exits playback only while windowed: in fullscreen
+            it leaves fullscreen first, so the hint follows. */}
+        <Tooltip text="Exit playback" shortcut={isFullscreen ? undefined : "Esc"} pos="bottom" className="flex-shrink-0">
+          <button
+            type="button"
+            onClick={onExitPlayback}
+            aria-label="Exit playback"
+            className="aura-glass-player aura-player-btn aura-player-back aura-glass-press flex items-center justify-center w-10 h-10 rounded-full
+                       text-white/85 hover:text-white"
+          >
+            <BackIcon />
+          </button>
+        </Tooltip>
         {activeTarget && (
-          <div className="flex-1 min-w-0 flex flex-col gap-0.5 select-none">
-            <h1
-              className="text-white text-2xl font-semibold tracking-tight leading-[1.1] truncate"
-              style={{ textShadow: "0 2px 12px rgba(0,0,0,0.9), 0 0 24px rgba(0,0,0,0.55)" }}
-            >
+          // The title block is plain text over the video, no surface (the
+          // user's call, 2026-11-22: the glass box around it read as one
+          // box too many). Legibility comes from the dense, tight text
+          // shadow (`.aura-player-title`, styles/glass-player.css), the top
+          // scrim above and its corner shade; the accent code is the mark
+          // text with a higher lightness floor (`.aura-player-title-code`).
+          <div className="aura-player-title flex-1 min-w-0 flex flex-col gap-0.5 select-none">
+            <h1 className="text-white text-2xl font-semibold tracking-tight leading-[1.1] truncate">
               {activeTarget.name}
             </h1>
             {(activeTarget.episode || activeTarget.episode_title) && (
-              <p
-                className="text-white/85 text-[13.5px] font-medium tracking-[0.02em] truncate"
-                style={{ textShadow: "0 1px 6px rgba(0,0,0,0.92)" }}
-              >
+              <p className="text-white/90 text-[13.5px] font-medium tracking-[0.02em] truncate">
                 {activeTarget.episode && (
-                  <span className="font-mono text-ln-accent/90 mr-2">
+                  <span className="aura-player-title-code font-mono mr-2">
                     {activeTarget.episode}
                     {/* Absolute-episode annotation on a saga show that uses
                         per-season numbering (empty otherwise). absolute_episode_num
@@ -2536,15 +2921,15 @@ export default function PlayerOverlay({
                         activeTarget.episode_num,
                         activeTarget.absolute_episode_num,
                       );
-                      return tag ? <span className="text-white/45 ml-1.5">{tag}</span> : null;
+                      return tag ? <span className="text-white/75 ml-1.5">{tag}</span> : null;
                     })()}
                   </span>
                 )}
                 {activeTarget.episode_title && (
-                  <span className="text-white/85">{activeTarget.episode_title}</span>
+                  <span className="text-white/90">{activeTarget.episode_title}</span>
                 )}
                 {chapterLabel && (
-                  <span className="font-mono text-white/50 text-[12px] ml-2.5" title="Manga chapters this episode adapts">
+                  <span className="font-mono text-white/75 text-[12px] ml-2.5" title="Manga chapters this episode adapts">
                     {chapterLabel}
                   </span>
                 )}
@@ -2554,14 +2939,13 @@ export default function PlayerOverlay({
         )}
       </div>
 
-      {/* Bottom gradient vignette — darkens bright video behind the control bar */}
+      {/* Bottom gradient vignette: darkens bright video behind the control bar.
+          Its gradient and fade live in glass-misc.css (.aura-player-vignette),
+          which lightens it while the bar below is marked real glass; that rule
+          needs this div to stay a PRECEDING SIBLING of the bar's wrapper. */}
       <div
-        className="absolute inset-x-0 bottom-0 h-56 pointer-events-none"
-        style={{
-          opacity: controlsVisible ? 1 : 0,
-          transition: "opacity 500ms ease-in-out",
-          background: "linear-gradient(to top, rgba(0,0,0,0.75) 0%, transparent 100%)",
-        }}
+        className="aura-player-vignette absolute inset-x-0 bottom-0 h-56 pointer-events-none"
+        style={{ opacity: controlsVisible ? 1 : 0 }}
       />
 
       {/* ── Bottom: control bar ── */}
@@ -2571,7 +2955,8 @@ export default function PlayerOverlay({
         style={{ opacity: controlsVisible ? 1 : 0 }}
       >
         <div
-          className="aura-glass-bar rounded-2xl px-4 pt-2 pb-3 w-full max-w-[1100px]
+          ref={glassBarRef}
+          className="aura-glass-player aura-player-bar rounded-[22px] px-4 pt-2 pb-3 w-full max-w-[1100px]
                      pointer-events-auto"
         >
           {/* ── Scrubber (full-width row). VOD gets the full thumbnail
@@ -2652,9 +3037,8 @@ export default function PlayerOverlay({
                 <button
                   onClick={togglePause}
                   aria-label={paused ? "Play" : "Pause"}
-                  className="flex items-center justify-center w-11 h-11 rounded-full
-                             bg-ln-accent/15 text-ln-accent hover:bg-ln-accent/25
-                             transition-colors flex-shrink-0"
+                  className="aura-glass-flat is-primary aura-glass-press flex items-center justify-center
+                             w-11 h-11 rounded-full flex-shrink-0"
                 >
                   {paused ? <PlayIcon /> : <PauseIcon />}
                 </button>
@@ -2692,7 +3076,7 @@ export default function PlayerOverlay({
                   <span className="text-red-300/90 font-semibold text-[12px] tracking-wide">LIVE</span>
                 </div>
               ) : (
-                <div className="ml-2 flex items-center gap-1.5 text-white/70 font-mono text-[12px] tabular-nums">
+                <div className="aura-player-time-dim ml-2 flex items-center gap-1.5 text-white/70 font-mono text-[12px] tabular-nums">
                   <span className="w-1.5 h-1.5 rounded-full bg-white/40" />
                   <span>−{fmtBehind(Math.max(0, dvr.edge - dvr.position))} behind</span>
                 </div>
@@ -2700,8 +3084,8 @@ export default function PlayerOverlay({
             ) : (
               <div className="ml-2 flex items-center gap-2 text-white/85 font-mono text-[12.5px] tabular-nums">
                 <span>{fmt(displayTime)}</span>
-                <span className="text-white/30">/</span>
-                <span className="text-white/55">{fmt(duration)}</span>
+                <span className="text-white/50">/</span>
+                <span className="aura-player-time-dim text-white/60">{fmt(duration)}</span>
               </div>
             )}
 
@@ -2750,34 +3134,12 @@ export default function PlayerOverlay({
             <TrackMenu
               label="Audio (Language)"
               tooltip="Audio language / track"
-              icon={<AudioIcon />}
+              icon={AUDIO_ICON_EL}
               tracks={audioTracks}
               allowOff={false}
-              onPick={async (id) => {
-                if (id == null) return;
-                try {
-                  await invoke("set_audio_track", { track: id });
-                  window.dispatchEvent(new Event("aura:tracks-refresh"));
-                  const t = audioTracks.find((x) => x.id === id);
-                  fireToast(`Audio · ${t?.title ?? t?.lang?.toUpperCase() ?? `#${id}`}`);
-                  // Persist the picked LANGUAGE (not the numeric id —
-                  // ids change between releases) so a sibling episode
-                  // or a re-watch picks the same language automatically.
-                  if (activeTarget && t?.lang) {
-                    setTitleState(activeTarget.media_type, titleStateKey(activeTarget), {
-                      audio_lang: t.lang.toLowerCase(),
-                    });
-                  }
-                } catch {}
-              }}
+              onPick={onAudioPick}
               emptyHint="No audio tracks reported yet"
-              delay={{
-                label: "Audio sync",
-                value: audioDelay,
-                onMinus: () => nudgeAudioDelay(-0.1),
-                onPlus:  () => nudgeAudioDelay(+0.1),
-                onReset: resetAudioDelay,
-              }}
+              delay={audioDelayRow}
             />
 
             {/* Subtitle tracks — embedded MPV tracks merged with external
@@ -2786,143 +3148,17 @@ export default function PlayerOverlay({
             <TrackMenu
               label="Subtitles"
               tooltip="Subtitle track"
-              icon={<SubsIcon />}
+              icon={SUBS_ICON_EL}
               tracks={subDropdownItems}
               isOff={subsMuted}
-              onOff={async () => {
-                // True off — hide subtitles entirely. We use sub-visibility
-                // because some libmpv builds reject `sid=no` after a sub-add.
-                try {
-                  await invoke("set_subtitle_visibility", { visible: false });
-                  setSubsMuted(true);
-                  setSelectedSubId(null);
-                  fireToast("Subtitles off");
-                  if (activeTarget) {
-                    setTitleState(activeTarget.media_type, titleStateKey(activeTarget), {
-                      sub_lang: "off",
-                    });
-                  }
-                } catch {}
-              }}
-              onPick={async (id) => {
-                // Ignore picks while one is still landing. Adding an external
-                // subtitle occupies the engine thread, so before this guard a
-                // run of impatient clicks queued a run of blocking loads and
-                // stalled every other playback command behind them. The
-                // optimistic `setSelectedSubId` calls below are what make the
-                // wait visible, so the user has no reason to click again.
-                if (subPickBusyRef.current) return;
-                subPickBusyRef.current = true;
-                const prevSubId = selectedSubId;
-                try {
-                // Picking any track also re-enables visibility.
-                try {
-                  await invoke("set_subtitle_visibility", { visible: true });
-                  setSubsMuted(false);
-                } catch {}
-
-                if (id == null) {
-                  setSelectedSubId(null);
-                  invoke("set_subtitle_track", { track: "no" })
-                    .then(() => window.dispatchEvent(new Event("aura:tracks-refresh")))
-                    .catch(() => {});
-                  return;
-                }
-                // Negative IDs are external addon entries (synthetic
-                // negative IDs we mint in `subDropdownItems`).
-                if (id < 0) {
-                  const ext = subDropdownItems.find((t) => t.id === id);
-                  const url = ext?.codec;
-                  if (!url) return;
-                  // If this URL has already been sub-added in this
-                  // session, MPV has an embedded track for it. Find that
-                  // track by matching title and just switch to it
-                  // instead of re-adding (which would create a duplicate).
-                  // The dedupe in `subDropdownItems` hides the external
-                  // entry once a track-refresh picks up the new embedded
-                  // track, but there's a brief window before that fires.
-                  const matching = embeddedSubTracks.find(
-                    (e) => e.title && e.title === ext?.title,
-                  );
-                  if (matching) {
-                    try {
-                      await invoke("set_subtitle_track", { track: matching.id });
-                      setSelectedSubId(matching.id);
-                      window.dispatchEvent(new Event("aura:tracks-refresh"));
-                      fireToast(
-                        `Subtitles · ${matching.title ?? matching.lang?.toUpperCase() ?? `#${matching.id}`}`,
-                      );
-                      if (activeTarget && matching.lang) {
-                        setTitleState(activeTarget.media_type, titleStateKey(activeTarget), {
-                          sub_lang: matching.lang.toLowerCase(),
-                        });
-                      }
-                    } catch {}
-                    return;
-                  }
-                  try {
-                    // Optimistic. Adding an external subtitle is not instant,
-                    // and leaving the row on the OLD selection while it lands
-                    // is precisely what reads as "the pick did nothing".
-                    setSelectedSubId(id); // negative menu id until the refresh swaps in the live track
-                    // Pass title + lang so MPV labels the new track
-                    // sensibly (otherwise it auto-titles from the URL,
-                    // which surfaces as e.g. "1958307247" in the
-                    // dropdown). The title is also what powers the
-                    // dedupe above on the next refresh, so it is pinned to
-                    // this url for the rest of the file.
-                    if (ext?.title) extTitleByUrlRef.current.set(url, ext.title);
-                    await invoke("add_subtitle_to_mpv", {
-                      path: url,
-                      flag: "select",
-                      title: ext?.title,
-                      lang: ext?.lang ?? null,
-                    });
-                    window.dispatchEvent(new Event("aura:tracks-refresh"));
-                    fireToast(`Subtitles · ${ext?.lang?.toUpperCase() ?? "external"}`);
-                    if (activeTarget && ext?.lang) {
-                      setTitleState(activeTarget.media_type, titleStateKey(activeTarget), {
-                        sub_lang: ext.lang.toLowerCase(),
-                      });
-                    }
-                  } catch (e) {
-                    setSelectedSubId(prevSubId);
-                    if (ext?.title && extTitleByUrlRef.current.get(url) === ext.title) {
-                      extTitleByUrlRef.current.delete(url);
-                    }
-                    console.error("sub-add failed", e);
-                  }
-                  return;
-                }
-                try {
-                  setSelectedSubId(id);
-                  await invoke("set_subtitle_track", { track: id });
-                  window.dispatchEvent(new Event("aura:tracks-refresh"));
-                  const t = subDropdownItems.find((x) => x.id === id);
-                  fireToast(`Subtitles · ${t?.title ?? t?.lang?.toUpperCase() ?? `#${id}`}`);
-                  if (activeTarget && t?.lang) {
-                    setTitleState(activeTarget.media_type, titleStateKey(activeTarget), {
-                      sub_lang: t.lang.toLowerCase(),
-                    });
-                  }
-                } catch { setSelectedSubId(prevSubId); }
-                } finally {
-                  subPickBusyRef.current = false;
-                }
-              }}
+              onOff={onSubOff}
+              onPick={onSubPick}
               emptyHint="No subtitle tracks"
-              delay={{
-                label: "Subtitle sync",
-                value: subDelay,
-                onMinus: () => nudgeSubDelay(-0.1),
-                onPlus:  () => nudgeSubDelay(+0.1),
-                onReset: resetSubDelay,
-                onLiveSync: () => setSyncOpen(true),
-              }}
+              delay={subDelayRow}
             />
 
             {/* Subtitle styling — same six controls as Settings, inline. */}
-            <SubtitleStyleMenu />
+            <SubtitleStyleMenu onOpenChange={setSubStyleOpen} />
 
             {/* Shader / upscaler */}
             <ShaderPicker
@@ -2969,7 +3205,7 @@ export default function PlayerOverlay({
               streamUrl={streamUrl}
               activeTarget={activeTarget}
               isAnime={isAnime}
-              time={time}
+              getTime={getTime}
               duration={duration}
               skipWindows={skipWindowsForScrub}
               isFullscreen={isFullscreen}
@@ -2997,7 +3233,8 @@ export default function PlayerOverlay({
         }
         streamUrl={streamUrl}
         streamHash={streamHash}
-        onClose={() => setSubsOpen(false)}
+        onClose={closeSubsPicker}
+        onLoaded={onSubsLoaded}
       />
 
       {/* Live Subtitle Sync: cue picker. Sibling of SubtitlePicker, inside
@@ -3007,8 +3244,10 @@ export default function PlayerOverlay({
           component's state so they survive the panel closing and reopening. */}
       <SubtitleSyncPanel
         open={syncOpen}
-        onClose={() => setSyncOpen(false)}
-        currentTime={time}
+        onClose={closeSyncPanel}
+        // The panel reads the playhead only when it opens (its anchor), so a
+        // closed panel gets a constant and its memo skips every tick.
+        currentTime={syncOpen ? time : 0}
         paused={paused}
         togglePause={togglePause}
         tracks={tracks}
@@ -3554,12 +3793,15 @@ function Scrubber({
             transform: "translateX(-50%)",
           }}
         >
+          {/* data-glass-glint="off" on all three: the pointer can never be
+              over this popover (pointer-events-none, it follows the cursor
+              along the track), so a cursor-lit edge here only distracts. */}
           {hoveredSegment && (
-            <div className="aura-glass-menu rounded-md px-3 py-2 text-[11.5px] min-w-[160px]">
+            <div data-glass-glint="off" className="aura-glass-player rounded-[10px] px-3 py-2 text-[11.5px] min-w-[160px]">
               <div className="text-white font-semibold tracking-wide">
                 {skipKindLabel(hoveredSegment.seg.type)}
                 {hoveredSegment.seg.type === "mixed-op" && (
-                  <span className="text-white/45 font-normal ml-1.5">(mixed)</span>
+                  <span className="text-white/60 font-normal ml-1.5">(mixed)</span>
                 )}
               </div>
               {/* The song, when identified. Reads above the timings because
@@ -3573,7 +3815,7 @@ function Scrubber({
               <div className="text-white/75 font-mono tabular-nums mt-0.5">
                 {fmtTime(hoveredSegment.seg.start)} - {fmtTime(hoveredSegment.seg.end)}
               </div>
-              <div className="text-white/45 text-[10px] mt-0.5">
+              <div className="text-white/60 text-[10px] mt-0.5">
                 {(hoveredSegment.seg.end - hoveredSegment.seg.start).toFixed(1)}s
                 {hoveredSegment.seg.source && (
                   <span className="ml-2">· {skipSourceLabel(hoveredSegment.seg.source)}</span>
@@ -3586,7 +3828,7 @@ function Scrubber({
                     prompt itself say why. */}
                 {!hoveredSegment.seg.auto && skipModes
                   && skipHeldReason(hoveredSegment.seg, skipModes) && (
-                  <span className="ml-2 text-white/50">· prompt only</span>
+                  <span className="ml-2 text-white/60">· prompt only</span>
                 )}
               </div>
               {/* Confidence: the level, then the note in full (no tooltip
@@ -3604,8 +3846,7 @@ function Scrubber({
             </div>
           )}
           {thumbnailAt && (thumbUrl || thumbBusy) && (
-            <div className="relative w-40 aspect-video rounded-md overflow-hidden
-                            aura-glass-menu shadow-[0_8px_24px_-8px_rgba(0,0,0,0.7)]">
+            <div data-glass-glint="off" className="relative w-40 aspect-video rounded-[10px] overflow-hidden aura-glass-player">
               {/* Gate the <img> on thumbUrlSec === hoverIntSec so a stale URL
                   (a prior sec's fetch resolving after the user moved) NEVER
                   paints over a new hover — the loader fills that gap. Each
@@ -3636,7 +3877,7 @@ function Scrubber({
               )}
             </div>
           )}
-          <div className="aura-glass-menu rounded px-2 py-0.5 text-[11px]
+          <div data-glass-glint="off" className="aura-glass-player rounded-[7px] px-2 py-0.5 text-[11px]
                           font-mono tabular-nums text-white/90">
             {fmtTime(hoverSec)}
           </div>
@@ -3652,7 +3893,7 @@ function Scrubber({
 // VolumeControl — icon button + slider that expands on hover/focus.
 // ---------------------------------------------------------------------------
 
-function VolumeControl({
+const VolumeControl = memo(function VolumeControl({
   volume, isMuted, onMute, onChange, Icon,
 }: {
   volume: number;
@@ -3719,7 +3960,7 @@ function VolumeControl({
     >
       <div
         className="absolute right-full top-1/2 -translate-y-1/2 mr-0.5 overflow-hidden rounded-full
-                   aura-glass-menu transition-[width,opacity] duration-200 ease-out"
+                   aura-glass-player transition-[width,opacity] duration-200 ease-out"
         style={{ width: open ? 160 : 0, opacity: open ? 1 : 0, pointerEvents: open ? "auto" : "none" }}
         aria-hidden={!open}
       >
@@ -3794,13 +4035,13 @@ function VolumeControl({
       </Tooltip>
     </div>
   );
-}
+});
 
 // ---------------------------------------------------------------------------
 // SpeedMenu — discrete-stop dropdown 0.5x → 5x with 0.25 increments.
 // ---------------------------------------------------------------------------
 
-function SpeedMenu({
+const SpeedMenu = memo(function SpeedMenu({
   speed, onChange,
 }: {
   speed: number;
@@ -3869,7 +4110,7 @@ function SpeedMenu({
       )}
     </div>
   );
-}
+});
 
 // Sliders / "tune" glyph for the trailer quality pill.
 const QualityIcon = () => (
@@ -3891,7 +4132,7 @@ const TRAILER_QUALITY_OPTIONS: { value: string; label: string }[] = [
 // playback. The button shows the resolved quality (e.g. "1080p"); picking a
 // rung re-resolves via yt-dlp and swaps in place at the current playhead.
 // ---------------------------------------------------------------------------
-function TrailerQualityMenu({
+const TrailerQualityMenu = memo(function TrailerQualityMenu({
   quality, label, maxHeight, resolving, onSelect,
 }: {
   quality: string;
@@ -3961,7 +4202,7 @@ function TrailerQualityMenu({
       )}
     </div>
   );
-}
+});
 
 // ---------------------------------------------------------------------------
 // TrackMenu — generic dropdown for audio + subtitle tracks.
@@ -3973,7 +4214,7 @@ interface TrackMenuExtra {
   accent?: boolean;
 }
 
-function TrackMenu({
+const TrackMenu = memo(function TrackMenu({
   label, tooltip, icon, tracks, onPick, extraItems, emptyHint,
   isOff, onOff, allowOff = true, delay,
 }: {
@@ -4138,20 +4379,21 @@ function TrackMenu({
       )}
     </div>
   );
-}
+});
 
 // ---------------------------------------------------------------------------
 // MoreMenu — Copy link / Download / External / Restart …
 // ---------------------------------------------------------------------------
 
-function MoreMenu({
-  streamUrl, activeTarget, isAnime, time, duration, skipWindows, isFullscreen,
+const MoreMenu = memo(function MoreMenu({
+  streamUrl, activeTarget, isAnime, getTime, duration, skipWindows, isFullscreen,
 }: {
   isFullscreen: boolean;
   streamUrl: string | null;
   activeTarget: ActiveScrobbleTarget | null;
   isAnime: boolean;
-  time: number;
+  /** The live playhead, read on demand (a click), never per render. */
+  getTime: () => number;
   duration: number;
   skipWindows: AuraSkipWindow[];
 }) {
@@ -4275,7 +4517,7 @@ function MoreMenu({
         open={aniskipOpen}
         onClose={() => setAniskipOpen(false)}
         activeTarget={activeTarget}
-        time={time}
+        getTime={getTime}
         duration={duration}
         windows={skipWindows}
         superseded={supersededSkipWindows}
@@ -4416,7 +4658,7 @@ function MoreMenu({
       )}
     </div>
   );
-}
+});
 
 function MoreItem({
   icon, label, onClick, disabled,
@@ -4440,7 +4682,7 @@ function MoreItem({
 // looking at. Same Aura gradient as the title-bar wordmark.
 // ---------------------------------------------------------------------------
 
-function BufferingOverlay({
+const BufferingOverlay = memo(function BufferingOverlay({
   show, statusText, bufferPct, title, logo,
 }: {
   show: boolean;
@@ -4454,37 +4696,63 @@ function BufferingOverlay({
   title: string;
   logo: string | null;
 }) {
+  // The logo's natural aspect ratio, read when it loads. The box is sized from
+  // it (App.css "BufferingOverlay size") rather than from the image's natural
+  // pixels: the old `max-h-32 w-auto` only CAPPED the height, so a logo served
+  // small (a 420 x 72 wordmark) rendered at its natural 72 px. A logo that
+  // fails every retry falls back to the text title instead of an empty gap.
+  const [logoAr, setLogoAr] = useState<number | null>(null);
+  const [logoFailed, setLogoFailed] = useState(false);
+  useEffect(() => { setLogoAr(null); setLogoFailed(false); }, [logo]);
   if (!title && !logo) return null;
+  const showLogo = !!logo && !(logoFailed && title);
+  // Clamped so a sliver or a tall emblem cannot blow the box up; 2.5 (a
+  // typical fanart wordmark) until the real ratio is known.
+  const ar = Math.min(8, Math.max(0.5, logoAr ?? 2.5));
   return (
     <div
-      className="absolute inset-0 flex items-center justify-center pointer-events-none"
+      className="aura-buffering-root absolute inset-0 flex items-center justify-center pointer-events-none overflow-hidden"
+      data-show={show ? "true" : "false"}
       style={{
         opacity: show ? 1 : 0,
         transition: "opacity 320ms ease-out",
       }}
     >
-      <div className="flex flex-col items-center gap-5">
-        {logo ? (
+      {/* No scrim and no glow behind this block: a large dark ramp bands over
+          a dark frame (8-bit composite over mpv), and a coloured halo hugging
+          the silhouette read as a blob. Legibility is a tight dark edge on
+          each piece (App.css "BufferingOverlay legibility"). */}
+      <div className="flex flex-col items-center gap-6">
+        {showLogo ? (
           <div
-            className="aura-buffering-pulse"
-            style={{ filter: "drop-shadow(0 6px 22px rgba(0,0,0,0.85)) drop-shadow(0 0 28px rgba(91,164,255,0.32))" }}
+            className="aura-buffering-pulse aura-buffering-logo"
+            style={{
+              "--aura-logo-ar": ar,
+              "--aura-logo-k": Math.pow(ar, -0.2),
+            } as React.CSSProperties}
           >
             <ImageLoader
               src={logo}
               alt={title}
-              className="block"
-              imgClassName="block max-h-32 w-auto object-contain"
+              loading="eager"
+              className="block w-full h-full"
+              imgClassName="block w-full h-full object-contain"
+              // No shimmer box over the video while the logo loads.
+              skeletonClassName="hidden"
+              onLoad={(img) => {
+                if (img.naturalWidth > 0 && img.naturalHeight > 0) {
+                  setLogoAr(img.naturalWidth / img.naturalHeight);
+                }
+              }}
+              onError={() => setLogoFailed(true)}
             />
           </div>
         ) : (
-          <h2
-            className="aura-buffering-text text-5xl font-light tracking-tight"
-            style={{ textShadow: "0 4px 24px rgba(0,0,0,0.85)" }}
-          >
+          <h2 className="aura-buffering-text font-light tracking-tight">
             {title}
           </h2>
         )}
-        <p className="text-white/60 text-[12.5px] font-mono uppercase tracking-[0.3em]">
+        <p className="aura-buffering-label aura-buffering-status text-white/70 font-mono uppercase tracking-[0.3em]">
           {statusText}…
         </p>
         {/* Progress toward playable: MPV's cache-buffering-state (%), i.e. how
@@ -4493,11 +4761,11 @@ function BufferingOverlay({
             demuxer readahead figure, not load progress, and read as a false
             "already buffered" number on a stalled load. */}
         {typeof bufferPct === "number" && (
-          <div className="flex flex-col items-center gap-1.5 -mt-2 w-40">
-            <span className="text-white/55 text-[13px] font-mono tabular-nums tracking-[0.35em]">
+          <div className="aura-buffering-progress flex flex-col items-center gap-2 -mt-2">
+            <span className="aura-buffering-label aura-buffering-pct text-white/65 font-mono tabular-nums tracking-[0.35em]">
               {Math.round(bufferPct)}%
             </span>
-            <span className="block h-[3px] w-full rounded-full bg-white/12 overflow-hidden">
+            <span className="aura-buffering-track block w-full rounded-full bg-white/12 overflow-hidden">
               <span
                 className="block h-full bg-ln-accent rounded-full transition-[width] duration-300"
                 style={{ width: `${Math.max(0, Math.min(100, bufferPct))}%` }}
@@ -4508,7 +4776,7 @@ function BufferingOverlay({
       </div>
     </div>
   );
-}
+});
 
 // ---------------------------------------------------------------------------
 // Skip windows — React-side controller.
@@ -4720,9 +4988,9 @@ function PlayerStackSlot({
   reserveSlot?: boolean;
   children: React.ReactNode;
 }) {
-  // Top offset has to clear the "Exit playback ↗  <Title>" header above.
-  // That header sits at top: 16 (fs) / 52 (windowed) and its content is
-  // ~64 px tall. 96 / 132 keeps the prompt firmly below it.
+  // Top offset has to clear the back button / title header above. That
+  // header sits at top: 16 (fs) / 52 (windowed) and is ~51 px tall; 84 / 120
+  // keeps the prompt 16 px below it (playerStack.ts).
   const top = playerStackBaseTop(isFullscreen);
   const ref = useRef<HTMLDivElement>(null);
   const holdsSlot = visible || reserveSlot;
@@ -4747,19 +5015,19 @@ function PlayerStackSlot({
   return (
     <div
       ref={ref}
-      // `.aura-stack-surface` / `.aura-stack-enter` (App.css): the surface
+      // `.aura-glass-player.aura-stack-surface` (styles/glass-player.css: the
+      // player's A face, denser) / `.aura-stack-enter` (App.css): the surface
       // and entry the Next Up card under it shares. The entry is a dedicated
       // keyframe, NOT the shared `aura-toast-pop`: that one bakes in a
       // translate(-50%) meant for the centre toast, and this element is
       // left-anchored with no base transform, so it snapped sideways for the
       // whole 220 ms.
-      className={`aura-stack-surface ${mountedHidden ? "" : "aura-stack-enter"} fixed left-6 z-[9000]
-                  pointer-events-none px-6 py-4 rounded-2xl text-white`}
+      className={`aura-glass-player aura-stack-surface ${mountedHidden ? "" : "aura-stack-enter"} fixed left-6 z-[9000]
+                  pointer-events-none px-6 py-4 rounded-[20px] text-white`}
       style={{
         top,
         opacity: visible ? 1 : 0,
         transition: "opacity 400ms ease",
-        textShadow: "0 1px 4px rgba(0,0,0,0.85)",
         // The stack's shared width (playerStack.ts), so the Next Up card
         // under it lines up edge for edge. Inline on purpose: tailwind.config
         // REPLACES the maxWidth scale, so max-w-md and friends emit no CSS.
@@ -4816,7 +5084,7 @@ function SkipMatchRows({ rows }: { rows: readonly SkipMatchRow[] }) {
  *  minute or two of an episode, and a box over the cold open for all of that
  *  would be the very clutter the shared slot avoids. It keeps the slot while
  *  hidden, so a Next Up card under it does not slide on every controls wake. */
-function SkipMatchStatus({
+const SkipMatchStatus = memo(function SkipMatchStatus({
   rows, isFullscreen, visible,
 }: {
   rows: readonly SkipMatchRow[];
@@ -4832,7 +5100,7 @@ function SkipMatchStatus({
       <SkipMatchRows rows={rows} />
     </PlayerStackSlot>
   );
-}
+});
 
 /** Top-left prompt toast rendered when in a prompt-mode window.
  *  Sized larger than the standard control-feedback toast (which lives
@@ -4840,7 +5108,7 @@ function SkipMatchStatus({
  *  offset below the exit-playback / title bar elements (which start at
  *  16 px in fullscreen and 16 + 36 = 52 px in windowed). Uses
  *  `pointer-events-none` so it never intercepts clicks on the controls. */
-function SkipPromptToast({
+const SkipPromptToast = memo(function SkipPromptToast({
   window: w,
   isFullscreen,
   visible,
@@ -4902,7 +5170,7 @@ function SkipPromptToast({
           job is still to tell you the key. Absent for live action and for any
           ambiguous match, which is the common case. */}
       {song && (
-        <div className="text-[13px] text-white/50 mt-1.5 truncate">{song}</div>
+        <div className="text-[13px] text-white/60 mt-1.5 truncate">{song}</div>
       )}
       {/* What the position rests on and, below the top level, what could go
           wrong: the reason a Risky prompt is worth a second look. */}
@@ -4915,17 +5183,17 @@ function SkipPromptToast({
         </div>
       )}
       {heldLine && (
-        <div className="text-[13px] text-white/50 mt-1.5">Auto-skip is on, but {heldLine}.</div>
+        <div className="text-[13px] text-white/60 mt-1.5">Auto-skip is on, but {heldLine}.</div>
       )}
       {matchRows.length > 0 && (
         <div className="mt-3 pt-3 border-t border-white/10">
-          <div className="text-[11px] uppercase tracking-[0.22em] text-white/45 mb-2">Theme check</div>
+          <div className="text-[11px] uppercase tracking-[0.22em] text-white/60 mb-2">Theme check</div>
           <SkipMatchRows rows={matchRows} />
         </div>
       )}
     </PlayerStackSlot>
   );
-}
+});
 
 /** "Kaikai Kitan by Eve", or just the title when the artist is unknown.
  *  Null when nothing was identified, which is what makes every caller fall
@@ -5188,12 +5456,8 @@ function SkipWindowButton({
       <button
         type="button"
         onClick={() => seekAbsolute(target)}
-        className="ml-3 px-3 py-1 rounded-full
-                   bg-ln-accent/20 text-ln-accent
-                   hover:bg-ln-accent/30 active:bg-ln-accent/40
-                   border border-ln-accent/40
-                   text-[12px] font-semibold tracking-wide
-                   transition-colors"
+        className="aura-glass-flat is-primary aura-glass-press ml-3 px-3 py-1 rounded-full
+                   text-[12px] font-semibold tracking-wide"
         title={(() => {
           const conf = skipConfidenceInfo(active);
           return `${label} (${Math.round(active.end - time)} s remaining)`

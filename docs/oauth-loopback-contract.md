@@ -1,12 +1,13 @@
 # OAuth loopback contract (Aura desktop ⇄ aura.animasec.dev proxy)
 
-Aura now runs the Trakt / AniList authorization leg in the user's **default
+Aura now runs the AniList authorization leg in the user's **default
 browser** rather than an in-app webview, because the default browser already
 holds the user's provider session — that is the entire UX win. This is the
 approach RFC 8252 ("OAuth 2.0 for Native Apps") recommends for native clients.
 
-Trakt needed no proxy change (device flow has no redirect). **AniList does.**
-This document is the contract the proxy must implement.
+This document is the contract the proxy must implement for AniList. (Simkl
+signs in with PKCE as a public client and redirects straight to the loopback
+listener, so it involves no proxy at all.)
 
 ---
 
@@ -132,20 +133,3 @@ The nonce is the whole access control: any local process can hit
 `http://127.0.0.1:11471/oauth/callback`, so without it a malicious page could
 plant an attacker-controlled token and silently redirect the user's scrobbles
 into someone else's account.
-
----
-
-## Unrelated bug worth fixing in the same pass
-
-`/oauth/trakt/device/token` augments Trakt's response with `expires_at`, which
-Aura stores and `summarise()` (`scrobble_auth.rs`) renders from directly.
-
-Verify it is an **absolute Unix timestamp in seconds**, not Trakt's
-`expires_in` duration (~7776000). If the duration leaks through, `expires_at`
-lands in 1970, the Settings row shows a permanent red "expired, reconnect now",
-and the user re-authorizes repeatedly **even though scrobbling keeps working** —
-because `refresh_trakt_token` only ever fires reactively on a 401
-(`scrobble.rs:673`, `:760`), never proactively.
-
-Symptom to match against: `Trakt /sync/history OK (status=201)` in the logs
-right up until a manual reconnect.

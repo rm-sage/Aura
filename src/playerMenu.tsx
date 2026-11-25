@@ -17,9 +17,22 @@
 // Legibility over video is the point: a docked menu has no scrim, so nothing
 // here goes below 55% white for text a user has to read, and nothing below
 // 10.5 px.
+//
+// Glass: every panel is `.aura-glass-player` (App.css GLASS SYSTEM, the A
+// face in styles/glass-player.css), the chosen material with no backdrop
+// pass, because the video is a native mpv window under the webview and a
+// backdrop filter would sample nothing. 18 px corners (12 px rows 6 px in, so
+// the corners are concentric, as the rail's). Rows are `.aura-glass-row`
+// (selection marked with `is-selected`, never an accent fill; the selected row
+// wears the rail's active-pill face and takes the cursor light's rim), under
+// one sliding hover droplet per panel in Liquid (useListDroplet), switches
+// `ToggleSwitch` (decorative, size sm), buttons `.aura-glass-flat`. Small grey text is white
+// 0.6 or more: 4.5:1 over a pure white frame on the 0.86 face.
 // ---------------------------------------------------------------------------
 
 import { useEffect, type CSSProperties, type ReactNode, type Ref, type RefObject } from "react";
+import { useListDroplet } from "./glassListDroplet";
+import { ToggleSwitch } from "./settingsControls";
 
 /** Mouse wheel over an open menu scrolls the menu: the overlay's volume-wheel
  *  handler would otherwise take the event. Needs a NON-passive listener, so it
@@ -82,6 +95,8 @@ export function PlayerMenuPanel({
   onMouseEnter?: () => void;
   onMouseLeave?: () => void;
 }) {
+  // Liquid's sliding hover droplet over the body's rows (inert in Frosted).
+  const droplet = useListDroplet();
   return (
     <div
       ref={panelRef}
@@ -92,29 +107,31 @@ export function PlayerMenuPanel({
       // window-level volume-wheel handler (the body scrolls on its own).
       onWheel={(e) => e.stopPropagation()}
       className={`${position ?? "absolute bottom-full mb-2 right-0 z-50"} ${width} flex flex-col
-                  rounded-2xl aura-glass-menu overflow-hidden ${className ?? ""}`}
+                  rounded-[18px] aura-glass-player overflow-hidden ${className ?? ""}`}
       style={style}
     >
       <div className="flex items-center justify-between gap-3 pl-4 pr-3 pt-3 pb-2.5 border-b border-white/8 flex-shrink-0">
         <h3 className="text-white text-[14px] font-semibold tracking-tight truncate">{title}</h3>
         {meta != null && (
-          <span className="text-white/55 text-[12px] font-mono tabular-nums flex-shrink-0">{meta}</span>
+          <span className="text-white/60 text-[12px] font-mono tabular-nums flex-shrink-0">{meta}</span>
         )}
       </div>
       <div
         ref={bodyRef}
-        className="p-1.5 overflow-y-auto overflow-x-hidden"
+        className="relative p-1.5 overflow-y-auto overflow-x-hidden"
         style={{
           maxHeight: maxBodyHeight,
           overscrollBehavior: "contain",
           scrollbarWidth: "thin",
           scrollbarColor: "rgba(255,255,255,0.25) transparent",
         }}
+        {...droplet.listProps}
       >
+        <span ref={droplet.ref} aria-hidden className="aura-glass-hl aura-player-hl" />
         {children}
       </div>
       {footer != null && (
-        <div className="px-4 py-2 border-t border-white/8 text-[12px] text-white/55 flex-shrink-0">
+        <div className="px-4 py-2 border-t border-white/8 text-[12px] text-white/60 flex-shrink-0">
           {footer}
         </div>
       )}
@@ -125,7 +142,7 @@ export function PlayerMenuPanel({
 /** A small uppercase label above a group of rows. */
 export function PlayerMenuSection({ children }: { children: ReactNode }) {
   return (
-    <p className="px-3 pt-2 pb-1 text-white/55 text-[11px] font-semibold uppercase tracking-wider">
+    <p className="px-3 pt-2 pb-1 text-white/60 text-[11px] font-semibold uppercase tracking-wider">
       {children}
     </p>
   );
@@ -145,9 +162,10 @@ export function MenuCheckIcon() {
   );
 }
 
-/** One selectable or actionable row. `selected` fills it with the accent and
- *  shows a check (unless `trailing` replaces it); `description` is a second,
- *  dimmer line. */
+/** One selectable or actionable row. `selected` marks it the glass way
+ *  (Frosted: bright bold label; Liquid: a raised face with the accent on the
+ *  icon and label) and shows an accent check (unless `trailing` replaces it);
+ *  `description` is a second, dimmer line. */
 export function PlayerMenuRow({
   label, description, icon, trailing, selected = false, disabled = false, onClick, title,
   role, ariaChecked, mono = false, onMouseEnter, onMouseLeave, rowRef, ariaHasPopup, ariaExpanded,
@@ -170,11 +188,13 @@ export function PlayerMenuRow({
   ariaHasPopup?: boolean;
   ariaExpanded?: boolean;
 }) {
+  // Hover and the selected face come from .aura-glass-row; the selected
+  // label colour too (white in Frosted, the accent in Liquid).
   const tone = disabled
     ? "text-white/55 cursor-not-allowed"
     : selected
-      ? "bg-ln-accent/15 text-ln-accent"
-      : "text-white/90 hover:bg-white/10 hover:text-white";
+      ? "is-selected"
+      : "text-white/90 hover:text-white";
   return (
     <button
       ref={rowRef}
@@ -189,13 +209,16 @@ export function PlayerMenuRow({
       aria-current={!role && selected ? "true" : undefined}
       aria-haspopup={ariaHasPopup || undefined}
       aria-expanded={ariaExpanded}
+      // The selected row is a rim-only light surface (the rail's active pill):
+      // the cursor light draws its rim (styles/glass-player.css).
+      data-glass-light={selected ? "rim" : undefined}
       onMouseEnter={onMouseEnter}
       onMouseLeave={onMouseLeave}
-      className={`w-full text-left rounded-xl px-3 py-2 flex items-center gap-3 transition-colors
+      className={`aura-glass-row w-full text-left rounded-xl px-3 py-2 flex items-center gap-3
                   focus:outline-none focus-visible:ring-1 focus-visible:ring-white/30 ${tone}`}
     >
       {icon && (
-        <span className={`flex-shrink-0 ${selected ? "text-ln-accent" : disabled ? "text-white/30" : "text-white/70"}`}>
+        <span className={`flex-shrink-0 ${selected ? "" : disabled ? "text-white/30" : "text-white/70"}`}>
           {icon}
         </span>
       )}
@@ -206,12 +229,12 @@ export function PlayerMenuRow({
         </span>
         {description && (
           <span className={`block text-[12px] leading-snug mt-0.5
-                            ${selected ? "text-ln-accent/85" : disabled ? "text-white/45" : "text-white/60"}`}>
+                            ${selected ? "opacity-75" : disabled ? "text-white/45" : "text-white/60"}`}>
             {description}
           </span>
         )}
       </span>
-      {trailing ?? (selected && <span className="flex-shrink-0"><MenuCheckIcon /></span>)}
+      {trailing ?? (selected && <span className="flex-shrink-0 text-ln-accent"><MenuCheckIcon /></span>)}
     </button>
   );
 }
@@ -237,17 +260,11 @@ export function PlayerMenuToggle({
       role="switch"
       ariaChecked={on && !disabled}
       trailing={
-        <span
-          aria-hidden
-          className={`relative w-9 h-5 rounded-full transition-colors flex-shrink-0
-                      ${on && !disabled ? "bg-ln-accent/80" : "bg-white/20"}`}
-        >
-          <span
-            className="absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white shadow-md
-                       transition-transform duration-150"
-            style={{ transform: on && !disabled ? "translateX(16px)" : "translateX(0)" }}
-          />
-        </span>
+        // The shared glass switch, decorative (the row carries the switch
+        // role, the click and the keyboard). Material only like the rest of
+        // the player (the track has no backdrop pass); the cursor light still
+        // rings it.
+        <ToggleSwitch decorative size="sm" value={on && !disabled} />
       }
     />
   );
@@ -294,11 +311,9 @@ export function PlayerMenuButton({
       onClick={onClick}
       disabled={disabled}
       title={title}
-      className={`h-8 px-2.5 rounded-lg text-[12.5px] font-medium transition-colors active:scale-95
+      className={`aura-glass-flat h-8 px-2.5 rounded-lg text-[12.5px] font-medium active:scale-95
                   disabled:opacity-40 disabled:cursor-not-allowed disabled:active:scale-100
-                  ${accent
-                    ? "bg-ln-accent/15 text-ln-accent border border-ln-accent/40 hover:bg-ln-accent/25"
-                    : "bg-white/8 text-white/90 border border-white/14 hover:bg-white/14 hover:text-white"}
+                  ${accent ? "is-primary" : "text-white/90 hover:text-white"}
                   ${className ?? ""}`}
     >
       {children}

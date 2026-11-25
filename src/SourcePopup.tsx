@@ -1,7 +1,7 @@
 // Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Webview } from "@tauri-apps/api/webview";
 import { LogicalPosition, LogicalSize } from "@tauri-apps/api/dpi";
 import { invoke } from "@tauri-apps/api/core";
@@ -65,20 +65,14 @@ interface SourceState {
    *    • auto-closes when `aura:scrobble-auth-changed` fires, so the
    *      user doesn't have to manually dismiss the popup after auth
    *      succeeds (whether by deep-link interception for AniList or
-   *      by device-flow polling for Trakt).
+   *      by Simkl's loopback listener).
    *
-   *  Omitting `interceptPrefix` (Trakt's case) skips navigation
-   *  interception and lets the device-flow polling drive auth
-   *  detection — the popup is just a convenient in-app browser tab
-   *  for entering the user_code on trakt.tv/activate.
-   *
-   *  `userCode` is the device-flow code surfaced as a copyable chip
-   *  in the popup header AND in the minimized floating pill, so the
-   *  user can always see what to paste into trakt.tv/activate
-   *  without having to dismiss or minimize the popup first. */
+   *  Omitting `interceptPrefix` (Simkl's case) skips navigation
+   *  interception: the popup follows the provider's redirect to the
+   *  loopback listener like any browser, and that listener lands the
+   *  token. */
   oauth?: {
     interceptPrefix?: string;
-    userCode?: string;
   };
 }
 
@@ -99,13 +93,12 @@ export function openSourcePopup(url: string, title: string): void {
  *  `aura:scrobble-auth-changed`; pass `interceptPrefix` (e.g.
  *  `aura://oauth/anilist`) to also intercept navigations to that scheme
  *  and re-emit them as `deep-link` events instead of letting WebView2
- *  hand them off to the OS scheme handler. Trakt callers can omit
- *  `interceptPrefix` — device-flow polling drives auth detection
- *  separately. */
+ *  hand them off to the OS scheme handler. A loopback-only provider
+ *  (Simkl) omits `interceptPrefix`: its listener lands the token. */
 export function openOAuthPopup(
   url: string,
   title: string,
-  opts: { interceptPrefix?: string; userCode?: string } = {},
+  opts: { interceptPrefix?: string } = {},
 ): void {
   if (!_setActive) {
     console.warn("[source-popup] openOAuthPopup called but no host is mounted");
@@ -114,7 +107,7 @@ export function openOAuthPopup(
   _setActive({
     url,
     title,
-    oauth: { interceptPrefix: opts.interceptPrefix, userCode: opts.userCode },
+    oauth: { interceptPrefix: opts.interceptPrefix },
   });
 }
 
@@ -122,7 +115,32 @@ export function closeSourcePopup(): void {
   if (_setActive) _setActive(null);
 }
 
-export default function SourcePopupHost() {
+/** The placeholder's rect with the card's entry scale removed. The child
+ *  webview is a native window that never scales, so it is sized to where the
+ *  placeholder lands at rest, even while the card is still collapsed or
+ *  mid-transition (a ResizeObserver never fires for a transform). The card
+ *  scales about its centre (default transform-origin), which is invariant. */
+function restingRect(
+  placeholder: HTMLElement,
+  card: HTMLElement | null,
+): { left: number; top: number; width: number; height: number } {
+  const r = placeholder.getBoundingClientRect();
+  const plain = { left: r.left, top: r.top, width: r.width, height: r.height };
+  if (!card || card.offsetWidth <= 0) return plain;
+  const c = card.getBoundingClientRect();
+  const s = c.width / card.offsetWidth;
+  if (!(s > 0) || Math.abs(s - 1) < 1e-3) return plain;
+  const cx = c.left + c.width / 2;
+  const cy = c.top + c.height / 2;
+  return {
+    left: cx + (r.left - cx) / s,
+    top: cy + (r.top - cy) / s,
+    width: r.width / s,
+    height: r.height / s,
+  };
+}
+
+function SourcePopupHost() {
   const [active, setActive] = useState<SourceState | null>(null);
   const [opening, setOpening] = useState(false);
   // Live host of the page currently rendered inside the OAuth popup.
@@ -151,10 +169,7 @@ export default function SourcePopupHost() {
   // Minimized — collapses the backdrop+card to a floating pill at
   // bottom-right while keeping the child webview alive offscreen so
   // OAuth flow state (cookies, in-progress page, etc) doesn't reset
-  // when the user looks at something underneath. The user_code
-  // banner in SettingsView (and the user_code chip in the pill
-  // below) is the typical reason — Trakt's device flow expects the
-  // code to be visible alongside trakt.tv/activate.
+  // when the user looks at something underneath.
   const [minimized, setMinimized] = useState(false);
   // Reset minimized whenever the popup re-opens, otherwise a stale
   // `minimized: true` could persist across an open/close cycle and
@@ -232,15 +247,33 @@ export default function SourcePopupHost() {
     return () => window.removeEventListener("keydown", onKey);
   }, [active]);
 
-  // Backdrop entry animation — same pattern as CalendarView's DayOverlay.
-  useEffect(() => {
-    if (!active) { setOpening(false); return; }
-    setOpening(true);
-    const id = requestAnimationFrame(() =>
-      requestAnimationFrame(() => setOpening(false)),
-    );
-    return () => cancelAnimationFrame(id);
-  }, [active]);
+  // Backdrop + card entry animation. `opening` flips true DURING render when
+  // `active` changes, so the commit that mounts (or swaps) the card is already
+  // collapsed and no forced read (the spawn effect's getBoundingClientRect)
+  // can resolve the open style first. While `opening`, both transitions are
+  // `none`, so an already-open card (A to B) snaps to collapsed instead of
+  // starting an open-to-collapsed transition that the next flip would cancel
+  // (a running transition whose current value equals the new target is
+  // dropped with no new one). The layout effect then forces the collapsed
+  // style and clears `opening`, and the transition runs from it before the
+  // first paint. The old double rAF painted the card open for a frame first
+  // (same fix as src/popPresence.ts).
+  const cardRef = useRef<HTMLDivElement | null>(null);
+  const [prevActive, setPrevActive] = useState<SourceState | null>(null);
+  if (active !== prevActive) {
+    setPrevActive(active);
+    setOpening(active !== null);
+    // A new popup opens expanded: the spawn effect places its native webview
+    // at the on-screen resting rect, and nothing parks it again afterwards,
+    // so a stale `minimized` would leave it over the app with the card hidden.
+    setMinimized(false);
+  }
+  useLayoutEffect(() => {
+    if (!opening) return;
+    const el = cardRef.current;
+    if (el) void el.offsetHeight; // commit the collapsed style as the start
+    setOpening(false);
+  }, [opening]);
 
   // First-open orientation toast (once per install).
   useEffect(() => {
@@ -284,7 +317,7 @@ export default function SourcePopupHost() {
     const label = `aura-source-popup-${++labelCounterRef.current}-${Date.now()}`;
     activeLabelRef.current = label;
     setNavHost(null);
-    const rect = placeholder.getBoundingClientRect();
+    const rect = restingRect(placeholder, cardRef.current);
     const x = rect.left;
     const y = rect.top;
     const width = Math.max(1, Math.round(rect.width));
@@ -365,7 +398,7 @@ export default function SourcePopupHost() {
   }, [active]);
 
   // OAuth mode auto-close — fires whether AniList's deep-link intercept
-  // landed a token or Trakt's device-flow poll did. We dispatch the
+  // landed a token or Simkl's loopback listener did. We dispatch the
   // close on the next animation frame so the toast that the connect
   // flow shows isn't immediately covered by the popup teardown
   // animation; small touch but reads better.
@@ -402,7 +435,7 @@ export default function SourcePopupHost() {
         wv.setSize(new LogicalSize(1, 1)).catch(() => {});
         return;
       }
-      const r = placeholder.getBoundingClientRect();
+      const r = restingRect(placeholder, cardRef.current);
       wv.setPosition(new LogicalPosition(r.left, r.top)).catch(() => {});
       wv.setSize(new LogicalSize(Math.max(1, r.width), Math.max(1, r.height))).catch(() => {});
     };
@@ -427,7 +460,7 @@ export default function SourcePopupHost() {
   // poll its live URL (WebView2 `Source`, surfaced by the Rust command)
   // while the popup is open and visible. Excluded:
   //   • OAuth popups — they deliberately expose only the host via the
-  //     navHost chip (the full start URL carries a device-flow / CSRF
+  //     navHost chip (the full start URL carries a CSRF
   //     state token we don't want echoed into a UI field), and have no
   //     address bar to update.
   //   • Minimized state — the bar isn't visible and the webview is
@@ -555,7 +588,7 @@ export default function SourcePopupHost() {
       style={{
         backgroundColor: opening ? "transparent" : "rgba(0,0,0,0.78)",
         backdropFilter: opening ? "blur(0px)" : "blur(8px)",
-        transition: "background-color 200ms ease, backdrop-filter 200ms ease",
+        transition: opening ? "none" : "background-color 200ms ease, backdrop-filter 200ms ease",
         opacity: minimized ? 0 : 1,
         pointerEvents: minimized ? "none" : "auto",
       }}
@@ -565,22 +598,22 @@ export default function SourcePopupHost() {
           stops propagation so the backdrop click only fires when the
           user actually clicks outside the card. */}
       <div
-        className="glass-panel rounded-2xl flex flex-col overflow-hidden"
+        ref={cardRef}
+        className="aura-float-glass rounded-2xl flex flex-col overflow-hidden"
         style={{
           width: "min(1280px, 92vw)",
           height: "min(820px, 88vh)",
           opacity: opening ? 0 : 1,
           transform: opening ? "scale(0.92)" : "scale(1)",
-          transition:
-            "opacity 280ms 60ms cubic-bezier(0.2, 0.8, 0.2, 1), " +
-            "transform 280ms 60ms cubic-bezier(0.2, 0.8, 0.2, 1)",
+          transition: opening
+            ? "none"
+            : "opacity 280ms 60ms cubic-bezier(0.2, 0.8, 0.2, 1), " +
+              "transform 280ms 60ms cubic-bezier(0.2, 0.8, 0.2, 1)",
         }}
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header — title + chips + minimize + close. In OAuth mode
-            we surface the live host (anti-phishing) AND the device-
-            flow user_code (so it's visible alongside trakt.tv/activate
-            without having to dismiss the popup). The popup webview
+            we surface the live host (anti-phishing). The popup webview
             has no URL bar of its own, so the header is the only
             place the user can see what site they're entering
             credentials into. */}
@@ -591,16 +624,6 @@ export default function SourcePopupHost() {
               <h2 className="text-white/90 text-lg font-semibold tracking-tight truncate">
                 {active.title}
               </h2>
-              {active.oauth?.userCode ? (
-                <span
-                  className="text-[12px] font-mono tracking-[0.18em] px-2.5 py-1
-                             rounded-md bg-amber-500/10 text-amber-200 border border-amber-400/25
-                             shrink-0 select-all"
-                  title="Enter this code in the loaded page to authorize Aura."
-                >
-                  {active.oauth.userCode}
-                </span>
-              ) : null}
               {active.oauth && navHost ? (
                 <span
                   className="text-[11px] font-mono uppercase tracking-wider px-2 py-0.5
@@ -613,7 +636,7 @@ export default function SourcePopupHost() {
               ) : null}
             </div>
             {/* OAuth mode keeps the static start-URL preview suppressed
-                (the URL carries a device-flow state token; the navHost
+                (the URL carries a state token; the navHost
                 chip is the anti-phishing surface for that flow). The
                 non-OAuth chrome strip below provides the URL surface
                 for regular popups. */}
@@ -621,9 +644,9 @@ export default function SourcePopupHost() {
           <button
             onClick={minimize}
             aria-label="Minimize"
-            title="Minimize — keep the popup running, see what's underneath. Click the floating pill at bottom-right to restore."
-            className="w-8 h-8 rounded-full glass-panel flex items-center justify-center
-                       text-white/55 hover:text-white transition-colors shrink-0 mr-1"
+            title="Minimize: keep the popup running, see what's underneath. Click the floating pill at bottom-right to restore."
+            className="aura-glass-flat w-8 h-8 rounded-full flex items-center justify-center
+                       text-white/55 hover:text-white shrink-0 mr-1"
           >
             <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
               <rect x="5" y="14" width="14" height="2" rx="1" />
@@ -632,8 +655,8 @@ export default function SourcePopupHost() {
           <button
             onClick={close}
             aria-label="Close"
-            className="w-8 h-8 rounded-full glass-panel flex items-center justify-center
-                       text-white/55 hover:text-white transition-colors shrink-0"
+            className="aura-glass-flat w-8 h-8 rounded-full flex items-center justify-center
+                       text-white/55 hover:text-white shrink-0"
           >
             <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
               <path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" />
@@ -648,15 +671,15 @@ export default function SourcePopupHost() {
             would let the user paste a phishing URL into a half-loaded
             OAuth window where credentials are about to be entered. */}
         {!active.oauth && (
-          <div className="flex items-center gap-2 px-4 py-2.5 border-b border-white/8 shrink-0
-                          bg-white/[0.02]">
+          <div className="flex items-center gap-2 px-4 py-2.5 shrink-0
+                          shadow-[inset_0_-1px_0_rgb(255_255_255/0.09)]">
             <button
               type="button"
               onClick={goBack}
               aria-label="Back"
               title="Back"
-              className="w-8 h-8 shrink-0 rounded-md flex items-center justify-center
-                         text-white/55 hover:text-white hover:bg-white/8 transition-colors"
+              className="aura-glass-item w-8 h-8 shrink-0 rounded-lg flex items-center justify-center
+                         text-white/65 hover:text-white"
             >
               <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
                 <path d="M15.41 7.41L14 6l-6 6 6 6 1.41-1.41L10.83 12z" />
@@ -667,8 +690,8 @@ export default function SourcePopupHost() {
               onClick={goForward}
               aria-label="Forward"
               title="Forward"
-              className="w-8 h-8 shrink-0 rounded-md flex items-center justify-center
-                         text-white/55 hover:text-white hover:bg-white/8 transition-colors"
+              className="aura-glass-item w-8 h-8 shrink-0 rounded-lg flex items-center justify-center
+                         text-white/65 hover:text-white"
             >
               <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
                 <path d="M8.59 16.59L10 18l6-6-6-6-1.41 1.41L13.17 12z" />
@@ -679,8 +702,8 @@ export default function SourcePopupHost() {
               onClick={refresh}
               aria-label="Refresh"
               title="Refresh"
-              className="w-8 h-8 shrink-0 rounded-md flex items-center justify-center
-                         text-white/55 hover:text-white hover:bg-white/8 transition-colors"
+              className="aura-glass-item w-8 h-8 shrink-0 rounded-lg flex items-center justify-center
+                         text-white/65 hover:text-white"
             >
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
                    strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
@@ -705,23 +728,18 @@ export default function SourcePopupHost() {
               autoCapitalize="off"
               placeholder="Enter URL (http or https only)"
               title={currentUrl || urlInput}
-              className="flex-1 min-w-0 h-8 px-3 rounded-md
-                         bg-white/[0.04] border border-white/10
+              className="aura-glass-field flex-1 min-w-0 h-8 px-3 rounded-md
                          text-white/85 text-[12px] font-mono
-                         placeholder-white/30
-                         focus:outline-none focus:border-ln-accent/50
-                         focus:bg-white/[0.06]"
+                         placeholder-white/30 focus:outline-none"
             />
             <button
               type="button"
               onClick={submitUrl}
               aria-label="Go"
               title="Go"
-              className="h-8 px-3 shrink-0 rounded-md
-                         bg-white/[0.05] border border-white/10
-                         text-white/75 hover:text-white hover:bg-white/[0.10]
-                         text-[12px] font-medium tracking-wide
-                         transition-colors"
+              className="aura-glass-flat h-8 px-3 shrink-0 rounded-md
+                         text-white/75 hover:text-white
+                         text-[12px] font-medium tracking-wide"
             >
               Go
             </button>
@@ -746,25 +764,15 @@ export default function SourcePopupHost() {
         type="button"
         onClick={restore}
         aria-label="Restore popup"
-        className="fixed bottom-4 right-4 z-[270] aura-float-glass
+        // Fixed over whatever page is open: Liquid's solid base (App.css).
+        data-glass-base=""
+        className="fixed bottom-4 right-4 z-[270] aura-float-glass aura-glass-control aura-glass-press
                    rounded-full px-4 py-2.5 flex items-center gap-3
-                   text-left shadow-glass-edge hover:bg-white/[0.06]
-                   transition-colors max-w-[min(420px,80vw)]"
+                   text-left max-w-[min(420px,80vw)]"
       >
         <span className="text-white/85 text-sm font-medium truncate">
           {active.title}
         </span>
-        {active.oauth?.userCode && (
-          <span
-            className="text-[12px] font-mono tracking-[0.18em] px-2 py-0.5
-                       rounded-md bg-amber-500/15 text-amber-200 border border-amber-400/30
-                       shrink-0 select-all"
-            onClick={(e) => e.stopPropagation()}
-            title="Device-flow code. Click the pill to restore the popup; this chip stays selectable so you can copy without expanding."
-          >
-            {active.oauth.userCode}
-          </span>
-        )}
         <span
           role="button"
           aria-label="Close"
@@ -781,3 +789,6 @@ export default function SourcePopupHost() {
     </>
   );
 }
+
+// Memoized: App renders it on every playback tick, and it takes no props.
+export default memo(SourcePopupHost);

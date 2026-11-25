@@ -1,0 +1,167 @@
+/* Aura - (c) 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice. */
+/* SPDX-License-Identifier: AGPL-3.0-or-later */
+
+/* ------------------------------------------------------------------ */
+/* The Home hero, round 9 (the A direction): 18 px corners, a cursor-   */
+/* lit bezel, an art-tinted underglow and the ambient bleed. Every      */
+/* large soft gradient here is a dithered SVG image (heroAmbient.ts),   */
+/* never a CSS gradient or a wide box-shadow (8-bit, no dither: bands). */
+/* Both materials (layout, not material).                               */
+/* ------------------------------------------------------------------ */
+
+/* The bezel: a rim-only light surface over the art (HeroCarousel.tsx),
+   so the aura-rim worklet draws its ring: the idle rim (top-left 0.15
+   fading to 0.06, bottom-right 0.12) and, with the pointer within reach,
+   the lit rim. Replaces the old 1px white/0.09 border (0.16 on top). */
+.aura-hero-bezel {
+  position: absolute;
+  inset: 0;
+  z-index: 30;
+  border-radius: inherit;
+  pointer-events: none;
+  --lg-idle-tl: 0.15;
+  --lg-idle-mid: 0.06;
+  --lg-idle-br: 0.12;
+}
+
+/* The hero box (HeroCarousel.tsx): ONE rounded clip for the whole group
+   (round 19; the user: "the corner of the hero item also appears to have a
+   feint black outline"). Its overflow clip alone rounds each child
+   separately, and the art, the slide vignette (0.78 at the edge), the
+   bottom gradient (0.7) and the legibility ramp (0.55) each cover an
+   antialiased corner pixel by the same fraction, so the page under that
+   pixel was multiplied down once per layer: a ring darker than both the page
+   and the rim (the outer antialiasing band 0 to 1 device px out, against the
+   page with the hero hidden: -4 to -11 mean, -18 to -40 at worst, every
+   corner, both scales). clip-path composites the group first and clips it
+   once: -0.3 to -1.1 mean. Nothing more than 1.5 device px inside the edge
+   changes (0 levels: art, scrims, bezel, rim). */
+.aura-hero-box { clip-path: inset(0 round 18px); }
+
+/* The underglow: behind the hero (z-index -1, so it paints under the rows
+   below as well), sized past the hero by the room HeroCarousel measured
+   (inline inset). Its image fades to 0 on a side where a clip box is
+   closer than the pad. */
+.aura-hero-underglow {
+  position: absolute;
+  z-index: -1;
+  pointer-events: none;
+  background-repeat: no-repeat;
+  background-size: 100% 100%;
+  /* A new slide's layer fades in on mount, the old one out (no state flip). */
+  animation: aura-hero-ug-in 900ms ease both;
+}
+.aura-hero-underglow.is-out { animation: aura-hero-ug-out 900ms ease forwards; }
+@keyframes aura-hero-ug-in { from { opacity: 0; } }
+@keyframes aura-hero-ug-out { to { opacity: 0; } }
+
+/* The ambient bleed (HeroBleed.tsx): fixed, full viewport, portalled into
+   .aura-app-shell as its lowest layer: z-index -2 in the shell's stacking
+   context (the shell is z-index 0 and stays transparent), so it sits over
+   the theme's opaque `--ln-bg` on html / body / #root (in <body> it showed
+   on Mica only) and under the title bar, the rail, the page and the hero
+   underglow (-1). Two layers crossfade on a slide change (900 ms, the
+   `ease` curve); HeroBleed writes each layer's opacity, the crossfade times
+   the scroll fade, from ONE clock that also drives the corner patch below,
+   so the page bleed and the patch never disagree mid-fade (a CSS transition
+   here and a script-driven patch differed by up to 4.5 levels, round 19).
+   Hidden over the video. */
+.aura-hero-bleed {
+  position: fixed;
+  inset: 0;
+  z-index: -2;
+  pointer-events: none;
+}
+.aura-hero-bleed-layer {
+  position: absolute;
+  inset: 0;
+  background-repeat: no-repeat;
+  background-size: 100% 100%;
+  opacity: 0;
+}
+html.playing-video .aura-hero-bleed { display: none; }
+/* The app-wide spectral sweep (AmbientAura) at 30% while a bleed image shows
+   (HeroBleed.tsx dimAmbient): the bleed is the ambient colour on Home. */
+.aura-ambient { transition: opacity 900ms ease; }
+.aura-ambient.is-under-bleed { opacity: 0.3; }
+html[data-reduced-motion="true"] .aura-ambient { transition: none; }
+html[data-reduced-motion="true"] .aura-hero-underglow { animation-duration: 1ms; }
+/* High Contrast: no ambient colour. */
+html[data-theme="contrast"] .aura-hero-bleed,
+html[data-theme="contrast-azure"] .aura-hero-bleed,
+html[data-theme="contrast"] .aura-hero-underglow,
+html[data-theme="contrast-azure"] .aura-hero-underglow { display: none; }
+
+/* The bleed's crop inside fixed glass marked [data-glass-bleed] (the rail,
+   the Home search bar): HeroBleed.tsx writes the element's --lg-bleed layer
+   (the same image, background-attachment: fixed); this is its strength,
+   about (1 - tint) so it reads as the bleed seen through the face. */
+:root { --lg-bleed-face: 0.33; }
+html[data-glass="liquid"] { --lg-bleed-face: 0.7; }
+
+/* The corner patch (round 18, reworked in round 19). The bleed's hole under
+   [data-glass-bleed] and the rail is RECTANGULAR (HeroBleed.tsx cutHoles, a
+   mask on the bleed layer): backdrop-filter reads the element's whole border
+   box, so a hole rounded like the element left the bleed in the four box
+   corners outside the radius, and the 20 px blur pulled it into the face (a
+   light, cool lift over the last 20 to 30 px of the search bar's rounded
+   ends, inside the rail's corners). The element paints the bleed back itself
+   where its face does not cover the hole: an element's own painting is never
+   in its backdrop, so the blur never sees it.
+   - Two empty children that HeroBleed puts first in the element (z-index
+     -1, so under its content and over its own face): .aura-bleed-patch, the
+     same fixed image at the page's strength, its box the hole, masked to the
+     four corners outside the radius (with the edge's own one-device-pixel
+     antialiasing ramp) and a band per side out to the hole's edge; and over
+     it .aura-bleed-drop, the element's drop shadow, so the shadow still lies
+     over the bleed there as it did when the page drew it (the element's own
+     box-shadow keeps only its insets and --lg-ring). Their values are their
+     own inline styles, written only when they change.
+   - Children, not ::before / ::after (round 18): a pseudo-element is styled
+     again every time its element is, which the cursor light does many times
+     a second and the search bar's focus morph every frame, and here every
+     pseudo-element is costly (the `*, ::before, ::after` base rules). Round
+     18's pair cost +54 ms of style per focus and blur and +25 to +35% at
+     idle, on a pointer sweep and on a slide change; these children are
+     restyled only when the element's INHERITED style changes. Nothing here
+     may say `inherit` (the drop shadow's radius is written as a value): one
+     child inheriting a non-inherited property makes Blink restyle every
+     child of the element whenever the element restyles (+30% per focus and
+     blur, measured).
+   - Only while HeroBleed marks the element (data-bleed-patch: Home, a bleed
+     image showing) and the bleed is shown at all (not High Contrast, not
+     over the video). Everywhere else the element paints exactly as before,
+     shadow included: a High Contrast rail has no backdrop pass and so no
+     layer of its own, and without an outer shadow its 1 px border at a
+     fractional top snapped onto one row instead of antialiasing across two
+     (+18 to +35 levels on its top row at 125%, round 19). */
+.aura-bleed-patch, .aura-bleed-drop { display: none; }
+html:not([data-theme="contrast"]):not([data-theme="contrast-azure"]):not(.playing-video) [data-bleed-patch].aura-float-glass {
+  box-shadow: var(--lg-ring), var(--lg-rimlight), var(--lg-edge);
+}
+html:not([data-theme="contrast"]):not([data-theme="contrast-azure"]):not(.playing-video) [data-bleed-patch] > :is(.aura-bleed-patch, .aura-bleed-drop) {
+  display: block;
+  position: absolute;
+  pointer-events: none;
+  z-index: -1;
+}
+.aura-bleed-drop {
+  inset: -1px;
+  box-shadow: var(--lg-drop);
+}
+/* The Home search bar rises over the search dim (rgba(0,0,0,0.7), faded by
+   SearchBar.tsx: in over 220 ms, out over 340 ms, ease-out, while the bar is
+   .is-open), so the page bleed in its corners was seen under that dim. The
+   patch follows it on the same timing with brightness(1 - 0.7 x the dim):
+   that scales the bleed's colour and keeps its alpha, so the patch over the
+   dimmed page under it gives exactly the dim over the bleed. Opacity (which
+   scales the alpha too) left the page's own share undimmed: +8 to +10
+   levels in the corners on a light page (measured, 125%). */
+.aura-search-shell > .aura-bleed-patch {
+  filter: none;
+  transition: filter 340ms ease-out;
+}
+.aura-search-shell.is-open > .aura-bleed-patch {
+  filter: brightness(0.3);
+  transition-duration: 220ms;
+}

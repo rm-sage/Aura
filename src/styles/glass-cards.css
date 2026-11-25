@@ -1,0 +1,245 @@
+/* Aura - (c) 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice. */
+/* SPDX-License-Identifier: AGPL-3.0-or-later */
+
+/* ------------------------------------------------------------------ */
+/* The catalog cards, round 9 (the A direction): CinemaRows.tsx        */
+/* CatalogCard, ContinueWatchingCard and their row headers.            */
+/* Cards are CONTENT, never glass (no backdrop pass on a card): their  */
+/* edge is a cursor-lit BEZEL, their hover an art-tinted underglow     */
+/* (cardGlow.ts). The small things Aura draws ON the art (SxxEyy, the  */
+/* countdown pill, the remove button, the watched mark, the progress   */
+/* tracks) are REAL frost (the user's pick), lit as rim-only surfaces. */
+/* Both materials (content, not chrome). frontend-ui.md "The Home      */
+/* cards".                                                              */
+/* ------------------------------------------------------------------ */
+
+/* The bezel: a rim-only light surface laid over the art (absolute, inset 0,
+   radius inherited from the art box), so the aura-rim worklet draws its ring:
+   an idle rim (top-left 0.18 fading to 0.06, bottom-right 0.10) and, with the
+   pointer within reach, the lit rim with its bounce and dispersion. It
+   replaces the art box's old 1px white/0.08 border, which drew nothing the
+   light could catch. Above the art, the scrim and the frost (a 1px ring at
+   the box edge; every frost element sits 8px in). */
+.aura-card-bezel {
+  position: absolute;
+  inset: 0;
+  z-index: 25;
+  border-radius: inherit;
+  pointer-events: none;
+  --lg-idle-tl: 0.18;
+  --lg-idle-mid: 0.06;
+  --lg-idle-br: 0.10;
+}
+/* No paint worklet: the old static hairline. */
+@supports not (background-image: paint(aura-rim)) {
+  .aura-card-bezel { box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.08); }
+}
+/* High Contrast turns the idle rim off (--lg-idle-k 0): a firm edge instead. */
+html[data-theme="contrast"] .aura-card-bezel,
+html[data-theme="contrast-azure"] .aura-card-bezel {
+  box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.35);
+}
+
+/* The hovered card's title takes the glass chrome's selection colour (the
+   rail's active label: accent 34% into white). Only the hovered card. */
+.aura-card-title {
+  transition: color 200ms ease;
+}
+.card-grow:hover .aura-card-title {
+  color: color-mix(in srgb, rgb(var(--ln-accent-rgb)) 34%, white);
+}
+html[data-aura-scrolling] .card-grow:not([data-hover-held]):hover .aura-card-title {
+  color: rgb(255 255 255 / 0.9);
+  transition: none;
+}
+
+/* ---- the hover underglow (cardGlow.ts) --------------------------------- */
+
+/* Two empty slots, the FIRST children of each glow host (a row <section>), so
+   they paint under every card of the row. cardGlow.ts places one under the
+   hovered card's art and gives it the dithered image; the other fades out. */
+.aura-card-glow {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 0;
+  height: 0;
+  pointer-events: none;
+  background-repeat: no-repeat;
+  background-size: 100% 100%;
+  opacity: 0;
+  transition: opacity 220ms ease;
+}
+.aura-card-glow.is-on {
+  opacity: 1;
+  transition-duration: 280ms;
+}
+/* The underglow carries the hovered card's contact shadow, so a card in a
+   glow host drops its old drop-shadow filter (an undithered blur that banded,
+   and a filter that made the card a backdrop root under its frost). Outside a
+   host (Airing page, View-all popup) and on High Contrast the filter stays. */
+html:not([data-theme="contrast"]):not([data-theme="contrast-azure"]) [data-card-glow-host] .card-grow[data-card-glow]:hover {
+  filter: none;
+}
+html.playing-video .aura-card-glow,
+html[data-theme="contrast"] .aura-card-glow,
+html[data-theme="contrast-azure"] .aura-card-glow {
+  display: none;
+}
+html[data-reduced-motion="true"] .aura-card-glow { transition: none; }
+
+/* ---- frost: the badges and tracks on the art ---------------------------- */
+
+/* REAL frost (the mockup's .fr, data-badge=real): a 45% neutral fill over a
+   12px blur, saturate 140%, a white 0.15 hairline. A rim-only light surface
+   ([data-glass-light="rim"] on the element): its background MUST start with
+   var(--lg-rim-layer) or the ring is lost. Idle rim 0.30 / 0.04 / 0.16. The
+   backdrop is the card's own art (the card is the nearest backdrop root
+   only while it has a filter; it has none in a glow host). */
+.aura-frost {
+  isolation: isolate;
+  background: var(--lg-rim-layer), rgb(15 17 22 / 0.45);
+  border: 1px solid rgb(255 255 255 / 0.15);
+  -webkit-backdrop-filter: blur(12px) saturate(140%);
+  backdrop-filter: blur(12px) saturate(140%);
+  --lg-idle-tl: 0.30;
+  --lg-idle-mid: 0.04;
+  --lg-idle-br: 0.16;
+}
+/* Hardware acceleration off: FAUX frost (no backdrop pass), as the mockup's
+   data-badge=faux: a denser 66% fill, a 0.13 hairline, a faint inner lift.
+   The Continue Watching cards (`.aura-cw-card`, the card root: SxxEyy,
+   countdown, tracks, remove button) take it too since round 12 (performance; the user: "get
+   rid of the real frost on the continue watching badges if it will gain a
+   lot of FPS"). Every CW frost element was a 12 px backdrop pass re-run
+   whenever anything on its card repainted (the cursor light on the bezel,
+   the badge's own rim light): in-page A/B on Home at 2575 x 1038 with
+   Cursor glow on, pointer sweeping the CW row 96 to 107 fps, wheel
+   scrolling 178 to 214, moving while scrolling 174 to 215. Poster marks and
+   tracks keep the real frost. */
+html[data-glass-gpu="off"] .aura-frost,
+.aura-cw-card .aura-frost {
+  background: var(--lg-rim-layer), rgb(26 29 38 / 0.66);
+  border-color: rgb(255 255 255 / 0.13);
+  box-shadow: inset 0 0 8px rgb(255 255 255 / 0.03);
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+}
+/* The CW countdown pill never wraps (whitespace-nowrap) and is dropped on a
+   card under 150 px of art (a 900 px window: about 85 px): there its one line
+   would not fit and, at the card's 16:9 height, it would sit on the SxxEyy
+   badge. */
+.aura-cw-countdown { container-type: inline-size; }
+@container (max-width: 149.98px) {
+  .aura-cw-countdown > * { display: none; }
+}
+
+/* The watch mark (WatchedBadge material="frost", round 12): one 26 px disc
+   with a 15 px glyph for every state (queue / watched / skipped / in
+   progress), 8 px in on every card and poster. Round 9's 22 px disc with
+   only the glyph coloured read as a much smaller icon than the solid disc it
+   replaced (the coloured mass shrank from a 22 px disc to an 8 x 10 px
+   bookmark), so the disc now carries a wash of the state's colour and a
+   tinted hairline, over a denser base (0.72, was 0.45: on a white sky the
+   glyph now clears 4:1 against what the blur leaves; at 0.62 the check read
+   weak there). Rim-only light surface: the background keeps
+   var(--lg-rim-layer) first. */
+.aura-frost.aura-watch-mark {
+  --wm-rgb: 52 211 153;
+  background:
+    var(--lg-rim-layer),
+    linear-gradient(rgb(var(--wm-rgb) / 0.14), rgb(var(--wm-rgb) / 0.14)),
+    rgb(12 14 18 / 0.72);
+  border-color: rgb(var(--wm-rgb) / 0.42);
+  box-shadow: 0 1px 4px rgb(0 0 0 / 0.35);
+  color: rgb(110 231 183);
+}
+.aura-watch-mark.is-skipped {
+  --wm-rgb: 192 132 252;
+  color: rgb(216 180 254);
+}
+.aura-watch-mark.is-in-progress {
+  --wm-rgb: 251 191 36;
+  color: rgb(252 211 77);
+}
+.aura-watch-mark.is-planned {
+  --wm-rgb: var(--ln-accent-rgb);
+  color: var(--ln-accent-mark);
+}
+/* No backdrop pass (hardware acceleration off, and the page grids' faux
+   frost, glass-pages.css): a denser base stands in for the blur. */
+html[data-glass-gpu="off"] .aura-frost.aura-watch-mark,
+:is(.aura-lib-grid, .aura-poster-grid, .aura-airing-grid) .aura-frost.aura-watch-mark {
+  background:
+    var(--lg-rim-layer),
+    linear-gradient(rgb(var(--wm-rgb) / 0.14), rgb(var(--wm-rgb) / 0.14)),
+    rgb(20 23 30 / 0.82);
+  border-color: rgb(var(--wm-rgb) / 0.42);
+  box-shadow: 0 1px 4px rgb(0 0 0 / 0.35);
+}
+
+/* A frost button (CW remove): a little denser under the pointer. */
+.aura-frost-btn {
+  transition: opacity 150ms ease, color 150ms ease;
+}
+.aura-frost-btn:hover {
+  background: var(--lg-rim-layer), rgb(15 17 22 / 0.66);
+}
+html[data-glass-gpu="off"] .aura-frost-btn:hover,
+.aura-cw-card .aura-frost-btn:hover {
+  background: var(--lg-rim-layer), rgb(26 29 38 / 0.82);
+}
+
+/* Glass tracks (the mockup's .trk): a frost pill 8px in from the sides and
+   7px up, 3px of padding round a rounded bar. The bar's empty part is white
+   0.12 (the season bar's not-yet-aired segments keep their own 0.15). */
+.aura-frost-track {
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  bottom: 7px;
+  padding: 3px;
+  border-radius: 999px;
+  border-color: rgb(255 255 255 / 0.10);
+  z-index: 10;
+}
+html[data-glass-gpu="off"] .aura-frost-track,
+.aura-cw-card .aura-frost-track { border-color: rgb(255 255 255 / 0.10); }
+/* A poster's track sits ABOVE the rating chips a rating poster bakes into
+   its image (round 12, PosterProgressTrack in CinemaRows.tsx). Measured on
+   the user's AIOMetadata posters (420 px tall): the chip band is the bottom
+   8.1% of the art (its top 34 px up). A percentage `bottom` on an absolute
+   box is a share of the art's height, so the lift scales with the card: 8.5%
+   plus 4 px leaves about 6 px clear above the chips at any poster size. */
+.aura-frost-track.is-poster { bottom: calc(8.5% + 4px); }
+.aura-frost-bar {
+  position: relative;
+  height: 5px;
+  border-radius: 999px;
+}
+.aura-frost-bar.is-thin { height: 4px; }
+.aura-frost-bar.is-empty { background: rgb(255 255 255 / 0.12); overflow: hidden; }
+
+/* ---- the row header ------------------------------------------------------ */
+
+/* "View all": a small flat glass control (the cursor light reaches it like
+   any glass control). Mono label, accent chevron that steps right on hover. */
+.aura-row-viewall {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 30px;
+  padding: 0 11px 0 14px;
+  border-radius: 999px;
+  font-size: 13px;
+  letter-spacing: 0.04em;
+  color: rgb(255 255 255 / 0.72);
+  cursor: pointer;
+}
+.aura-row-viewall:hover { color: rgb(255 255 255 / 0.95); }
+.aura-row-viewall svg {
+  color: rgb(var(--ln-accent-rgb));
+  transition: translate 280ms var(--lg-springy);
+}
+.aura-row-viewall:hover svg { translate: 2px 0; }
+html[data-reduced-motion="true"] .aura-row-viewall svg { transition: none; }

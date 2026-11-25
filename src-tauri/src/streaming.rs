@@ -208,7 +208,7 @@ fn is_webview_origin(origin: &str) -> bool {
     )
 }
 
-fn add_cors(headers: &mut axum::http::HeaderMap, origin: Option<&HeaderValue>) {
+pub(crate) fn add_cors(headers: &mut axum::http::HeaderMap, origin: Option<&HeaderValue>) {
     // Reflect the request Origin only when it is the WebView's own. No match ->
     // no ACAO header at all, so a cross-origin read fails. `*` is never sent.
     let allowed = origin

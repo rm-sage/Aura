@@ -101,15 +101,15 @@ export function MediaTypePills({
             onClick={() => onChange(f)}
             disabled={disabled}
             aria-pressed={isActive}
-            className={`nav-tap flex items-center gap-2 px-3.5 py-1.5 rounded-full text-xs font-medium
-                        border transition-colors disabled:opacity-40
-                        ${isActive
-                          ? "bg-ln-accent/20 text-ln-accent border-ln-accent/30"
-                          : "bg-white/5 text-white/55 border-white/10 hover:text-white/80 hover:bg-white/8"
-                        }`}
+            // The shared glass filter chip (FilterBar's): aria-pressed is the
+            // selection, Frosted an accent wash, Liquid a raised face with the
+            // accent on the label only (src/styles/glass-search.css).
+            className={`aura-glass-flat aura-filter-chip aura-glass-press flex items-center gap-2 px-3.5 py-1.5
+                        rounded-full text-xs font-medium disabled:opacity-40
+                        ${isActive ? "" : "text-white/55 hover:text-white/80"}`}
           >
             {LABELS[f]}
-            <span className="text-[10px] tabular-nums opacity-70">
+            <span className="text-[10px] tabular-nums opacity-85">
               {counts[f]}
             </span>
           </button>

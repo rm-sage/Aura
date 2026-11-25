@@ -191,6 +191,10 @@ windows = { version = "0.61", features = [
     # or region" setting, which picks the TMDB release-date row (release_dates.rs).
     # Never GetUserDefaultGeoName: Windows 10 1709+ only, and a load-time import.
     "Win32_Globalization",
+    # CredEnumerateW / CredFree - the one-time sweep of a retired scrobble
+    # service's tokens under every account (scrobble_auth.rs), since keyring
+    # cannot enumerate its own entries.
+    "Win32_Security_Credentials",
 ] }
 
 # Dev-profile slimming. The default debug profile produced ~43 GB of

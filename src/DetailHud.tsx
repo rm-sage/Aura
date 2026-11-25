@@ -30,12 +30,13 @@
 // letting any single column fall under a readable measure.
 // ---------------------------------------------------------------------------
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   CharactersTab, RatingsTab, RelatedTab, SongsTab, StaffTab, TrailersTab,
 } from "./AnimeExtrasOverlay";
 import type { CourRef } from "./animeExtras";
 import { loadAuraSettings } from "./auraSettings";
+import { animateSpan, cancelSpan } from "./liquidGlass";
 
 /** Tabs that always exist, plus the anime-only extras. */
 export type HudTab =
@@ -126,6 +127,66 @@ export default function DetailHud({
     btns?.[next]?.focus();
   };
 
+  // The sliding inner pill (the rail's active pill, one per bar): measured
+  // from the selected tab's offsetLeft / offsetWidth, never derived. A tab
+  // change slides it on the liquidGlass springs; the first placement and any
+  // re-layout (the bar resizing, a font swap, the extras tabs arriving) snap.
+  const pillRef = useRef<HTMLSpanElement | null>(null);
+  const placedRef = useRef(false);
+  const [layoutGen, setLayoutGen] = useState(0);
+  const lastGenRef = useRef(0);
+  useLayoutEffect(() => {
+    const bar = listRef.current;
+    const pill = pillRef.current;
+    if (!bar || !pill) return;
+    const btn = bar.querySelector<HTMLElement>("[role='tab'][aria-selected='true']");
+    if (!btn) { pill.classList.remove("is-on"); return; }
+    // A narrow column wraps the bar onto two lines: the pill takes the
+    // selected tab's line at once (top / height inline) and slides only
+    // along it; a change of line snaps rather than sliding diagonally.
+    const top = `${btn.offsetTop}px`;
+    const lineChanged = pill.style.top !== top;
+    pill.style.top = top;
+    pill.style.height = `${btn.offsetHeight}px`;
+    const snap = !placedRef.current || lastGenRef.current !== layoutGen || lineChanged;
+    lastGenRef.current = layoutGen;
+    animateSpan(pill, "x", { a: btn.offsetLeft, b: btn.offsetLeft + btn.offsetWidth }, { snap });
+    pill.classList.add("is-on");
+    placedRef.current = true;
+  }, [tab, tabs, layoutGen]);
+  useEffect(() => {
+    const bar = listRef.current;
+    if (!bar || typeof ResizeObserver === "undefined") return;
+    let first = true;
+    const ro = new ResizeObserver(() => {
+      // The first callback reports the size the layout effect already used.
+      if (first) { first = false; return; }
+      setLayoutGen((g) => g + 1);
+    });
+    ro.observe(bar);
+    return () => ro.disconnect();
+  }, []);
+  useEffect(() => {
+    const pill = pillRef.current;
+    return () => { if (pill) cancelSpan(pill); };
+  }, []);
+
+  // The panel's own scroller: once scrolled, its content fades out under the
+  // top edge (`data-scrolled`, written only when the state flips).
+  const scrollRef = useRef<HTMLDivElement | null>(null);
+  const onPanelScroll = () => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const on = el.scrollTop > 2;
+    if (on !== el.hasAttribute("data-scrolled")) el.toggleAttribute("data-scrolled", on);
+  };
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    el.scrollTop = 0;
+    el.removeAttribute("data-scrolled");
+  }, [tab, resetKey]);
+
   return (
     // WIDTH IS CAPPED, and this is the fix for the panel reading as dead
     // space on an ultrawide. Spanning the full column meant a ~2900px glass
@@ -138,13 +199,19 @@ export default function DetailHud({
     // `data-hero-menu-exempt`: a right-click anywhere on the info panel is not
     // a right-click on the hero's backdrop (DetailView's HERO_MENU_EXEMPT).
     <div data-hero-menu-exempt className="flex flex-col gap-3 min-h-0" style={{ width: "min(100%, 74rem)" }}>
+      {/* ONE glass control (the rail pattern, round 11): transparent tab
+          buttons over a sliding inner pill, instead of a glass pill per tab
+          (seven backdrop passes and seven lenses). glass-detail.css. */}
       <div
         ref={listRef}
         role="tablist"
         aria-label="Title information"
         onKeyDown={onKeyDown}
-        className="flex items-center gap-1.5 flex-wrap"
+        data-glass-light="control"
+        data-liquid="off"
+        className="aura-float-glass aura-glass-control aura-hud-tabbar"
       >
+        <span ref={pillRef} aria-hidden data-glass-light="rim" className="aura-hud-tabpill" />
         {tabs.map((t) => {
           const on = t.id === tab;
           return (
@@ -155,13 +222,9 @@ export default function DetailHud({
               aria-controls="aura-hud-panel"
               tabIndex={on ? 0 : -1}
               onClick={() => setTab(t.id)}
-              className={
-                "aura-hud-tab px-3 h-7 rounded-lg text-[11px] font-medium "
-                + "uppercase tracking-[0.14em] transition-colors border "
-                + (on
-                  ? "text-ln-accent bg-ln-accent/16 border-ln-accent/40"
-                  : "text-white/70 border-white/12 hover:text-white")
-              }
+              // A plain button on the bar: the pill behind it marks the
+              // selection; the label takes the rail's lit colour.
+              className="aura-hud-tabbtn"
             >
               {t.label}
             </button>
@@ -174,18 +237,31 @@ export default function DetailHud({
           this and the flex parent is load-bearing: without it a flex child
           refuses to shrink below its content and the cap silently does
           nothing. */}
+      {/* Round 11: the notifications sheet's material (the Liquid menu tier,
+          Frosted in Matte), CSS face only (`data-liquid="off"`: far
+          over the lens size cap, and it must match the episodes panel). The
+          scroller is an inner box so its scrolled fade never masks the glass
+          itself. */}
       <div
         id="aura-hud-panel"
         role="tabpanel"
-        className="aura-hud-surface shadow-glass-edge rounded-xl
-                   px-6 py-5 overflow-y-auto"
+        data-liquid="off"
+        data-glass-light="panel"
+        className="aura-float-glass aura-detail-panel flex flex-col overflow-hidden"
         style={{
           // FIXED, not a max. A panel that resized to its content made every
           // tab switch jump the layout, which is worse than the dead space a
           // fixed box sometimes leaves. Roughly 50% taller than the first cut.
           height: "min(44vh, 31rem)",
+        }}
+      >
+      <div
+        ref={scrollRef}
+        onScroll={onPanelScroll}
+        className="aura-detail-scroll flex-1 min-h-0 px-6 py-5 overflow-y-auto"
+        style={{
           scrollbarWidth: "thin",
-          scrollbarColor: "rgba(255,255,255,0.08) transparent",
+          scrollbarColor: "rgba(255,255,255,0.12) transparent",
         }}
       >
         {tab === "overview" && overview}
@@ -212,6 +288,7 @@ export default function DetailHud({
         {tab === "trailers" && (
           <TrailersTab cours={cours} onPlay={onPlayTrailer} launchingId={trailerLaunchingId} />
         )}
+      </div>
       </div>
     </div>
   );

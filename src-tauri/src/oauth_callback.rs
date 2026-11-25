@@ -7,7 +7,7 @@
 //! the authorization leg in the user's own browser rather than an embedded
 //! webview, precisely because the system browser already carries the user's
 //! logged-in session. That is the whole point of this module: reconnecting
-//! Trakt / AniList becomes one click on "Authorize" instead of retyping a
+//! AniList becomes one click on "Authorize" instead of retyping a
 //! password into a webview whose cookie jar drops session cookies at app
 //! exit.
 //!

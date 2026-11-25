@@ -1,7 +1,8 @@
 // Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useState, useEffect, useRef, useMemo } from "react";
+import { memo, useState, useEffect, useLayoutEffect, useRef, useMemo, useCallback, type MouseEvent as ReactMouseEvent } from "react";
+import { createPortal } from "react-dom";
 import type { LibraryItem, AddonEntry, MetaDetail, MetaPreview, VideoEntry } from "../types";
 import { getMetaDetailFallback } from "../metaCache";
 import ImageLoader from "../ImageLoader";
@@ -11,13 +12,14 @@ import { useHoverCardActivation } from "../useHoverCardActivation";
 import { closeHoverNow } from "../catalogHoverStore";
 import { getReleaseSignal } from "../releaseSignalStore";
 import { useWindowHidden } from "../windowVisibility";
+import { sheet } from "../glassSheet";
 
 // ---------------------------------------------------------------------------
 // CalendarView — full-viewport month grid + day-click overlay
 //
 // The calendar pulls each library item's full meta detail (concurrency 4) to
 // resolve a release date. The grid groups every release into its day cell;
-// clicking a cell with releases opens a glass-panel overlay instead of an
+// clicking a cell with releases opens a glass overlay instead of an
 // inline breakdown section (which ate vertical space and required scrolling).
 //
 // Grid rows use `minmax(0, 1fr)` so the 5- or 6-row grid fills all remaining
@@ -86,6 +88,44 @@ function parseReleaseDate(detail: MetaDetail | null, item: LibraryItem): Date | 
   return null;
 }
 
+/** Each episode of a series detail with its local release day, parsed once per
+ *  detail object. The progressive load re-buckets the whole library every
+ *  200 ms flush, and a long-running series carries 1000+ episodes, so
+ *  re-parsing every `released` string on every flush was most of the cost.
+ *  Keyed weakly by the detail object (the flushed Maps keep the same objects),
+ *  so it is bounded by what the calendar still holds and needs no eviction. */
+const episodeDaysCache = new WeakMap<MetaDetail, { video: VideoEntry; day: Date; key: string }[]>();
+function episodeDays(detail: MetaDetail): { video: VideoEntry; day: Date; key: string }[] {
+  let out = episodeDaysCache.get(detail);
+  if (out) return out;
+  out = [];
+  for (const v of detail.videos ?? []) {
+    if (!v.released) continue;
+    const ts = Date.parse(v.released);
+    if (isNaN(ts)) continue;
+    const day = startOfDay(new Date(ts));
+    out.push({ video: v, day, key: dateKey(day) });
+  }
+  episodeDaysCache.set(detail, out);
+  return out;
+}
+
+const NO_ENTRIES: CalendarEntry[] = [];
+
+/** A day's entries with one per series (a day with 5 episodes of the same
+ *  show shows ONE poster), in order. The cell's poster strip and the hover
+ *  popout both read it. */
+function dedupeBySeries(entries: CalendarEntry[]): CalendarEntry[] {
+  const out: CalendarEntry[] = [];
+  const seen = new Set<string>();
+  for (const e of entries) {
+    if (seen.has(e.item.id)) continue;
+    seen.add(e.item.id);
+    out.push(e);
+  }
+  return out;
+}
+
 // ---------------------------------------------------------------------------
 // CalendarEntry & view shape
 // ---------------------------------------------------------------------------
@@ -97,6 +137,161 @@ interface CalendarEntry {
    *  movie's release date is the only release). */
   video: VideoEntry | null;
   releaseDate: Date;
+}
+
+// ---------------------------------------------------------------------------
+// Hover popout: the posters a day cell has no room for
+// ---------------------------------------------------------------------------
+
+/** Poster height in the popout (2:3, so 100 px wide), shrunk only when the
+ *  window is too short for the rows it needs. */
+const POPOUT_POSTER_H = 150;
+/** The floor: below it the posters stop shrinking and the popout widens. */
+const POPOUT_MIN_POSTER_H = 60;
+const POPOUT_PER_ROW = 5;
+const POPOUT_GAP = 6;
+const POPOUT_PAD = 8;
+/** Distance kept from the window edges; the top one clears the title bar. */
+const POPOUT_EDGE = 16;
+const POPOUT_MIN_TOP = 44;
+/** Space between the cell and the popout. */
+const POPOUT_OFFSET = 8;
+
+/**
+ * The posters past a day cell's two, shown while the cell is hovered.
+ *
+ * Portalled to body with fixed positioning: inside the cell it was clipped by
+ * the page (a top-row cell's popout ran off the window), nested its blur in
+ * the cell's own glass blur (a pale rectangle bled around it), and scrolled
+ * sideways with no way to reach the scroll bar. Here it wraps into rows, sizes
+ * itself to fit the window, and opens above the cell, or below when there is
+ * more room there. It never takes the pointer: the cell owns the click.
+ */
+function HiddenPostersPopout({ anchor, entries }: { anchor: DOMRect; entries: CalendarEntry[] }) {
+  const ref = useRef<HTMLDivElement>(null);
+  const [pos, setPos] = useState<{ left: number; top: number; below: boolean } | null>(null);
+  const [shown, setShown] = useState(false);
+
+  const vw = window.innerWidth;
+  const vh = window.innerHeight;
+  const n = entries.length;
+  const fitW = vw - 2 * POPOUT_EDGE - 2 * POPOUT_PAD;
+  // A busy day widens the popout before it shrinks the posters past the
+  // floor, and what still does not fit becomes a "+N more" tile: the box
+  // always fits between POPOUT_MIN_TOP and the bottom edge (it takes no
+  // pointer and has no scroll, so an off-window row could never be reached).
+  const maxRows = Math.max(1, Math.floor(
+    (vh - POPOUT_MIN_TOP - POPOUT_EDGE - 2 * POPOUT_PAD + POPOUT_GAP) / (POPOUT_MIN_POSTER_H + POPOUT_GAP)));
+  const maxCols = Math.max(1, Math.floor(
+    (fitW + POPOUT_GAP) / (Math.round(POPOUT_MIN_POSTER_H * 2 / 3) + POPOUT_GAP)));
+  const basePerRow = Math.max(1, Math.min(n, POPOUT_PER_ROW,
+    Math.floor((fitW + POPOUT_GAP) / (POPOUT_POSTER_H * 2 / 3 + POPOUT_GAP))));
+  const perRow = Math.max(1, Math.min(n, Math.max(basePerRow, Math.min(maxCols, Math.ceil(n / maxRows)))));
+  const capacity = maxRows * perRow;
+  const shownEntries = n > capacity ? entries.slice(0, Math.max(0, capacity - 1)) : entries;
+  const moreCount = n - shownEntries.length;
+  const slots = shownEntries.length + (moreCount > 0 ? 1 : 0);
+  const rowCount = Math.max(1, Math.ceil(slots / perRow));
+  const fitH = vh - POPOUT_MIN_TOP - POPOUT_EDGE - 2 * POPOUT_PAD - (rowCount - 1) * POPOUT_GAP;
+  // Width bound too: a widened row must still fit the window.
+  const maxHByW = Math.floor(((fitW - (perRow - 1) * POPOUT_GAP) / perRow) * 3 / 2);
+  const posterH = Math.max(POPOUT_MIN_POSTER_H,
+    Math.min(POPOUT_POSTER_H, Math.floor(fitH / rowCount), maxHByW));
+  const posterW = Math.round(posterH * 2 / 3);
+  const innerW = perRow * posterW + (perRow - 1) * POPOUT_GAP;
+
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const w = el.offsetWidth;
+    const h = el.offsetHeight;
+    const left = Math.min(
+      Math.max(anchor.left + anchor.width / 2 - w / 2, POPOUT_EDGE),
+      vw - POPOUT_EDGE - w,
+    );
+    const roomAbove = anchor.top - POPOUT_OFFSET - POPOUT_MIN_TOP;
+    const roomBelow = vh - POPOUT_EDGE - anchor.bottom - POPOUT_OFFSET;
+    const below = roomAbove < h && roomBelow > roomAbove;
+    const wanted = below ? anchor.bottom + POPOUT_OFFSET : anchor.top - POPOUT_OFFSET - h;
+    const top = Math.min(Math.max(wanted, POPOUT_MIN_TOP), vh - POPOUT_EDGE - h);
+    setPos({ left, top, below });
+  }, [anchor, vw, vh, innerW, posterH, rowCount]);
+
+  // One frame at the start state, so the entry transition runs.
+  useEffect(() => {
+    if (!pos) return;
+    const raf = requestAnimationFrame(() => setShown(true));
+    return () => cancelAnimationFrame(raf);
+  }, [pos !== null]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  return createPortal(
+    <div
+      ref={ref}
+      aria-hidden
+      // The tooltip tier (aura-glass-tip): a pointer-events-none hover popout,
+      // never refracted, so it costs one plain blur.
+      className="aura-float-glass aura-glass-tip fixed z-[60] rounded-xl pointer-events-none
+                 transition-[opacity,transform] duration-200 ease-out"
+      style={{
+        left: pos?.left ?? 0,
+        top: pos?.top ?? 0,
+        padding: POPOUT_PAD,
+        visibility: pos ? "visible" : "hidden",
+        opacity: shown ? 1 : 0,
+        transform: shown ? "none" : `translateY(${pos?.below ? -6 : 6}px) scale(0.96)`,
+        transformOrigin: pos?.below ? "top center" : "bottom center",
+      }}
+    >
+      <div className="flex flex-wrap" style={{ width: innerW, gap: POPOUT_GAP }}>
+        {shownEntries.map(({ item, detail, video }) => {
+          const src = detail?.poster ?? item.poster;
+          const epLabel =
+            video && video.season != null && video.episode != null
+              ? formatEpLabel(video.season, video.episode)
+              : null;
+          return (
+            <div
+              key={item.id}
+              className="relative flex-shrink-0 rounded-md overflow-hidden bg-white/5 border border-white/10"
+              style={{ width: posterW, height: posterH }}
+            >
+              {src ? (
+                <ImageLoader
+                  src={src}
+                  alt=""
+                  draggable={false}
+                  className="absolute inset-0 w-full h-full"
+                  imgClassName="w-full h-full object-cover"
+                />
+              ) : (
+                <div className="absolute inset-0 flex items-center justify-center text-white/20 text-[10px]">
+                  ?
+                </div>
+              )}
+              {epLabel && (
+                <span
+                  className="absolute top-1 left-1 text-[9px] leading-none font-mono font-semibold
+                             text-white/95 px-1 py-0.5 rounded bg-black/85 border border-white/15"
+                >
+                  {epLabel}
+                </span>
+              )}
+            </div>
+          );
+        })}
+        {moreCount > 0 && (
+          <div
+            className="relative flex-shrink-0 rounded-md bg-white/5 border border-white/10
+                       flex items-center justify-center text-white/75 text-[11px] font-mono font-semibold"
+            style={{ width: posterW, height: posterH }}
+          >
+            +{moreCount}
+          </div>
+        )}
+      </div>
+    </div>,
+    document.body,
+  );
 }
 
 interface Props {
@@ -154,6 +349,12 @@ export default function CalendarView({ library, addons, onSelectMeta }: Props) {
   const [details, setDetails] = useState<Map<string, MetaDetail | null>>(new Map());
   const [loading, setLoading] = useState(false);
   const [monthAnchor, setMonthAnchor] = useState<Date>(() => startOfMonth(new Date()));
+  // The day cell whose extra posters show in the hover popout, with its rect.
+  // Its posters are read from the current buckets at render, never captured
+  // at mouseenter: the progressive load keeps adding to a hovered day.
+  const [popout, setPopout] = useState<{ key: string; anchor: DOMRect } | null>(null);
+  // Changing month unmounts the hovered cell without a mouseleave.
+  useEffect(() => { setPopout(null); }, [monthAnchor]);
   // overlayDate drives the day-click modal; null = closed.
   const [overlayDate, setOverlayDate] = useState<Date | null>(null);
 
@@ -211,7 +412,11 @@ export default function CalendarView({ library, addons, onSelectMeta }: Props) {
     // Partial flushes MERGE over what is shown: a library refresh (the focus
     // refetch) re-runs this scan, and replacing with the partial map would
     // blank every item not yet re-resolved until the scan finished. The final
-    // write below replaces, which prunes items that left the library.
+    // write below rebuilds from this run, which prunes items that left the
+    // library. Neither lets a null from THIS run replace a detail already
+    // shown: null is a failed refetch (offline, an addon timeout or rate
+    // limit once the 4 h meta TTL has passed), and taking it dropped that
+    // series' releases off the grid until a later run succeeded.
     const acc = new Map<string, MetaDetail | null>();
     let flushTimer: number | null = null;
     const scheduleFlush = () => {
@@ -221,7 +426,7 @@ export default function CalendarView({ library, addons, onSelectMeta }: Props) {
         if (cancelled) return;
         setDetails((prev) => {
           const next = new Map(prev);
-          for (const [k, v] of acc) next.set(k, v);
+          for (const [k, v] of acc) next.set(k, v ?? prev.get(k) ?? null);
           return next;
         });
       }, 200);
@@ -245,7 +450,11 @@ export default function CalendarView({ library, addons, onSelectMeta }: Props) {
       await Promise.all(Array.from({ length: concurrency }, worker));
       if (!cancelled) {
         if (flushTimer != null) { window.clearTimeout(flushTimer); flushTimer = null; }
-        setDetails(new Map(acc));
+        setDetails((prev) => {
+          const next = new Map<string, MetaDetail | null>();
+          for (const [k, v] of acc) next.set(k, v ?? prev.get(k) ?? null);
+          return next;
+        });
         setLoading(false);
       }
     })();
@@ -273,14 +482,9 @@ export default function CalendarView({ library, addons, onSelectMeta }: Props) {
       const episodic = isEpisodicType(item.media_type);
 
       if (episodic && detail?.videos?.length) {
-        for (const v of detail.videos) {
-          if (!v.released) continue;
-          const ts = Date.parse(v.released);
-          if (isNaN(ts)) continue;
-          const day = startOfDay(new Date(ts));
-          const key = dateKey(day);
+        for (const { video, day, key } of episodeDays(detail)) {
           const list = buckets.get(key) ?? [];
-          list.push({ item, detail, video: v, releaseDate: day });
+          list.push({ item, detail, video, releaseDate: day });
           buckets.set(key, list);
         }
         continue;
@@ -363,6 +567,30 @@ export default function CalendarView({ library, addons, onSelectMeta }: Props) {
   const goToday = () => setMonthAnchor(startOfMonth(startOfDay(new Date())));
 
   const overlayEntries = overlayDate ? (entriesByDate.get(dateKey(overlayDate)) ?? []) : [];
+  const totalEntries = useMemo(
+    () => [...entriesByDate.values()].reduce((s, l) => s + l.length, 0),
+    [entriesByDate],
+  );
+
+  // The hovered day's posters past the first two, from the CURRENT buckets.
+  const popoutKey = popout?.key ?? null;
+  const popoutEntries = useMemo(
+    () => (popoutKey ? dedupeBySeries(entriesByDate.get(popoutKey) ?? NO_ENTRIES).slice(2) : NO_ENTRIES),
+    [popoutKey, entriesByDate],
+  );
+
+  // Stable cell callbacks, so a hover (which sets `popout` and re-renders this
+  // view) re-renders only the popout, not all 35 to 42 memoized day cells.
+  const openDay = useCallback((date: Date) => {
+    setPopout(null);
+    setOverlayDate(date);
+  }, []);
+  const showHidden = useCallback((key: string, anchor: DOMRect) => {
+    setPopout({ key, anchor });
+  }, []);
+  const hideHidden = useCallback((key: string) => {
+    setPopout((p) => (p?.key === key ? null : p));
+  }, []);
 
   return (
     // flex-1 + flex-col + min-h-0: fills the parent flex slot (App's main
@@ -377,8 +605,8 @@ export default function CalendarView({ library, addons, onSelectMeta }: Props) {
         {/* Header */}
         <div className="flex items-end justify-between gap-4 mb-4">
           <div>
-            <h1 className="aura-row-title text-3xl font-semibold tracking-tight">Release Calendar</h1>
-            <p className="text-white/35 text-sm mt-1">
+            <h1 data-glass-light="text" className="aura-row-title text-3xl font-semibold tracking-tight">Release Calendar</h1>
+            <p className="text-white/55 text-sm mt-1">
               Releases for items in your library.
             </p>
           </div>
@@ -386,8 +614,8 @@ export default function CalendarView({ library, addons, onSelectMeta }: Props) {
             <button
               onClick={goPrev}
               aria-label="Previous month"
-              className="w-9 h-9 rounded-full glass-panel flex items-center justify-center
-                         text-white/70 hover:text-white transition-colors"
+              className="aura-glass-flat w-9 h-9 rounded-full flex items-center justify-center
+                         text-white/70 hover:text-white"
             >
               <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
                 <path d="M15.41 16.59L10.83 12l4.58-4.59L14 6l-6 6 6 6z" />
@@ -395,16 +623,16 @@ export default function CalendarView({ library, addons, onSelectMeta }: Props) {
             </button>
             <button
               onClick={goToday}
-              className="px-3 h-9 rounded-full glass-panel text-xs font-medium
-                         text-white/70 hover:text-white transition-colors"
+              className="aura-glass-flat px-3 h-9 rounded-full text-xs font-medium
+                         text-white/70 hover:text-white"
             >
               Today
             </button>
             <button
               onClick={goNext}
               aria-label="Next month"
-              className="w-9 h-9 rounded-full glass-panel flex items-center justify-center
-                         text-white/70 hover:text-white transition-colors"
+              className="aura-glass-flat w-9 h-9 rounded-full flex items-center justify-center
+                         text-white/70 hover:text-white"
             >
               <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
                 <path d="M8.59 16.59L13.17 12 8.59 7.41 10 6l6 6-6 6z" />
@@ -416,24 +644,24 @@ export default function CalendarView({ library, addons, onSelectMeta }: Props) {
         {/* Month label */}
         <div className="flex items-baseline gap-3 mb-3">
           <h2 className="text-white/80 text-2xl font-light tracking-wide">{monthLabel}</h2>
-          <span className="text-white/30 text-xs">
+          <span className="text-white/55 text-xs">
             {entriesByDate.size === 0
               ? "No releases tracked"
-              : `${[...entriesByDate.values()].reduce((s, l) => s + l.length, 0)} total in library`}
+              : `${totalEntries} total in library`}
           </span>
         </div>
 
         {/* Empty/empty-addon states */}
         {addons.length === 0 && (
-          <div className="glass-panel rounded-2xl px-5 py-4 mb-3">
-            <p className="text-white/55 text-sm">
+          <div {...sheet("rounded-[20px] px-5 py-4 mb-3")}>
+            <p className="text-white/65 text-sm">
               Add an addon (in the Addons tab) to populate the calendar.
             </p>
           </div>
         )}
         {addons.length > 0 && library.length === 0 && !loading && (
-          <div className="glass-panel rounded-2xl px-5 py-4 mb-3">
-            <p className="text-white/55 text-sm">
+          <div {...sheet("rounded-[20px] px-5 py-4 mb-3")}>
+            <p className="text-white/65 text-sm">
               Your library is empty. Items you save show up here when their
               release date falls in view.
             </p>
@@ -446,7 +674,7 @@ export default function CalendarView({ library, addons, onSelectMeta }: Props) {
         {loading && (
           <div className="relative h-[3px] w-full rounded-full bg-white/5 overflow-hidden mb-2">
             <div
-              className="absolute top-0 left-0 h-full w-1/3 rounded-full bg-ln-accent"
+              className="absolute top-0 left-0 h-full w-1/3 rounded-full bg-[var(--ln-accent-mark)]"
               style={{ animation: "calendar-loading-bar 1.4s ease-in-out infinite" }}
             />
           </div>
@@ -455,7 +683,7 @@ export default function CalendarView({ library, addons, onSelectMeta }: Props) {
         {/* Weekday header */}
         <div className="grid grid-cols-7 gap-2 px-1 mb-2">
           {WEEKDAY_LABELS.map((d) => (
-            <div key={d} className="text-white/35 text-[10px] font-semibold tracking-[0.18em] uppercase text-center">
+            <div key={d} className="text-white/55 text-[10px] font-semibold tracking-[0.18em] uppercase text-center">
               {d}
             </div>
           ))}
@@ -471,7 +699,7 @@ export default function CalendarView({ library, addons, onSelectMeta }: Props) {
       >
         <div
           key={monthAnchor.getMonth()}
-          className="grid grid-cols-7 gap-2 h-full"
+          className="aura-cal-grid grid grid-cols-7 gap-2 h-full"
           style={{
             gridTemplateRows: `repeat(${rows}, minmax(0, 1fr))`,
             gridAutoRows: "minmax(0, 1fr)",
@@ -479,180 +707,27 @@ export default function CalendarView({ library, addons, onSelectMeta }: Props) {
         >
           {monthCells.map(({ date, inMonth }) => {
             const key = dateKey(date);
-            const entries = entriesByDate.get(key) ?? [];
-            const isToday = isSameDay(date, today);
-            const dim = !inMonth;
-
-            // Dedup posters by series id so a day with 5 episodes of the
-            // same show shows ONE poster, not five identical thumbs.
-            // Cap at 2 visible posters — cleaner at cell sizes than 3.
-            const allDedupedEntries: typeof entries = [];
-            const seen = new Set<string>();
-            for (const e of entries) {
-              if (seen.has(e.item.id)) continue;
-              seen.add(e.item.id);
-              allDedupedEntries.push(e);
-            }
-            const totalDeduped = allDedupedEntries.length;
-            const visiblePosters = allDedupedEntries.slice(0, 2);
-            const hiddenPosters = allDedupedEntries.slice(2);
-            const hiddenCount = totalDeduped - visiblePosters.length;
-
-            const CellTag = entries.length > 0 ? "button" : "div";
             return (
-              // NOTE: overflow-hidden is intentionally absent so the hover
-              // popout (absolute bottom-full) can escape the cell boundary.
-              // Top-row cells will have their popout clipped by the page
-              // chrome — this is acceptable for v1 (the outer wrapper's
-              // overflow-hidden clips it cleanly without broken layout).
-              <CellTag
+              <CalendarDayCell
                 key={key}
-                {...(entries.length > 0
-                  ? { onClick: () => setOverlayDate(date) }
-                  : {})}
-                className={`group relative rounded-xl glass-panel p-2 text-left
-                            flex flex-col
-                            ${dim ? "opacity-35" : ""}
-                            ${entries.length > 0
-                              ? "cursor-pointer transition-all duration-150 hover:bg-white/10 hover:border-white/20 hover:scale-[1.02] hover:ring-1 hover:ring-ln-accent/40"
-                              : "cursor-default"}
-                            ${isToday ? "cal-today" : ""}`}
-              >
-                {/* Date number + optional overflow badge */}
-                <div className="flex items-start justify-between">
-                  <span
-                    className={`leading-none ${isToday
-                      ? "inline-flex items-center justify-center min-w-[22px] h-[22px] px-1.5 -ml-0.5 -mt-0.5 rounded-full bg-ln-accent text-black text-sm font-bold shadow-[0_0_10px_rgba(91,164,255,0.7)]"
-                      : dim
-                        ? "text-white/35 text-sm font-medium"
-                        : "text-white/75 text-sm font-medium"
-                    }`}
-                  >
-                    {date.getDate()}
-                  </span>
-                  {/* Badge: only shown when there are hidden posters */}
-                  {hiddenCount > 0 && (
-                    <span className="text-xs font-bold tracking-wide text-ln-accent
-                                     px-2 py-0.5 rounded bg-ln-accent/25 border border-ln-accent/40">
-                      +{hiddenCount}
-                    </span>
-                  )}
-                </div>
-
-
-                {/* Visible poster strip — max 2 posters per cell */}
-                {visiblePosters.length > 0 && (
-                  // Posters share the remaining cell height equally — height
-                  // is driven by the 1fr row, not a fixed minHeight. The
-                  // 2:3 aspect ratio derives width from height automatically.
-                  <div className="mt-2 flex-1 min-h-0 flex items-end justify-center gap-1.5">
-                    {visiblePosters.map(({ item, detail, video }) => {
-                      const src = detail?.poster ?? item.poster;
-                      const epLabel =
-                        video && video.season != null && video.episode != null
-                          ? formatEpLabel(video.season, video.episode)
-                          : null;
-                      return (
-                        <div
-                          key={item.id}
-                          className="relative h-full rounded-md overflow-hidden
-                                     bg-white/5 border border-white/10"
-                          style={{ aspectRatio: "2 / 3" }}
-                          title={detail?.name ?? item.name}
-                        >
-                          {src ? (
-                            <ImageLoader
-                              src={src}
-                              alt=""
-                              draggable={false}
-                              className="absolute inset-0 w-full h-full"
-                              imgClassName="w-full h-full object-cover"
-                            />
-                          ) : loading ? (
-                            <PosterShimmer />
-                          ) : (
-                            <div className="absolute inset-0 flex items-center justify-center
-                                            text-white/20 text-[10px]">
-                              ?
-                            </div>
-                          )}
-                          {epLabel && (
-                            // Top-LEFT to match the DayOverlay badge and to
-                            // stay clear of addon-baked HDR/DV/language badges
-                            // that sit in the poster's top-right art.
-                            <span
-                              className="absolute top-1 left-1 text-[9px] leading-none
-                                         font-mono font-semibold text-white/95
-                                         px-1 py-0.5 rounded bg-black/85
-                                         border border-white/15"
-                            >
-                              {epLabel}
-                            </span>
-                          )}
-                        </div>
-                      );
-                    })}
-                  </div>
-                )}
-
-                {/* Hover popout — floats above the cell, shows hidden posters.
-                    Only rendered when there are posters beyond the 2-cap.
-                    pointer-events-none throughout: the parent <button> cell
-                    owns the click; the popout is purely decorative on hover. */}
-                {hiddenCount > 0 && (
-                  <div
-                    className="absolute bottom-full left-0 right-0 mb-2 z-50
-                               pointer-events-none
-                               opacity-0 scale-90 translate-y-2
-                               group-hover:opacity-100 group-hover:scale-100 group-hover:translate-y-0
-                               transition-all duration-200 ease-out"
-                    style={{ transformOrigin: "bottom right" }}
-                  >
-                    <div className="bg-black/85 backdrop-blur-md rounded-xl
-                                    border border-white/15 shadow-glass-edge p-2
-                                    flex flex-row gap-1.5 overflow-x-auto whitespace-nowrap"
-                         style={{ height: "180px" }}>
-                      {hiddenPosters.map(({ item, detail }, i) => {
-                        const src = detail?.poster ?? item.poster;
-                        return (
-                          <div
-                            key={item.id}
-                            className="relative h-full flex-shrink-0 rounded-md overflow-hidden
-                                       bg-white/5 border border-white/10
-                                       opacity-0 scale-90
-                                       group-hover:opacity-100 group-hover:scale-100
-                                       transition-all duration-200 ease-out"
-                            style={{
-                              aspectRatio: "2 / 3",
-                              transitionDelay: `${i * 30}ms`,
-                            }}
-                            title={detail?.name ?? item.name}
-                          >
-                            {src ? (
-                              <ImageLoader
-                                src={src}
-                                alt=""
-                                draggable={false}
-                                className="absolute inset-0 w-full h-full"
-                                imgClassName="w-full h-full object-cover"
-                              />
-                            ) : (
-                              <div className="absolute inset-0 flex items-center justify-center
-                                              text-white/20 text-[10px]">
-                                ?
-                              </div>
-                            )}
-                          </div>
-                        );
-                      })}
-                    </div>
-                  </div>
-                )}
-              </CellTag>
+                dayKey={key}
+                date={date}
+                inMonth={inMonth}
+                entries={entriesByDate.get(key) ?? NO_ENTRIES}
+                isToday={isSameDay(date, today)}
+                loading={loading}
+                onOpen={openDay}
+                onShowHidden={showHidden}
+                onHideHidden={hideHidden}
+              />
             );
           })}
         </div>
       </div>
+
+      {popout && !overlayDate && popoutEntries.length > 0 && (
+        <HiddenPostersPopout key={popout.key} anchor={popout.anchor} entries={popoutEntries} />
+      )}
 
       {/* Day overlay — mounted only when a cell with releases is clicked */}
       {overlayDate && (
@@ -666,6 +741,137 @@ export default function CalendarView({ library, addons, onSelectMeta }: Props) {
     </div>
   );
 }
+
+// ---------------------------------------------------------------------------
+// CalendarDayCell: one day of the month grid. Memoized: hovering a busy day
+// sets the popout state in CalendarView, which used to re-render (and
+// re-dedupe) every cell of the month on each cell the pointer crossed.
+// ---------------------------------------------------------------------------
+
+const CalendarDayCell = memo(function CalendarDayCell({
+  dayKey: key, date, inMonth, entries, isToday, loading, onOpen, onShowHidden, onHideHidden,
+}: {
+  dayKey: string;
+  date: Date;
+  inMonth: boolean;
+  entries: CalendarEntry[];
+  isToday: boolean;
+  loading: boolean;
+  onOpen: (date: Date) => void;
+  onShowHidden: (key: string, anchor: DOMRect) => void;
+  onHideHidden: (key: string) => void;
+}) {
+  const dim = !inMonth;
+
+  // Dedup posters by series id; cap at 2 visible posters (cleaner at cell
+  // sizes than 3).
+  const allDedupedEntries = dedupeBySeries(entries);
+  const totalDeduped = allDedupedEntries.length;
+  const visiblePosters = allDedupedEntries.slice(0, 2);
+  const hiddenCount = totalDeduped - visiblePosters.length;
+
+  const CellTag = entries.length > 0 ? "button" : "div";
+  return (
+    // The posters past the first two show in HiddenPostersPopout,
+    // portalled to body, while the cell is hovered. onMouseLeave is set
+    // always, not only while there are hidden posters: a hovered cell whose
+    // count drops to 0 (or that turns from button to div, a remount) must
+    // still close its popout when the pointer leaves.
+    <CellTag
+      {...(entries.length > 0
+        ? { onClick: () => onOpen(date) }
+        : {})}
+      {...(hiddenCount > 0
+        ? {
+            onMouseEnter: (e: ReactMouseEvent<HTMLElement>) =>
+              onShowHidden(key, e.currentTarget.getBoundingClientRect()),
+          }
+        : {})}
+      onMouseLeave={() => onHideHidden(key)}
+      {...sheet(`is-cell group relative rounded-[14px] p-2 text-left
+                  flex flex-col
+                  ${dim ? "is-dim" : ""}
+                  ${entries.length > 0 ? "is-live cursor-pointer" : "cursor-default"}
+                  ${isToday ? "is-today" : ""}`)}
+    >
+      {/* Date number + optional overflow badge */}
+      <div className="flex items-start justify-between">
+        <span
+          className={`leading-none ${isToday
+            ? "aura-cal-today-num inline-flex items-center justify-center min-w-[22px] h-[22px] px-1.5 -ml-0.5 -mt-0.5 rounded-full text-sm font-bold"
+            : dim
+              ? "text-white/55 text-sm font-medium"
+              : "text-white/75 text-sm font-medium"
+          }`}
+        >
+          {date.getDate()}
+        </span>
+        {/* Badge: only shown when there are hidden posters */}
+        {hiddenCount > 0 && (
+          <span className="aura-mark-chip text-[11px] font-mono font-semibold tracking-wide px-2 py-0.5">
+            +{hiddenCount}
+          </span>
+        )}
+      </div>
+
+
+      {/* Visible poster strip: max 2 posters per cell */}
+      {visiblePosters.length > 0 && (
+        // Posters share the remaining cell height equally; height
+        // is driven by the 1fr row, not a fixed minHeight. The
+        // 2:3 aspect ratio derives width from height automatically.
+        <div className="mt-2 flex-1 min-h-0 flex items-end justify-center gap-1.5">
+          {visiblePosters.map(({ item, detail, video }) => {
+            const src = detail?.poster ?? item.poster;
+            const epLabel =
+              video && video.season != null && video.episode != null
+                ? formatEpLabel(video.season, video.episode)
+                : null;
+            return (
+              <div
+                key={item.id}
+                className="relative h-full rounded-md overflow-hidden bg-white/5"
+                style={{ aspectRatio: "2 / 3" }}
+                title={detail?.name ?? item.name}
+              >
+                {src ? (
+                  <ImageLoader
+                    src={src}
+                    alt=""
+                    draggable={false}
+                    className="absolute inset-0 w-full h-full"
+                    imgClassName="w-full h-full object-cover"
+                  />
+                ) : loading ? (
+                  <PosterShimmer />
+                ) : (
+                  <div className="absolute inset-0 flex items-center justify-center
+                                  text-white/20 text-[10px]">
+                    ?
+                  </div>
+                )}
+                {epLabel && (
+                  // Top-LEFT to match the DayOverlay badge and to
+                  // stay clear of addon-baked HDR/DV/language badges
+                  // that sit in the poster's top-right art.
+                  <span
+                    className="absolute top-1 left-1 text-[9px] leading-none
+                               font-mono font-semibold text-white/95
+                               px-1 py-0.5 rounded bg-black/85
+                               border border-white/15"
+                  >
+                    {epLabel}
+                  </span>
+                )}
+                <span aria-hidden className="aura-card-bezel" data-glass-light="rim" />
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </CellTag>
+  );
+});
 
 // ---------------------------------------------------------------------------
 // DayOverlay — modal that appears when the user clicks a calendar cell.
@@ -712,17 +918,25 @@ function DayOverlay({ date, entries, onClose, onSelectMeta }: DayOverlayProps) {
     // below PlayerOverlay (z-60+). Fades in immediately on mount.
     <div
       className="fixed inset-0 z-[55] flex items-center justify-center p-6"
-      style={{
-        backgroundColor: opening ? "transparent" : "rgba(0,0,0,0.80)",
-        backdropFilter: opening ? "blur(0px)" : "blur(8px)",
-        transition: "background-color 200ms ease, backdrop-filter 200ms ease",
-      }}
       onClick={onClose}
     >
-      {/* Modal card — click-through stops propagation to backdrop */}
+      {/* The dim + blur is a SIBLING of the card, never its wrapper: a
+          backdrop-filter on an ancestor is a Backdrop Root, so the card's own
+          glass would blur only this black scrim. Clicks on it still bubble to
+          the wrapper's onClose. */}
+      <div
+        aria-hidden
+        className="absolute inset-0"
+        style={{
+          backgroundColor: opening ? "transparent" : "rgba(0,0,0,0.80)",
+          backdropFilter: opening ? "blur(0px)" : "blur(8px)",
+          transition: "background-color 200ms ease, backdrop-filter 200ms ease",
+        }}
+      />
+      {/* Modal card: click-through stops propagation to backdrop */}
       <div
         ref={cardRef}
-        className="glass-panel rounded-2xl flex flex-col overflow-hidden"
+        className="aura-float-glass relative rounded-2xl flex flex-col overflow-hidden"
         style={{
           width: "min(1100px, 92vw)",
           maxHeight: "88vh",
@@ -738,15 +952,15 @@ function DayOverlay({ date, entries, onClose, onSelectMeta }: DayOverlayProps) {
                         border-b border-white/8">
           <div>
             <h2 className="text-white/90 text-lg font-semibold tracking-tight">{dateLabel}</h2>
-            <p className="text-white/40 text-sm mt-0.5">
+            <p className="text-white/60 text-sm mt-0.5">
               {releaseCount === 1 ? "1 release" : `${releaseCount} releases`}
             </p>
           </div>
           <button
             onClick={onClose}
             aria-label="Close"
-            className="w-8 h-8 rounded-full glass-panel flex items-center justify-center
-                       text-white/50 hover:text-white transition-colors shrink-0 mt-0.5"
+            className="aura-glass-flat w-8 h-8 rounded-full flex items-center justify-center
+                       text-white/50 hover:text-white shrink-0 mt-0.5"
           >
             <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
               <path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" />
@@ -824,7 +1038,7 @@ function CalendarCard({
   /** Right-click handler — fires the `aura:card-context` event the
    *  shared App-level listener uses to render context menus on cards
    *  app-wide. Optional so non-interactive use sites stay clean. */
-  onContextMenu?: (e: React.MouseEvent<HTMLElement>) => void;
+  onContextMenu?: (e: ReactMouseEvent<HTMLElement>) => void;
   onClick?: () => void;
 }) {
   const Tag = onClick ? "button" : "div";
@@ -838,11 +1052,11 @@ function CalendarCard({
       onContextMenu={onContextMenu}
       {...hover}
       data-meta-card={`${mediaType}:${meta.id}`}
-      className={`glass-panel rounded-xl p-2.5 flex flex-col gap-2 text-left w-full
-                  ${onClick ? "hover:bg-white/8 transition-colors cursor-pointer" : ""}`}
+      className={`aura-content-card group rounded-[12px] p-2.5 flex flex-col gap-2 text-left w-full
+                  ${onClick ? "is-live cursor-pointer" : ""}`}
     >
       <div
-        className="relative w-full rounded-md overflow-hidden bg-white/5 border border-white/8"
+        className="relative w-full rounded-md overflow-hidden bg-white/5"
         style={{ aspectRatio: "2 / 3" }}
       >
         {poster ? (
@@ -868,13 +1082,14 @@ function CalendarCard({
             {episodeTag}
           </span>
         )}
+        <span aria-hidden className="aura-card-bezel" data-glass-light="rim" />
       </div>
       <div className="min-w-0">
-        <p className="text-white/95 text-sm font-semibold leading-tight line-clamp-2">{name}</p>
+        <p className="aura-poster-title text-white/95 text-sm font-semibold leading-tight line-clamp-2">{name}</p>
         {episodeTitle && (
           <p className="text-white/70 text-[12.5px] mt-0.5 line-clamp-1">{episodeTitle}</p>
         )}
-        <p className="text-white/45 text-[11px] mt-0.5 font-mono">
+        <p className="text-white/60 text-[11px] mt-0.5 font-mono">
           {mediaType.charAt(0).toUpperCase() + mediaType.slice(1)} · {dateLabel}
         </p>
       </div>

@@ -1,7 +1,7 @@
 // Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { memo, useCallback, useEffect, useMemo, useReducer, useState } from "react";
+import { memo, useCallback, useDeferredValue, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import ErrorBoundary from "../ErrorBoundary";
 import ImageLoader from "../ImageLoader";
 import {
@@ -31,13 +31,15 @@ import {
   isFavorite,
   toggleFavorite,
   dropFavoritesForSource,
-  type FavoriteChannel,
 } from "../iptv/favoritesStore";
 import PlaylistForm from "./live/PlaylistForm";
 import GuideView from "./live/GuideView";
 import MultiView from "./live/MultiView";
 import { openChannelMenu } from "../iptv/channelMenu";
 import { useIdleGatedInterval } from "../useIdleGate";
+import { SegmentedControl } from "../settingsControls";
+import { sheet } from "../glassSheet";
+import { useListDroplet } from "../glassListDroplet";
 
 /** Guide rows are heavier than grid cards (sticky cells + per-row timeline);
  *  the guide starts at this many rows and grows by GUIDE_PAGE as the user
@@ -140,6 +142,8 @@ function LiveBody({ active, playerActive, onPlayChannel }: Props) {
   // group name) so it can't collide with a real provider group and so a
   // source switch / removal doesn't silently dismiss it.
   const [favoritesView, setFavoritesView] = useState(false);
+  // The group rail is a glass sheet; its rows share ONE hover droplet.
+  const groupDroplet = useListDroplet<HTMLElement>(".aura-sheet-row");
   const [query, setQuery] = useState("");
   const [formOpen, setFormOpen] = useState(false);
   const [editingSource, setEditingSource] = useState<IptvPlaylistSource | null>(null);
@@ -213,17 +217,26 @@ function LiveBody({ active, playerActive, onPlayChannel }: Props) {
       .map((g) => ({ name: g, count: counts.get(g) ?? 0 }));
   }, [playlist]);
 
+  // The lists re-filter at a lower priority than the keystroke (as History
+  // does), so typing stays immediate on a 10k+ channel playlist.
+  const deferredQuery = useDeferredValue(query);
+
   // Filter channels by selected group + search query.
   const filtered = useMemo(() => {
     if (!playlist) return [];
-    const q = query.trim().toLowerCase();
+    const q = deferredQuery.trim().toLowerCase();
     let list = playlist.channels;
     if (selectedGroup !== "All") list = list.filter((c) => c.group === selectedGroup);
     if (q) list = list.filter((c) => c.name.toLowerCase().includes(q));
     return list;
-  }, [playlist, selectedGroup, query]);
+  }, [playlist, selectedGroup, deferredQuery]);
 
-  const visible = filtered.length > MAX_VISIBLE ? filtered.slice(0, MAX_VISIBLE) : filtered;
+  // Memoized: a fresh slice every render re-ran the now/next resolve below on
+  // every render (a keystroke, a favourite toggle), not only on its own keys.
+  const visible = useMemo(
+    () => (filtered.length > MAX_VISIBLE ? filtered.slice(0, MAX_VISIBLE) : filtered),
+    [filtered],
+  );
 
   // ── Guide infinite scroll ────────────────────────────────────────────
   // Reveal count is sticky per source+group (see guideRevealCache). It is NOT
@@ -251,13 +264,21 @@ function LiveBody({ active, playerActive, onPlayChannel }: Props) {
   // keyed on the visible set, source, the 30 s now-tick, and the EPG version
   // (so it re-resolves when the EPG finishes loading). `epgVer` participates
   // only as a re-trigger. Bounded to MAX_VISIBLE entries.
+  // A result equal to the last one (same programme objects) keeps its old
+  // object, so a re-filter or a tick inside the same programme leaves the
+  // memoized cards alone (resolveNowNext builds a new object every call).
+  const prevNowNext = useRef(new Map<string, NowNext>());
   const nowNextByChannel = useMemo(() => {
     const map = new Map<string, NowNext>();
     if (!selectedSourceId || !epgReady) return map;
+    const prev = prevNowNext.current;
     for (const ch of visible) {
       const nn = resolveNowNext(selectedSourceId, ch, nowMs);
-      if (nn && (nn.now || nn.next)) map.set(ch.id, nn);
+      if (!nn || !(nn.now || nn.next)) continue;
+      const old = prev.get(ch.id);
+      map.set(ch.id, old && old.now === nn.now && old.next === nn.next ? old : nn);
     }
+    prevNowNext.current = map;
     return map;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [visible, selectedSourceId, nowMs, epgReady, epgVer]);
@@ -265,22 +286,29 @@ function LiveBody({ active, playerActive, onPlayChannel }: Props) {
   // ── Favourites (cross-playlist) ──────────────────────────────────────
   const totalFavorites = useMemo(() => favoriteCount(), [favVer]);
   const favorites = useMemo(() => {
-    const q = query.trim().toLowerCase();
+    const q = deferredQuery.trim().toLowerCase();
     const list = [...getFavorites()];
     return q ? list.filter((f) => f.channel.name.toLowerCase().includes(q)) : list;
-  }, [favVer, query]);
+  }, [favVer, deferredQuery]);
   // Cap the rendered favourites (same MAX_VISIBLE budget as the channel grid
   // — don't mount hundreds of cards) and resolve now/next ONCE per render
   // into a keyed map instead of an inline call per card (which defeated the
   // card memo and re-ran up to 500 EPG scans every 30s tick).
-  const visibleFavorites =
-    favorites.length > MAX_VISIBLE ? favorites.slice(0, MAX_VISIBLE) : favorites;
+  const visibleFavorites = useMemo(
+    () => (favorites.length > MAX_VISIBLE ? favorites.slice(0, MAX_VISIBLE) : favorites),
+    [favorites],
+  );
+  const prevFavNowNext = useRef(new Map<string, NowNext>());
   const favNowNextByKey = useMemo(() => {
     const map = new Map<string, NowNext>();
+    const prev = prevFavNowNext.current;
     for (const fav of visibleFavorites) {
       const nn = resolveNowNext(fav.sourceId, fav.channel, nowMs);
-      if (nn && (nn.now || nn.next)) map.set(fav.key, nn);
+      if (!nn || !(nn.now || nn.next)) continue;
+      const old = prev.get(fav.key);
+      map.set(fav.key, old && old.now === nn.now && old.next === nn.next ? old : nn);
     }
+    prevFavNowNext.current = map;
     return map;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [visibleFavorites, nowMs, epgVer]);
@@ -288,10 +316,11 @@ function LiveBody({ active, playerActive, onPlayChannel }: Props) {
   /** Play a favourite — its origin playlist may not be the selected one, so
    *  synthesise the minimal playlist handlePlayChannel needs (it only reads
    *  `.name`). */
-  const playFavorite = (fav: FavoriteChannel) => {
-    onPlayChannel(fav.channel, {
-      id: fav.sourceId,
-      name: fav.sourceName,
+  const sources = state.sources;
+  const playFavorite = useCallback((channel: IptvChannel, sourceId: string, sourceName: string) => {
+    onPlayChannel(channel, {
+      id: sourceId,
+      name: sourceName,
       url: "",
       epgUrl: null,
       channels: [],
@@ -299,18 +328,24 @@ function LiveBody({ active, playerActive, onPlayChannel }: Props) {
       groups: [],
       // Carry the origin source's proxy so a favourite plays through the same
       // proxy as it would from its own playlist.
-      proxyUrl: state.sources.find((s) => s.id === fav.sourceId)?.proxyUrl ?? null,
+      proxyUrl: sources.find((s) => s.id === sourceId)?.proxyUrl ?? null,
     });
-  };
+  }, [sources, onPlayChannel]);
+  /** Play a channel of the selected playlist. Stable, so the memoized grid
+   *  cards and guide rows are not re-rendered by every page render (a hover,
+   *  a keystroke, a tick) through a fresh inline closure. */
+  const playFromPlaylist = useCallback((channel: IptvChannel) => {
+    if (playlist) onPlayChannel(channel, playlist);
+  }, [playlist, onPlayChannel]);
 
   return (
     <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
       {/* Header */}
       <div className="px-6 pt-6 pb-3 flex items-end justify-between gap-4 flex-wrap">
         <div>
-          <h1 className="aura-row-title text-3xl font-semibold tracking-tight">Live TV</h1>
-          <p className="text-white/35 text-sm mt-1">
-            Your IPTV playlists — channels stream through the normal player.
+          <h1 data-glass-light="text" className="aura-row-title text-3xl font-semibold tracking-tight">Live TV</h1>
+          <p className="text-white/60 text-sm mt-1">
+            Your IPTV playlists. Channels stream through the normal player.
           </p>
         </div>
         <div className="flex items-center gap-2 flex-wrap">
@@ -342,8 +377,7 @@ function LiveBody({ active, playerActive, onPlayChannel }: Props) {
               setEditingSource(null);
               setFormOpen(true);
             }}
-            className="px-3.5 h-9 rounded-xl text-[13px] font-medium border transition-colors
-                       bg-ln-accent/15 text-ln-accent border-ln-accent/30 hover:bg-ln-accent/25"
+            className="aura-glass-flat aura-glass-press is-primary px-3.5 h-9 rounded-xl text-[13px] font-medium"
           >
             + Add playlist
           </button>
@@ -363,9 +397,11 @@ function LiveBody({ active, playerActive, onPlayChannel }: Props) {
         <div className="flex-1 flex min-h-0">
           {/* Category sidebar */}
           <aside
-            className="w-56 flex-shrink-0 border-r border-white/8 overflow-y-auto py-2"
+            {...sheet("aura-live-rail relative w-56 flex-shrink-0 overflow-y-auto ml-6 mb-4 rounded-[18px] p-1.5")}
             style={{ scrollbarWidth: "thin", scrollbarColor: "rgba(255,255,255,0.08) transparent" }}
+            {...groupDroplet.listProps}
           >
+            <span ref={groupDroplet.ref} aria-hidden className="aura-glass-hl aura-sheet-hl" />
             <GroupRow
               label="★ Favorites"
               count={totalFavorites}
@@ -417,22 +453,24 @@ function LiveBody({ active, playerActive, onPlayChannel }: Props) {
                 }}
                 placeholder={favoritesView ? "Search favorites…" : "Search channels…"}
                 data-aura-search
-                className="h-9 w-64 max-w-full px-3 rounded-xl bg-white/5 border border-white/10
+                // Glass text field (App.css GLASS SYSTEM): the fill, border and
+                // focus edge come from the class in both materials.
+                className="aura-glass-field h-9 w-64 max-w-full px-3 rounded-xl
                            text-[13px] text-white/90 placeholder:text-white/30
-                           focus:outline-none focus:border-ln-accent/40"
+                           outline-none"
               />
               {favoritesView ? (
-                <span className="text-white/35 text-xs">
+                <span className="text-white/55 text-xs">
                   {favorites.length.toLocaleString()} favorite{favorites.length === 1 ? "" : "s"}
                   {favorites.length > MAX_VISIBLE && ` · showing first ${MAX_VISIBLE} (refine to see all)`}
                 </span>
               ) : playlist ? (
-                <span className="text-white/35 text-xs">
+                <span className="text-white/55 text-xs">
                   {filtered.length.toLocaleString()} channel{filtered.length === 1 ? "" : "s"}
                   {viewMode === "grid" && filtered.length > MAX_VISIBLE &&
                     ` · showing first ${MAX_VISIBLE} (refine to see all)`}
                   {viewMode === "guide" && guideHasMore &&
-                    ` · showing ${guideChannels.length.toLocaleString()} — scroll for more`}
+                    ` · showing ${guideChannels.length.toLocaleString()}, scroll for more`}
                 </span>
               ) : null}
               {!favoritesView && <ViewModeToggle mode={viewMode} onChange={setViewMode} />}
@@ -445,38 +483,33 @@ function LiveBody({ active, playerActive, onPlayChannel }: Props) {
                 style={{ scrollbarWidth: "thin", scrollbarColor: "rgba(255,255,255,0.08) transparent" }}
               >
                 {favorites.length === 0 ? (
-                  <p className="text-white/40 text-sm py-12 text-center max-w-[28rem] mx-auto">
-                    {query
+                  <p className="text-white/60 text-sm py-12 text-center max-w-[28rem] mx-auto">
+                    {deferredQuery
                       ? "No favorites match your search."
-                      : "No favorites yet. Hover a channel and tap the ★ to add it here — favorites span every playlist."}
+                      : "No favorites yet. Hover a channel and tap the ★ to add it here. Favorites span every playlist."}
                   </p>
                 ) : (
                   <div
                     className="grid gap-3"
                     style={{ gridTemplateColumns: "repeat(auto-fill, minmax(186px, 1fr))" }}
                   >
-                    {visibleFavorites.map((fav) => (
-                      <ChannelCard
-                        key={fav.key}
-                        channel={fav.channel}
-                        nowNext={favNowNextByKey.get(fav.key) ?? null}
-                        nowMs={nowMs}
-                        onPlay={() => playFavorite(fav)}
-                        favorited
-                        onToggleFavorite={() =>
-                          toggleFavorite(fav.sourceId, fav.sourceName, fav.channel)
-                        }
-                        sourceLabel={fav.sourceName}
-                        onContextMenu={(e) =>
-                          openChannelMenu(e, {
-                            channel: fav.channel,
-                            sourceId: fav.sourceId,
-                            sourceName: fav.sourceName,
-                            onPlay: () => playFavorite(fav),
-                          })
-                        }
-                      />
-                    ))}
+                    {visibleFavorites.map((fav) => {
+                      const nn = favNowNextByKey.get(fav.key) ?? null;
+                      return (
+                        <ChannelCard
+                          key={fav.key}
+                          channel={fav.channel}
+                          sourceId={fav.sourceId}
+                          sourceName={fav.sourceName}
+                          nowNext={nn}
+                          // Only a card with a programme on air reads the clock.
+                          nowMs={nn?.now ? nowMs : 0}
+                          onPlay={playFavorite}
+                          favorited
+                          sourceLabel={fav.sourceName}
+                        />
+                      );
+                    })}
                   </div>
                 )}
               </div>
@@ -484,7 +517,7 @@ function LiveBody({ active, playerActive, onPlayChannel }: Props) {
               <MultiView
                 channels={filtered}
                 suspended={playerActive}
-                onPlayChannel={(ch) => playlist && onPlayChannel(ch, playlist)}
+                onPlayChannel={playFromPlaylist}
               />
             ) : viewMode === "guide" ? (
               <GuideView
@@ -499,7 +532,7 @@ function LiveBody({ active, playerActive, onPlayChannel }: Props) {
                 truncated={epgIsTruncated}
                 hasMore={guideHasMore}
                 onReachEnd={revealMoreGuide}
-                onPlayChannel={(ch) => playlist && onPlayChannel(ch, playlist)}
+                onPlayChannel={playFromPlaylist}
               />
             ) : (
               <div
@@ -514,37 +547,30 @@ function LiveBody({ active, playerActive, onPlayChannel }: Props) {
                     onRetry={() => selectedSourceId && refreshPlaylist(selectedSourceId, { force: true })}
                   />
                 ) : visible.length === 0 ? (
-                  <p className="text-white/40 text-sm py-12 text-center">
-                    {query ? "No channels match your search." : "No channels in this group."}
+                  <p className="text-white/60 text-sm py-12 text-center">
+                    {deferredQuery ? "No channels match your search." : "No channels in this group."}
                   </p>
                 ) : (
                   <div
                     className="grid gap-3"
                     style={{ gridTemplateColumns: "repeat(auto-fill, minmax(186px, 1fr))" }}
                   >
-                    {visible.map((ch) => (
-                      <ChannelCard
-                        key={ch.id}
-                        channel={ch}
-                        nowNext={nowNextByChannel.get(ch.id) ?? null}
-                        nowMs={nowMs}
-                        onPlay={() => playlist && onPlayChannel(ch, playlist)}
-                        favorited={!!selectedSourceId && isFavorite(selectedSourceId, ch.id)}
-                        onToggleFavorite={() =>
-                          selectedSourceId &&
-                          toggleFavorite(selectedSourceId, playlist?.name ?? selectedSourceId, ch)
-                        }
-                        onContextMenu={(e) =>
-                          selectedSourceId &&
-                          openChannelMenu(e, {
-                            channel: ch,
-                            sourceId: selectedSourceId,
-                            sourceName: playlist?.name ?? selectedSourceId,
-                            onPlay: () => playlist && onPlayChannel(ch, playlist),
-                          })
-                        }
-                      />
-                    ))}
+                    {visible.map((ch) => {
+                      const nn = nowNextByChannel.get(ch.id) ?? null;
+                      return (
+                        <ChannelCard
+                          key={ch.id}
+                          channel={ch}
+                          sourceId={selectedSourceId}
+                          sourceName={playlist?.name ?? selectedSourceId ?? ""}
+                          nowNext={nn}
+                          // Only a card with a programme on air reads the clock.
+                          nowMs={nn?.now ? nowMs : 0}
+                          onPlay={playFromPlaylist}
+                          favorited={!!selectedSourceId && isFavorite(selectedSourceId, ch.id)}
+                        />
+                      );
+                    })}
                   </div>
                 )}
               </div>
@@ -578,24 +604,36 @@ function LiveBody({ active, playerActive, onPlayChannel }: Props) {
 
 const ChannelCard = memo(function ChannelCard({
   channel,
+  sourceId,
+  sourceName,
   nowNext,
   nowMs,
-  onPlay,
+  onPlay: onPlayChannel,
   favorited,
-  onToggleFavorite,
   sourceLabel,
-  onContextMenu,
 }: {
   channel: IptvChannel;
+  /** The playlist the channel belongs to. Null leaves the star and the
+   *  right-click menu inert (no playlist selected). */
+  sourceId: string | null;
+  sourceName: string;
   nowNext: NowNext | null;
+  /** The clock, read only for the on-air progress bar. */
   nowMs: number;
-  onPlay: () => void;
+  /** Stable across renders (the parent's useCallback), so the memo holds:
+   *  the card passes its own channel and source back. */
+  onPlay: (channel: IptvChannel, sourceId: string, sourceName: string) => void;
   favorited: boolean;
-  onToggleFavorite: () => void;
   /** Shown under the name in the favourites view (which playlist it's from). */
   sourceLabel?: string;
-  onContextMenu?: (e: React.MouseEvent) => void;
 }) {
+  const onPlay = () => onPlayChannel(channel, sourceId ?? "", sourceName);
+  const onToggleFavorite = () => {
+    if (sourceId) toggleFavorite(sourceId, sourceName, channel);
+  };
+  const onContextMenu = (e: React.MouseEvent) => {
+    if (sourceId) openChannelMenu(e, { channel, sourceId, sourceName, onPlay });
+  };
   const now = nowNext?.now ?? null;
   const progress =
     now && now.endMs > now.startMs
@@ -608,11 +646,9 @@ const ChannelCard = memo(function ChannelCard({
       onClick={onPlay}
       onKeyDown={(e) => (e.key === "Enter" || e.key === " ") && onPlay()}
       onContextMenu={onContextMenu}
-      title={now ? `${channel.name} — ${now.title}` : channel.name}
-      className="group relative flex flex-col items-stretch text-left rounded-xl overflow-hidden
-                 border border-white/8 bg-white/[0.03] hover:bg-white/[0.07]
-                 hover:border-white/15 transition-colors cursor-pointer
-                 focus:outline-none focus-visible:border-ln-accent/50"
+      title={now ? `${channel.name}: ${now.title}` : channel.name}
+      className="aura-content-card is-live aura-live-channel group relative flex flex-col items-stretch text-left
+                 rounded-[12px] overflow-hidden cursor-pointer focus:outline-none"
     >
       {/* Favourite toggle — visible on hover, or always when favourited.
           stopPropagation so the star doesn't trigger playback. */}
@@ -668,7 +704,7 @@ const ChannelCard = memo(function ChannelCard({
         {progress != null && (
           <span aria-hidden className="absolute inset-x-0 bottom-0 h-[3px] bg-black/40">
             <span
-              className="block h-full bg-ln-accent/80"
+              className="block h-full bg-[var(--ln-accent-mark)]"
               style={{ width: `${(progress * 100).toFixed(1)}%` }}
             />
           </span>
@@ -677,11 +713,11 @@ const ChannelCard = memo(function ChannelCard({
       <div className="px-2.5 py-2">
         <p className="text-[12.5px] text-white/85 font-medium truncate">{channel.name}</p>
         {now ? (
-          <p className="text-[10.5px] text-ln-accent/80 truncate" title={now.title}>
+          <p className="text-[10.5px] text-[color:var(--ln-accent-mark-text)] truncate" title={now.title}>
             {now.title}
           </p>
         ) : (
-          <p className="text-[10.5px] text-white/35 truncate">{sourceLabel ?? channel.group}</p>
+          <p className="text-[10.5px] text-white/55 truncate">{sourceLabel ?? channel.group}</p>
         )}
       </div>
     </div>
@@ -699,22 +735,19 @@ const ChannelGlyph = () => (
 // ---------------------------------------------------------------------------
 
 function ViewModeToggle({ mode, onChange }: { mode: ViewMode; onChange: (m: ViewMode) => void }) {
+  // The shared glass segmented control (one sliding indicator).
   return (
-    <div className="ml-auto flex gap-1 p-1 rounded-xl bg-white/5 border border-white/8">
-      {(["grid", "guide", "multiview"] as const).map((m) => (
-        <button
-          key={m}
-          type="button"
-          onClick={() => onChange(m)}
-          className={[
-            "px-3 h-7 rounded-lg text-[12px] font-medium capitalize transition-colors",
-            mode === m ? "bg-ln-accent/20 text-ln-accent" : "text-white/55 hover:text-white/85",
-          ].join(" ")}
-        >
-          {m}
-        </button>
-      ))}
-    </div>
+    <SegmentedControl<ViewMode>
+      value={mode}
+      onChange={onChange}
+      ariaLabel="Live TV view"
+      className="ml-auto"
+      options={[
+        { value: "grid", label: "Grid" },
+        { value: "guide", label: "Guide" },
+        { value: "multiview", label: "Multiview" },
+      ]}
+    />
   );
 }
 
@@ -741,20 +774,20 @@ function GroupRow({
     <button
       type="button"
       onClick={onClick}
+      aria-current={active ? "true" : undefined}
+      data-glass-light={active ? "rim" : undefined}
       className={[
-        "w-full flex items-center justify-between gap-2 px-4 h-9 text-left transition-colors",
-        accent ? "border-b border-white/8 mb-1" : "",
+        "aura-sheet-row w-full flex items-center justify-between gap-2 px-3 h-9 text-left",
+        accent ? "is-fav" : "",
         active
-          ? accent
-            ? "text-amber-300 bg-amber-300/10"
-            : "text-ln-accent bg-ln-accent/10"
+          ? "is-selected"
           : accent
-            ? "text-amber-200/80 hover:text-amber-200 hover:bg-amber-300/[0.06]"
-            : "text-white/60 hover:text-white/90 hover:bg-white/[0.05]",
+            ? "text-amber-200/85 hover:text-amber-200"
+            : "text-white/65 hover:text-white/90",
       ].join(" ")}
     >
       <span className="text-[12.5px] font-medium truncate">{label}</span>
-      <span className="text-[10.5px] text-white/30 tabular-nums flex-shrink-0">{count}</span>
+      <span className="text-[10.5px] text-white/50 tabular-nums flex-shrink-0">{count}</span>
     </button>
   );
 }
@@ -791,8 +824,9 @@ function SourcePicker({
       <button
         type="button"
         onClick={() => setOpen((o) => !o)}
-        className="px-3.5 h-9 rounded-xl text-[13px] font-medium border transition-colors
-                   bg-white/5 text-white/85 border-white/10 hover:bg-white/10 flex items-center gap-2 max-w-[240px]"
+        aria-expanded={open}
+        className="aura-glass-flat aura-pill-dd px-3.5 h-9 rounded-xl text-[13px] font-medium
+                   text-white/85 flex items-center gap-2 max-w-[240px]"
       >
         <span className="truncate">{current?.name ?? "Select playlist"}</span>
         <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" className="opacity-50 flex-shrink-0">
@@ -803,17 +837,16 @@ function SourcePicker({
         <>
           <div className="fixed inset-0 z-30" onClick={() => setOpen(false)} />
           <div
-            className="absolute right-0 mt-1 w-[280px] max-h-[60vh] overflow-y-auto z-40
-                       rounded-xl border border-white/12 bg-[rgba(14,14,18,0.97)] backdrop-blur-2xl
-                       shadow-glass-edge py-1"
+            // Floating glass (menu tier) growing from its trigger's corner.
+            className="aura-float-glass aura-glass-pop-in absolute right-0 mt-1 w-[280px] max-h-[60vh]
+                       overflow-y-auto z-40 rounded-xl py-1"
+            style={{ "--lg-origin": "top right" } as React.CSSProperties}
           >
             {sources.map((s) => (
               <div
                 key={s.id}
-                className={[
-                  "flex items-center gap-1 px-2 py-1.5 group",
-                  s.id === selectedId ? "bg-white/[0.06]" : "hover:bg-white/[0.04]",
-                ].join(" ")}
+                aria-current={s.id === selectedId ? "true" : undefined}
+                className="aura-glass-row flex items-center gap-1 px-2 py-1.5 mx-1 rounded-lg group"
               >
                 <button
                   type="button"
@@ -912,7 +945,7 @@ function EmptyState({ loaded, onAdd }: { loaded: boolean; onAdd: () => void }) {
       </div>
       <div>
         <p className="text-white/85 text-lg font-semibold">No playlists yet</p>
-        <p className="text-white/40 text-sm mt-1 max-w-[24rem]">
+        <p className="text-white/60 text-sm mt-1 max-w-[24rem]">
           Add an M3U playlist or Xtream login to browse and watch live channels.
         </p>
       </div>
@@ -920,8 +953,7 @@ function EmptyState({ loaded, onAdd }: { loaded: boolean; onAdd: () => void }) {
         <button
           type="button"
           onClick={onAdd}
-          className="mt-1 px-4 h-9 rounded-xl text-[13px] font-medium
-                     bg-ln-accent/15 text-ln-accent border border-ln-accent/30 hover:bg-ln-accent/25"
+          className="aura-glass-flat aura-glass-press is-primary mt-1 px-4 h-9 rounded-xl text-[13px] font-medium"
         >
           + Add your first playlist
         </button>
@@ -937,8 +969,7 @@ function ErrorState({ message, onRetry }: { message: string; onRetry: () => void
       <button
         type="button"
         onClick={onRetry}
-        className="px-3.5 h-9 rounded-xl text-[13px] font-medium bg-white/5 border border-white/10
-                   text-white/80 hover:bg-white/10"
+        className="aura-glass-flat aura-glass-press px-3.5 h-9 rounded-xl text-[13px] font-medium text-white/80"
       >
         Retry
       </button>
@@ -953,7 +984,7 @@ function GridSkeleton() {
       style={{ gridTemplateColumns: "repeat(auto-fill, minmax(186px, 1fr))" }}
     >
       {Array.from({ length: 18 }).map((_, i) => (
-        <div key={i} className="rounded-xl overflow-hidden border border-white/8 bg-white/[0.03]">
+        <div key={i} className="rounded-[12px] overflow-hidden bg-white/[0.03]">
           <div className="aspect-video bg-white/5 animate-pulse" />
           <div className="px-2.5 py-2 space-y-1.5">
             <div className="h-3 w-3/4 rounded bg-white/5 animate-pulse" />

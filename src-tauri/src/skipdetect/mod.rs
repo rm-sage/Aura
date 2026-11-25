@@ -16,8 +16,8 @@
 //   probe        argv builders and stderr parsers for the three ffmpeg opens.
 //   audio        the ffmpeg processes: probe (retry once), one region pass
 //                with stdout / stderr drained concurrently, theme decode.
-//   animethemes  the AnimeThemes client (one base URL, rustls, https only,
-//                GET only, paced) and theme fingerprints.
+//   animethemes  the AnimeThemes client (one GraphQL endpoint, rustls, https
+//                only, read-only query, paced) and theme fingerprints.
 //   cache        animethemes-v1.json, theme-fp/, skipdetect-v1.json (bounded,
 //                atomic, oldest first, under app_data_dir).
 //   job          one detect end to end (probe -> HEAD -> TAIL).

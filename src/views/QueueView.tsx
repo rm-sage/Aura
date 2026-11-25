@@ -50,6 +50,8 @@ import {
 } from "../metaCache";
 import { useHoverCardActivation } from "../useHoverCardActivation";
 import { loadAuraSettings, saveAuraSettings } from "../auraSettings";
+import { sheet } from "../glassSheet";
+import { ToggleSwitch } from "../settingsControls";
 
 // ---------------------------------------------------------------------------
 // QueueView — ordered list of items the user has marked as "planned".
@@ -379,8 +381,8 @@ function QueueViewBody({ library, libraryLoaded, loadFailed, onRetryLoad, addons
         <div className="mx-auto px-6 py-6 space-y-5" style={{ maxWidth: PAGE_CONTENT_MAX_W }}>
           <div className="flex items-end justify-between gap-4 flex-wrap">
             <div>
-              <h1 className="aura-row-title text-3xl font-semibold tracking-tight">Queue</h1>
-              <p className="text-white/35 text-sm mt-1">
+              <h1 data-glass-light="text" className="aura-row-title text-3xl font-semibold tracking-tight">Queue</h1>
+              <p className="text-white/55 text-sm mt-1">
                 {orderedIds.length === 0
                   ? "Your queue is empty. Right-click anything in the catalog and choose 'Mark as Planned' to add it here."
                   : `${orderedIds.length} planned · ${reorderable ? "drag tiles to reorder" : "set Sort By to Default to reorder"}.`}
@@ -393,19 +395,12 @@ function QueueViewBody({ library, libraryLoaded, loadFailed, onRetryLoad, addons
                 aria-checked={removeStartedSeries}
                 onClick={toggleRemoveStartedSeries}
                 title="When on, a series leaves the Queue once you start watching it (any episode). Movies always leave the Queue once watched."
-                className="inline-flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-medium
-                           border border-white/10 bg-white/5 text-white/65
-                           hover:text-white/90 hover:bg-white/8 transition-colors"
+                className="aura-glass-flat inline-flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-medium
+                           text-white/65 hover:text-white/90"
               >
-                <span
-                  className={`relative w-8 h-[18px] rounded-full transition-colors
-                              ${removeStartedSeries ? "bg-ln-accent/70" : "bg-white/15"}`}
-                >
-                  <span
-                    className={`absolute top-0.5 w-[14px] h-[14px] rounded-full bg-white transition-all
-                                ${removeStartedSeries ? "left-[18px]" : "left-0.5"}`}
-                  />
-                </span>
+                {/* The shared glass switch, decorative and xs: the pill
+                    carries the switch role, the click and the keyboard. */}
+                <ToggleSwitch decorative size="xs" value={removeStartedSeries} />
                 Remove started series
               </button>
               {queuedAsMeta.length > 0 && (
@@ -431,32 +426,32 @@ function QueueViewBody({ library, libraryLoaded, loadFailed, onRetryLoad, addons
           )}
 
           {orderedIds.length === 0 ? (
-            <div className="glass-panel rounded-2xl px-6 py-10 text-center">
+            <div {...sheet("rounded-[20px] px-6 py-10 text-center")}>
               <p className="text-white/55 text-sm">
                 Items you mark as Planned appear here in the order you queue
                 them. Drag a tile up or down to change its position.
               </p>
             </div>
           ) : displayedIds.length === 0 && loadFailed ? (
-            <div className="glass-panel rounded-2xl px-6 py-10 text-center space-y-3">
+            <div {...sheet("rounded-[20px] px-6 py-10 text-center space-y-3")}>
               <p className="text-white/65 text-sm">
                 Could not load your queue. Check your connection and try again.
               </p>
               <button
                 type="button"
                 onClick={onRetryLoad}
-                className="px-4 py-1.5 rounded-lg border border-white/15 bg-white/5
-                           text-white/80 text-[12px] font-medium hover:bg-white/10 transition-colors"
+                className="aura-glass-flat px-4 py-1.5 rounded-lg
+                           text-white/80 text-[12px] font-medium"
               >
                 Retry
               </button>
             </div>
           ) : displayedIds.length === 0 && !libraryLoaded ? (
-            <div className="glass-panel rounded-2xl px-6 py-10 text-center">
+            <div {...sheet("rounded-[20px] px-6 py-10 text-center")}>
               <p className="text-white/55 text-sm">Loading your queue…</p>
             </div>
           ) : displayedIds.length === 0 ? (
-            <div className="glass-panel rounded-2xl px-6 py-10 text-center">
+            <div {...sheet("rounded-[20px] px-6 py-10 text-center")}>
               <p className="text-white/55 text-sm">
                 {search.trim()
                   ? `No queued items match “${search.trim()}”.`
@@ -472,7 +467,7 @@ function QueueViewBody({ library, libraryLoaded, loadFailed, onRetryLoad, addons
             >
               <SortableContext items={displayedIds} strategy={rectSortingStrategy} disabled={!reorderable}>
                 <div
-                  className="grid gap-5 pb-6"
+                  className="grid gap-5 pb-6 aura-poster-grid"
                   style={{ gridTemplateColumns: "repeat(auto-fill, minmax(180px, 1fr))" }}
                 >
                   {displayedIds.map((id) => {
@@ -554,7 +549,7 @@ function QueueCard({
       ref={setNodeRef}
       style={style}
       {...(bare ? {} : hover)}
-      className="group relative flex flex-col gap-2 card-contain"
+      className="aura-poster-card group relative flex flex-col gap-2 card-contain"
       data-meta-card={`${meta.media_type}:${meta.id}`}
     >
       <button
@@ -575,7 +570,7 @@ function QueueCard({
                    ${reorderable ? "cursor-grab active:cursor-grabbing" : bare ? "cursor-default" : "cursor-pointer"}`}
       >
         <div
-          className="relative overflow-hidden rounded-xl bg-white/5 border border-white/8"
+          className="relative overflow-hidden rounded-xl bg-white/5"
           style={{ aspectRatio: "2 / 3" }}
         >
           {meta.poster ? (
@@ -594,11 +589,13 @@ function QueueCard({
           <WatchedBadge
             metaId={meta.id}
             mediaType={meta.media_type}
-            className="absolute top-1.5 left-1.5"
+            material="frost"
+            className="absolute top-2 left-2 z-10"
           />
+          <span aria-hidden className="aura-card-bezel" data-glass-light="rim" />
         </div>
         <div className="px-0.5">
-          <p className="text-white/85 text-sm font-medium leading-tight line-clamp-2 text-center">
+          <p className="aura-poster-title text-white/85 text-sm font-medium leading-tight line-clamp-2 text-center">
             {meta.name}
           </p>
           <div className="flex items-center justify-center gap-1.5 mt-1">
@@ -609,7 +606,7 @@ function QueueCard({
                 start), which the user already removed from the
                 Library grid; mirror that here so the two surfaces
                 stay visually consistent. */}
-            <span className="text-white/40 text-[10px] uppercase tracking-wider">
+            <span className="text-white/55 text-[10px] uppercase tracking-wider">
               {typeLabel(meta.media_type ?? "other")}
             </span>
           </div>
@@ -627,13 +624,11 @@ function QueueCard({
           setManualWatchedState(meta.id, null);
           showAppToast(`Removed from Queue · ${meta.name}`);
         }}
-        className="absolute top-2 right-2 w-7 h-7 rounded-full
-                   bg-black/70 border border-white/20
-                   text-white/85 hover:text-white hover:bg-rose-500/40
-                   hover:border-rose-300/50
+        data-glass-light="rim"
+        className="aura-frost aura-frost-btn is-remove absolute top-2 right-2 w-7 h-7 rounded-full
+                   text-white/85 hover:text-rose-200
                    flex items-center justify-center
-                   opacity-0 group-hover:opacity-100 focus:opacity-100
-                   transition-all duration-150 z-10"
+                   opacity-0 group-hover:opacity-100 focus:opacity-100 z-30"
       >
         <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
           <path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" />

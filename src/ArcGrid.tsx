@@ -147,9 +147,10 @@ function ArcCard({
           ? `${kind.name} · ${kind.filler} of ${kind.total} filler`
           : kind.name
       }
+      // The card bezel (a rim-only cursor-light surface, last child) is the
+      // edge, not a border: no accent border on hover (round 11).
       className="group relative block w-full text-left overflow-hidden rounded-xl
-                 bg-white/5 border border-white/10 hover:border-ln-accent/40
-                 transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-ln-accent/60"
+                 bg-white/5 focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-white/60"
       style={{ aspectRatio: TILE_ASPECT }}
     >
       {art ? (
@@ -178,10 +179,12 @@ function ArcCard({
 
       {/* Episode-number range, top-left, in the CW badge's mono style: the arc's
           answer to "which episodes IS this?". */}
+      {/* Frost look, FAUX in the grid (glass-detail.css `.aura-arc-grid`): one
+          per card in a scroller, and in the player there is no backdrop. */}
       {range && (
         <span
-          className="absolute top-2 left-2 px-2 py-1 rounded
-                     bg-black/75 backdrop-blur-sm border border-white/15
+          data-glass-light="rim"
+          className="aura-frost absolute top-2 left-2 px-2 py-1 rounded-[7px]
                      text-white/90 text-[12px] font-mono font-semibold tracking-wider tabular-nums"
         >
           {range}
@@ -197,8 +200,9 @@ function ArcCard({
           &#10003;
         </span>
       ) : watched > 0 ? (
-        <span className="absolute top-2 right-2 px-2 py-1 rounded-full bg-black/75 backdrop-blur-sm
-                         border border-white/15 text-emerald-300 text-[11px] font-semibold tabular-nums">
+        <span data-glass-light="rim"
+              className="aura-frost absolute top-2 right-2 px-2 py-1 rounded-full
+                         text-emerald-300 text-[11px] font-semibold tabular-nums">
           {watched}/{total}
         </span>
       ) : null}
@@ -306,6 +310,7 @@ function ArcCard({
           />
         </div>
       )}
+      <span aria-hidden data-glass-light="rim" className="aura-card-bezel" />
     </button>
   );
 }
@@ -337,7 +342,10 @@ function GroupingSelect({
       // `max-w-full` keeps every tab on screen, growing to a second line instead.
       // `justify-center` so a wrapped last line (e.g. a lone "Season, Arc & Saga
       // Combos") sits centred rather than stranded left with dead space beside it.
-      className="flex flex-wrap items-center justify-center gap-1 p-1 rounded-xl bg-black/30 border border-white/10 max-w-full"
+      // The established selectable chip (`.aura-glass-flat.aura-filter-chip`,
+      // aria-pressed), not a hand-rolled segmented wrap: a wrapping group
+      // cannot be a SegmentedControl (round 11).
+      className="flex flex-wrap items-center justify-center gap-1.5 max-w-full"
     >
       {ordered.map((g) => {
         const on = g.id === active;
@@ -348,17 +356,15 @@ function GroupingSelect({
               onClick={() => onChange(g.id)}
               aria-pressed={on}
               className={[
-                "flex items-center gap-2 px-3 h-8 rounded-lg text-[12px] font-semibold transition-colors",
-                on
-                  ? "bg-ln-accent/20 text-ln-accent ring-1 ring-inset ring-ln-accent/40"
-                  : "text-white/55 hover:text-white/90 hover:bg-white/6",
+                "aura-glass-flat aura-filter-chip flex items-center gap-2 px-3 h-8 rounded-[10px] text-[12px] font-semibold",
+                on ? "" : "text-white/55 hover:text-white/90",
               ].join(" ")}
             >
               <span className="truncate max-w-[11rem]">{groupingDisplayName(g.name)}</span>
               <span
                 className={[
                   "px-1.5 py-px rounded-full text-[10px] font-mono tabular-nums",
-                  on ? "bg-ln-accent/25 text-ln-accent" : "bg-white/10 text-white/50",
+                  on ? "bg-white/10" : "bg-white/10 text-white/60",
                 ].join(" ")}
               >
                 {g.arc_count}
@@ -387,7 +393,7 @@ export function ArcGridSkeleton({ count }: { count?: number }) {
       {Array.from({ length: n }, (_, i) => (
         <div
           key={i}
-          className="rounded-xl bg-white/8 border border-white/8 animate-pulse"
+          className="rounded-xl bg-white/8 animate-pulse"
           style={{ aspectRatio: TILE_ASPECT }}
         />
       ))}
@@ -459,11 +465,20 @@ export default function ArcGrid({
     const tile = arcId
       ? root.querySelector<HTMLElement>(`[data-arc-id="${CSS.escape(arcId)}"]`)
       : null;
-    scroller.scrollTop = tile ? tile.offsetTop - scroller.offsetTop : 0;
+    // From the rects: the same offset the old offsetTop difference gave, and
+    // still right when the scroller is the tile's offsetParent (the player
+    // drawer's list is `relative` for its hover droplet). Rects include
+    // ancestor transforms (the detail page opens under a scale), so the delta
+    // is scaled back by offsetHeight / rect height.
+    const sr = scroller.getBoundingClientRect();
+    const k = sr.height > 0 ? scroller.offsetHeight / sr.height : 1;
+    scroller.scrollTop = tile
+      ? (tile.getBoundingClientRect().top - sr.top) * k + scroller.scrollTop
+      : 0;
   }, [loading, result.grouping_id, arcs, videos, absoluteById, libraryById]);
 
   return (
-    <div ref={rootRef} className="flex flex-col gap-3">
+    <div ref={rootRef} className="aura-arc-grid flex flex-col gap-3">
       <div className="flex items-center justify-between gap-3 flex-wrap">
         <GroupingSelect
           groupings={result.groupings}
@@ -474,7 +489,7 @@ export default function ArcGrid({
             when a show has only one grouping, and a lone child in a
             `justify-between` row sits at flex-START, so the count jumped to the
             left edge on exactly the commonest case. */}
-        <span className="ml-auto text-[12px] text-white/40 font-medium tabular-nums">
+        <span className="ml-auto text-[12px] text-white/60 font-medium tabular-nums">
           {loading
             ? "Loading arcs…"
             : `${arcs.length} ${arcs.length === 1 ? "arc" : "arcs"}`}
@@ -508,7 +523,7 @@ export default function ArcGrid({
         </div>
       )}
 
-      <div className="pt-1 text-[10px] text-white/25 leading-relaxed">
+      <div className="pt-1 text-[10px] text-white/50 leading-relaxed">
         Arc data from TMDB. This product uses the TMDB API but is not endorsed or certified by TMDB.
         {usesFandomArt && " Arc artwork from Fandom, licensed CC BY-SA."}
       </div>

@@ -182,6 +182,12 @@ export default function Tooltip({ text, content, pos = "right", shortcut, delay 
     left: 0, top: 0, ready: false,
   });
   const showTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // An open tip re-measures on every parent render (`content` is usually a
+  // fresh node) and on every scroll event. Keep the old state when the spot
+  // did not move, so a re-measure does not cost a second render.
+  const placeAt = (left: number, top: number) => {
+    setCoords((c) => (c.ready && c.left === left && c.top === top ? c : { left, top, ready: true }));
+  };
 
   const cancelShow = () => {
     if (showTimer.current) { clearTimeout(showTimer.current); showTimer.current = null; }
@@ -224,7 +230,7 @@ export default function Tooltip({ text, content, pos = "right", shortcut, delay 
     const r = tip.getBoundingClientRect();
     const a = trigger.getBoundingClientRect();
     const { left, top } = computePos(pos, a, r.width, r.height);
-    setCoords({ left, top, ready: true });
+    placeAt(left, top);
   }, [open, dismissed, pos, text, content, shortcut]);
 
   // Keep position correct on resize / scroll while open.
@@ -237,7 +243,7 @@ export default function Tooltip({ text, content, pos = "right", shortcut, delay 
       const r = tip.getBoundingClientRect();
       const a = trigger.getBoundingClientRect();
       const { left, top } = computePos(pos, a, r.width, r.height);
-      setCoords({ left, top, ready: true });
+      placeAt(left, top);
     };
     window.addEventListener("resize", reposition);
     window.addEventListener("scroll", reposition, true);
@@ -268,8 +274,9 @@ export default function Tooltip({ text, content, pos = "right", shortcut, delay 
           // aura-float-glass, not glass-panel-elevated: that composites
           // --ln-glass-3, which is TINTED per theme, so a tooltip over key art
           // picked up an accent-coloured wash. This is the same surface the
-          // search bar and the menus use.
-          className="aura-float-glass fixed z-[10700] pointer-events-none whitespace-nowrap
+          // search bar and the menus use. aura-glass-tip keeps it on the cheap
+          // tier in Liquid: the dense menu material, never refracted.
+          className="aura-float-glass aura-glass-tip fixed z-[10700] pointer-events-none whitespace-nowrap
                      px-2.5 py-1.5 rounded-lg
                      text-[11px] font-medium tracking-wide
                      transition-opacity duration-150"

@@ -4,8 +4,14 @@
 import { useState, useEffect, useRef, useCallback, memo } from "react";
 import type { MetaPreview } from "./types";
 import ImageLoader from "./ImageLoader";
-import { shrinkPoster, screenWidthHint } from "./posterSize";
+import { shrinkPoster, screenWidthHint, sizedLogo } from "./posterSize";
 import { useWindowHidden } from "./windowVisibility";
+import HeroBleed, { BLEED_STRENGTH } from "./HeroBleed";
+import {
+  heroPalette, peekHeroPalette, underglowImage, UNDERGLOW_PAD,
+  type HeroPalette, type RGB,
+} from "./heroAmbient";
+import { releaseSvgImage } from "./glassGlint";
 
 // ---------------------------------------------------------------------------
 // HeroCarousel
@@ -25,11 +31,21 @@ import { useWindowHidden } from "./windowVisibility";
 //     hero when an unrelated parent state changes.
 //   • Uses gpu-layer + cv-auto-hero for compositor isolation.
 //
-// Auto-advances every 8 seconds; pauses while the cursor is over the hero.
+// Auto-advances every AUTO_ADVANCE_MS; holds while the cursor is over the
+// hero, the window is hidden, or Home is not seen (`paused`: a Detail page
+// over it, or playback). The first slide mounts at full opacity with no
+// cross-fade (only a later index change fades), and HomeView hands over a
+// settled list (heroSource.ts), so loading never steps through slides.
 // ---------------------------------------------------------------------------
 
 interface Props {
   items: MetaPreview[];
+  /** The source's identity (HomeView keys the carousel on it too): the
+   *  slide shown is remembered per source, so coming back to Home shows
+   *  the slide it was on instead of restarting at the first. */
+  sourceKey?: string;
+  /** Hold the auto-advance (Home mounted but covered). */
+  paused?: boolean;
   /** Click on the active hero card → open the detail view. */
   onSelect?: (meta: MetaPreview) => void;
   /** Catalog the hero items were pulled from (e.g. "Trending Movies").
@@ -95,7 +111,18 @@ const ChevronRight = () => (
   </svg>
 );
 
-function HeroCarouselInner({ items, onSelect, sourceLabel }: Props) {
+/** The slide last shown, by source (one entry): HomeView unmounts when
+ *  another view opens, and a return lands back on this slide. */
+let lastSlide: { source: string; id: string } | null = null;
+
+function initialSlide(items: MetaPreview[], source: string | undefined): number {
+  if (!source || !lastSlide || lastSlide.source !== source) return 0;
+  const id = lastSlide.id;
+  const i = items.findIndex((it) => it.id === id);
+  return i >= 0 ? i : 0;
+}
+
+function HeroCarouselInner({ items, onSelect, sourceLabel, sourceKey, paused }: Props) {
   // Per-item "logo image failed to load" set. Falls back to the
   // text-title rendering path for that item, sidestepping the
   // broken-image glyph the browser would otherwise paint next to the
@@ -110,13 +137,16 @@ function HeroCarouselInner({ items, onSelect, sourceLabel }: Props) {
       return next;
     });
   };
-  const [rawIndex, setIndex] = useState(0);
+  // The first slide (the remembered one on a return) is the initial state, so
+  // the first commit already shows it: prevIndexRef starts on it below and no
+  // cross-fade runs for it.
+  const [rawIndex, setIndex] = useState(() => initialSlide(items, sourceKey));
   // Clamped at READ time. The effect below resets the state when the list
   // shrinks, but it runs after the render that sees the shorter list, and that
   // render reads items[index] for the current slide: an out-of-range index
-  // there is a crash, not a flash. Home's default hero can shrink under a
-  // mounted carousel (its source row is the first row with items, which can
-  // change as rows load), so every read goes through this value instead.
+  // there is a crash, not a flash. The list can still change under a mounted
+  // carousel (a pinned catalog refetched with other titles), so every read
+  // goes through this value instead.
   const index = rawIndex < items.length ? rawIndex : 0;
   const [hovered, setHovered] = useState(false);
   /** Item ids where we've detected a dual-layer fallback (low-res or
@@ -152,15 +182,23 @@ function HeroCarouselInner({ items, onSelect, sourceLabel }: Props) {
     if (rawIndex >= items.length) setIndex(0);
   }, [items.length, rawIndex]);
 
-  // Auto-advance (paused while the window is hidden / minimized).
+  // Auto-advance: only while Home is seen (not `paused` under a Detail page
+  // or playback, not hovered, the window not hidden / minimized). Each of
+  // those restarts the full interval when it ends.
   const hidden = useWindowHidden();
   useEffect(() => {
-    if (items.length <= 1 || hovered || hidden) return;
+    if (items.length <= 1 || hovered || hidden || paused) return;
     timer.current = setInterval(() => {
       setIndex((i) => (i + 1) % items.length);
     }, AUTO_ADVANCE_MS);
     return () => { if (timer.current) clearInterval(timer.current); };
-  }, [items.length, hovered, hidden]);
+  }, [items.length, hovered, hidden, paused]);
+
+  // Remember the slide shown for a return to Home.
+  const shownId = items.length > 0 ? items[index].id : null;
+  useEffect(() => {
+    if (sourceKey && shownId) lastSlide = { source: sourceKey, id: shownId };
+  }, [sourceKey, shownId]);
 
   const goTo = useCallback((i: number) => {
     if (items.length === 0) return;
@@ -169,6 +207,59 @@ function HeroCarouselInner({ items, onSelect, sourceLabel }: Props) {
 
   const next = useCallback(() => goTo(index + 1), [index, goTo]);
   const prev = useCallback(() => goTo(index - 1), [index, goTo]);
+
+  // ---- ambient light (round 9): palette, underglow, bleed ------------------
+  // The current slide's art, exactly as the backdrop loads it (the proxy url,
+  // so its colours can be read back; heroAmbient.ts).
+  const currentItem = items.length > 0 ? items[index] : null;
+  // ONE width hint per render, handed to the memoized backdrops as a prop:
+  // read inside them, a display / scale change reached the palette url on
+  // the next carousel render but not the shown art, so the two drifted apart.
+  const widthHint = screenWidthHint();
+  const artUrl = currentItem ? (shrinkPoster(pickHeroArt(currentItem).src, widthHint) ?? null) : null;
+  const [palette, setPalette] = useState<HeroPalette | null>(() => peekHeroPalette(artUrl));
+  useEffect(() => {
+    let live = true;
+    const hit = peekHeroPalette(artUrl);
+    if (hit) { setPalette(hit); return; }
+    // The old palette stays only while the read is pending; an unreadable
+    // slide clears it (no bleed, a neutral shadow, never the last slide's).
+    heroPalette(artUrl).then((p) => { if (live) setPalette(p ?? null); });
+    return () => { live = false; };
+  }, [artUrl]);
+
+  // The neighbours' palettes and logos are read AHEAD (2026-11-24; the user:
+  // on Avengers: Endgame the colour bleed "seems to be pausing to wait for
+  // the logo to load before applying"). The palette was read only once a
+  // slide was current, from the art fetched again then, so a slide whose
+  // art was slow to arrive kept the last slide's bleed until it did (the
+  // video: the old bleed held about 0.5 s after the slide changed, released
+  // with the art and the logo, which was likewise fetched only then). Both
+  // neighbours, so auto-advance, Next and Previous all find them ready; the
+  // palette cache is bounded (heroAmbient.ts, 32), and the two logo images
+  // here are replaced on every change.
+  const logoWarm = useRef<HTMLImageElement[]>([]);
+  useEffect(() => {
+    const n = items.length;
+    if (n < 2) return;
+    const near = [...new Set([(index + 1) % n, (index - 1 + n) % n])].filter((i) => i !== index);
+    const imgs: HTMLImageElement[] = [];
+    for (const i of near) {
+      const it = items[i];
+      const art = shrinkPoster(pickHeroArt(it).src, screenWidthHint());
+      if (art) void heroPalette(art);
+      if (it.logo && !logoFailed.has(it.id)) {
+        const img = new Image();
+        img.decoding = "async";
+        img.src = sizedLogo(it.logo) ?? it.logo;
+        imgs.push(img);
+      }
+    }
+    logoWarm.current = imgs;
+  }, [index, items]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const heroRef = useRef<HTMLDivElement>(null);
+  const underglow = useUnderglow(heroRef, palette);
 
   if (items.length === 0) return null;
 
@@ -191,16 +282,32 @@ function HeroCarouselInner({ items, onSelect, sourceLabel }: Props) {
   if (outgoing != null && outgoing < n && outgoing !== index) windowed.add(outgoing);
 
   return (
+    // The wrapper carries the width (so the underglow can sit outside the
+    // hero's clip); the hero box inside keeps the same size as before.
+    <div className="relative mx-auto w-full" style={{ maxWidth: HERO_MAX_WIDTH }}>
+    {underglow.layers.map((l) => (
+      <div
+        key={l.key}
+        aria-hidden
+        className={`aura-hero-underglow${l.out ? " is-out" : ""}`}
+        style={{
+          left: -underglow.room.left, right: -underglow.room.right,
+          top: -underglow.room.top, bottom: -underglow.room.bottom,
+          backgroundImage: l.url,
+        }}
+      />
+    ))}
+    <HeroBleed palette={palette} heroRef={heroRef} />
     <div
-      className="relative mx-auto w-full overflow-hidden rounded-xl
-                 border border-white/[0.09] border-t-white/[0.16]
-                 group gpu-layer cv-auto-hero cursor-pointer"
+      ref={heroRef}
+      className="relative mx-auto w-full overflow-hidden rounded-[18px]
+                 aura-hero-box group gpu-layer cv-auto-hero cursor-pointer"
       style={{
         // 21:9 box (cinematic). Landscape art is object-cover and crops
-        // slightly to fill the wider box. A crisp 1px border (brighter along
-        // the top edge for a lit-from-above feel) now frames the hero —
-        // replacing the old alpha-fade edge mask that left the edges
-        // undefined — matching the streams/episodes panel treatment.
+        // slightly to fill the wider box. 18 px corners and a cursor-lit
+        // bezel (round 9, .aura-hero-bezel below) frame it; the old 1px
+        // white border is gone. .aura-hero-box (glass-hero.css) clips the
+        // whole group once, so its corners have no dark ring (round 19).
         aspectRatio: "21 / 9",
         maxHeight: HERO_MAX_HEIGHT,
         maxWidth: HERO_MAX_WIDTH,
@@ -233,7 +340,8 @@ function HeroCarouselInner({ items, onSelect, sourceLabel }: Props) {
             key={item.id}
             item={item}
             active={i === index}
-            onDualLayer={() => reportDualLayer(item.id)}
+            widthHint={widthHint}
+            onDualLayer={reportDualLayer}
           />
         ) : null
       ))}
@@ -314,7 +422,7 @@ function HeroCarouselInner({ items, onSelect, sourceLabel }: Props) {
             {current.logo && !logoFailed.has(current.id) ? (
               <div className="flex items-end gap-4 mb-3 flex-wrap">
                 <img
-                  src={current.logo}
+                  src={sizedLogo(current.logo) ?? undefined}
                   alt=""
                   draggable={false}
                   className="max-h-24 object-contain object-left"
@@ -377,26 +485,28 @@ function HeroCarouselInner({ items, onSelect, sourceLabel }: Props) {
       </div>
 
       {/* Hover-only arrows. Clicks must stopPropagation so the wrapper's
-          onClick (which routes to detail view) doesn't intercept them. */}
+          onClick (which routes to detail view) doesn't intercept them.
+          Floating glass controls (App.css GLASS SYSTEM); their opacity fade
+          is in glass-misc.css (.aura-hero-arrow), beside the press motion. */}
       {items.length > 1 && (
         <>
           <button
             onClick={(e) => { e.stopPropagation(); prev(); }}
             aria-label="Previous"
-            className="absolute left-4 top-1/2 -translate-y-1/2 w-11 h-11 rounded-full
-                       glass-panel-elevated flex items-center justify-center
-                       text-white/80 hover:text-white
-                       opacity-0 group-hover:opacity-100 transition-opacity duration-300"
+            className="aura-float-glass aura-glass-control aura-glass-press aura-hero-arrow
+                       absolute left-4 top-1/2 -translate-y-1/2 w-11 h-11 rounded-full
+                       flex items-center justify-center text-white/80 hover:text-white
+                       opacity-0 group-hover:opacity-100"
           >
             <ChevronLeft />
           </button>
           <button
             onClick={(e) => { e.stopPropagation(); next(); }}
             aria-label="Next"
-            className="absolute right-4 top-1/2 -translate-y-1/2 w-11 h-11 rounded-full
-                       glass-panel-elevated flex items-center justify-center
-                       text-white/80 hover:text-white
-                       opacity-0 group-hover:opacity-100 transition-opacity duration-300"
+            className="aura-float-glass aura-glass-control aura-glass-press aura-hero-arrow
+                       absolute right-4 top-1/2 -translate-y-1/2 w-11 h-11 rounded-full
+                       flex items-center justify-center text-white/80 hover:text-white
+                       opacity-0 group-hover:opacity-100"
           >
             <ChevronRight />
           </button>
@@ -418,6 +528,10 @@ function HeroCarouselInner({ items, onSelect, sourceLabel }: Props) {
           </div>
         </>
       )}
+
+      {/* The bezel: the rim light ring over the art (glass-hero.css). */}
+      <span aria-hidden data-glass-light="rim" className="aura-hero-bezel" />
+    </div>
     </div>
   );
 }
@@ -432,17 +546,24 @@ export default HeroCarousel;
 // sharp poster card overlay anchored on the left.
 // ---------------------------------------------------------------------------
 
-function HeroBackdrop({
-  item, active, onDualLayer,
+// memo(), with the stable `reportDualLayer` (it takes the id): a hover in or
+// out, a palette landing, an underglow layer swap or the fade's end re-render
+// the carousel, and each of the three or four mounted backdrops (and their
+// ImageLoaders) re-rendered with it for nothing, re-running both dual-layer
+// effects on a fresh inline callback every time.
+const HeroBackdrop = memo(function HeroBackdrop({
+  item, active, widthHint, onDualLayer,
 }: {
   item: MetaPreview;
   active: boolean;
-  onDualLayer: () => void;
+  /** screenWidthHint() as the carousel read it (the same value its palette url uses). */
+  widthHint: number;
+  onDualLayer: (id: string) => void;
 }) {
   const { src, isPortraitFallback } = pickHeroArt(item);
   // Full-bleed backdrop: resize to the display's physical width (never upscaled,
   // so a low-res source stays low-res and the detection below still fires).
-  const proxiedSrc = shrinkPoster(src, screenWidthHint());
+  const proxiedSrc = shrinkPoster(src, widthHint);
   const [lowRes, setLowRes] = useState(false);
 
   // Reset measurement when src changes
@@ -451,13 +572,13 @@ function HeroBackdrop({
   // If we already know we're falling back to a portrait poster, signal up
   // immediately so the parent slides the title card before the image arrives.
   useEffect(() => {
-    if (isPortraitFallback) onDualLayer();
-  }, [isPortraitFallback, onDualLayer]);
+    if (isPortraitFallback) onDualLayer(item.id);
+  }, [isPortraitFallback, onDualLayer, item.id]);
 
   // When the heuristic detection escalates to lowRes after onLoad, signal up
   useEffect(() => {
-    if (lowRes) onDualLayer();
-  }, [lowRes, onDualLayer]);
+    if (lowRes) onDualLayer(item.id);
+  }, [lowRes, onDualLayer, item.id]);
 
   const usePortraitInset = isPortraitFallback || lowRes;
 
@@ -564,4 +685,84 @@ function HeroBackdrop({
       />
     </div>
   );
+});
+
+// ---------------------------------------------------------------------------
+// useUnderglow: the hero's art-tinted underglow (round 9). A contact shadow
+// (the art's raw middle at 22%, alpha 0.55, sigma 26) and a coloured halo
+// (the vivid centre, alpha min(0.3, bleed x 1.4), sigma 62) behind the hero,
+// as ONE dithered image (heroAmbient.ts underglowImage) per hero size and
+// slide, crossfading between two layers on a change. It reaches
+// UNDERGLOW_PAD past each edge, less where the page scroller's clip box is
+// closer (it fades to 0 there instead of being cut). No palette: a neutral
+// contact shadow only.
+// ---------------------------------------------------------------------------
+
+interface UnderglowLayer { key: number; url: string; out: boolean }
+interface Room { left: number; right: number; top: number; bottom: number }
+const NO_ROOM: Room = { left: 0, right: 0, top: 0, bottom: 0 };
+
+function useUnderglow(heroRef: React.RefObject<HTMLDivElement | null>, palette: HeroPalette | null) {
+  const [geo, setGeo] = useState<{ w: number; h: number; room: Room } | null>(null);
+  const [layers, setLayers] = useState<UnderglowLayer[]>([]);
+  const seq = useRef(0);
+  const urlsRef = useRef(new Map<number, string>());
+
+  // Size and room, re-measured when the hero resizes (debounced, 4 px steps).
+  useEffect(() => {
+    const hero = heroRef.current;
+    if (!hero) return;
+    let t: ReturnType<typeof setTimeout> | undefined;
+    const measure = () => {
+      const r = hero.getBoundingClientRect();
+      if (r.width < 8 || r.height < 8) return;
+      const sc = hero.closest<HTMLElement>(".aura-page-scroller");
+      const st = sc?.scrollTop ?? 0;
+      const c = sc?.getBoundingClientRect();
+      const pad = UNDERGLOW_PAD;
+      const room: Room = {
+        left: Math.round(Math.max(0, Math.min(pad, c ? r.left - c.left : pad))),
+        right: Math.round(Math.max(0, Math.min(pad, c ? c.right - r.right - 8 : pad))),
+        top: Math.round(Math.max(0, Math.min(pad, c ? r.top + st - c.top : pad))),
+        bottom: pad,
+      };
+      const w = Math.round(r.width / 4) * 4, h = Math.round(r.height / 4) * 4;
+      setGeo((g) => (g && g.w === w && g.h === h && g.room.left === room.left && g.room.right === room.right
+        && g.room.top === room.top ? g : { w, h, room }));
+    };
+    measure();
+    const ro = new ResizeObserver(() => {
+      if (t) clearTimeout(t);
+      t = setTimeout(measure, 150);
+    });
+    ro.observe(hero);
+    return () => { if (t) clearTimeout(t); ro.disconnect(); };
+  }, [heroRef]);
+
+  useEffect(() => {
+    if (!geo) return;
+    const shadow: RGB = palette ? palette.raw.map((v) => Math.round(v * 0.22)) as RGB : [0, 0, 0];
+    const halo: RGB = palette ? palette.center : [0, 0, 0];
+    const url = underglowImage({
+      w: geo.w, h: geo.h, ...geo.room, shadow, halo,
+      aS: 0.55, aH: palette ? Math.min(0.3, BLEED_STRENGTH * 1.4) : 0,
+    });
+    const key = ++seq.current;
+    // The new layer fades in on mount (a CSS animation, no state flip), the
+    // one in front of it fades out, and is dropped once the fade is done.
+    urlsRef.current.set(key, url);
+    setLayers((ls) => [...ls.filter((l) => !l.out).slice(-1).map((l) => ({ ...l, out: true })), { key, url, out: false }]);
+    const drop = setTimeout(() => {
+      setLayers((ls) => ls.filter((l) => l.key === key));
+      // Images no layer shows any more (blob urls) are released.
+      for (const [k, u] of urlsRef.current) if (k !== key) { releaseSvgImage(u); urlsRef.current.delete(k); }
+    }, 1000);
+    return () => clearTimeout(drop);
+  }, [geo, palette]);
+  useEffect(() => () => {
+    for (const u of urlsRef.current.values()) releaseSvgImage(u);
+    urlsRef.current.clear();
+  }, []);
+
+  return { layers, room: geo?.room ?? NO_ROOM };
 }

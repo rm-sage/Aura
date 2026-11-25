@@ -22,6 +22,9 @@
 
 const QUIET_MS = 160;
 const INPUT_RECENT_MS = 300;
+/** The paused hover look is for cards a scroll carries under the pointer. The card already
+ *  under it when the scroll starts is marked `data-hover-held` and keeps its look (App.css). */
+const HOVER_HELD_SELECTOR = ".card-grow:hover";
 
 export function installScrollPause(): () => void {
   const root = document.documentElement;
@@ -29,6 +32,12 @@ export function installScrollPause(): () => void {
   let lastScroll = 0;
   let lastInput = -Infinity;
   let pointerHeld = false;
+  let held: Element[] = [];
+
+  const release = () => {
+    for (const el of held) el.removeAttribute("data-hover-held");
+    held = [];
+  };
 
   // One timer per gesture rather than one per scroll event: this runs every frame.
   const settle = () => {
@@ -38,12 +47,16 @@ export function installScrollPause(): () => void {
       return;
     }
     timer = null;
+    release();
     root.removeAttribute("data-aura-scrolling");
   };
   const onScroll = () => {
     lastScroll = performance.now();
     if (timer !== null) return;
     if (!pointerHeld && lastScroll - lastInput > INPUT_RECENT_MS) return;
+    // Marked in the same task as the flag, so the one style pass sees both.
+    held = Array.from(document.querySelectorAll(HOVER_HELD_SELECTOR));
+    for (const el of held) el.setAttribute("data-hover-held", "");
     root.setAttribute("data-aura-scrolling", "");
     timer = window.setTimeout(settle, QUIET_MS);
   };
@@ -67,6 +80,7 @@ export function installScrollPause(): () => void {
     window.removeEventListener("pointerup", onPointerUp, opts);
     window.removeEventListener("pointercancel", onPointerUp, opts);
     if (timer !== null) window.clearTimeout(timer);
+    release();
     root.removeAttribute("data-aura-scrolling");
   };
 }

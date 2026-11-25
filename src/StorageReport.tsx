@@ -110,7 +110,7 @@ const LOCAL_STORAGE_CATALOGUE: { prefix: string; label: string; description: str
   {
     prefix:      "aura:ratings-cache:v1",
     label:       "Ratings cache",
-    description: "Aggregated ratings (MDBList: IMDb / Rotten Tomatoes / Metacritic / TMDB / Trakt / Letterboxd, plus MAL + AniList for anime). 7-day TTL; scores rarely change. Re-fetches on next detail open after expiry. Safe to clear.",
+    description: "Aggregated ratings (MDBList: IMDb / Rotten Tomatoes / Metacritic / TMDB / Letterboxd, plus MAL + AniList for anime). 7-day TTL; scores rarely change. Re-fetches on next detail open after expiry. Safe to clear.",
     destructive: false,
   },
   {
@@ -158,13 +158,13 @@ const LOCAL_STORAGE_CATALOGUE: { prefix: string; label: string; description: str
   {
     prefix:      "aura:scrobble-ineligible:",
     label:       "Refused-scrobble record",
-    description: "History items Trakt, AniList or Simkl has definitively refused (no catalog match for the episode under this numbering, or an unresolvable title), so bulk runs stop re-sending them and re-reporting the same failure. Expires after 30 days in case the catalog gains the entry. Clearing it just means those items get retried once more.",
+    description: "History items AniList or Simkl has definitively refused (no catalog match for the episode under this numbering, or an unresolvable title), so bulk runs stop re-sending them and re-reporting the same failure. Expires after 30 days in case the catalog gains the entry. Clearing it just means those items get retried once more.",
     destructive: false,
   },
   {
     prefix:      "aura:scrobbled:",
     label:       "Scrobbled-history record",
-    description: "Which History rows you have already pushed to Trakt / AniList / Simkl, so a bulk 'Scrobble All' can skip them instead of re-sending. Not the duplicate guard itself: Trakt ignores a repeat of the same watched_at, AniList won't move progress backwards and Simkl ignores a row it already has, so clearing this only costs a few redundant calls on the next bulk run. Safe to clear.",
+    description: "Which History rows you have already pushed to AniList / Simkl, so a bulk 'Scrobble All' can skip them instead of re-sending. Not the duplicate guard itself: AniList won't move progress backwards and Simkl ignores a row it already has, so clearing this only costs a few redundant calls on the next bulk run. Safe to clear.",
     destructive: false,
   },
 ];
@@ -420,8 +420,7 @@ export default function StorageReport() {
               <button
                 type="button"
                 onClick={() => setPendingClear({ kind: "images", target: "", label: "cached posters & images", destructive: false })}
-                className="text-[10px] px-2 py-1 rounded-md transition-colors
-                           text-white/60 hover:text-white hover:bg-white/8 border border-white/10"
+                className="aura-glass-item text-[10px] px-2 py-1 rounded-md text-white/70 hover:text-white"
               >
                 Reload
               </button>
@@ -488,21 +487,25 @@ function ClearConfirmModal({
   }, [onCancel]);
 
   const isImages = pending.kind === "images";
+  // Tone rides the glass hooks (aura-glass-tone-*, glass-settings.css), the
+  // Settings confirm's recipe: a ring-* utility on glass would be overridden.
   const accent = pending.destructive
-    ? { ring: "ring-rose-400/40", btn: "border-rose-300/60 bg-rose-500/30 text-rose-50 hover:bg-rose-500/45", icon: "text-rose-300" }
-    : { ring: "ring-amber-400/40", btn: "border-amber-300/60 bg-amber-500/30 text-amber-50 hover:bg-amber-500/45", icon: "text-amber-300" };
+    ? { ring: "aura-glass-tone-danger", btn: "is-danger is-strong", icon: "text-rose-300" }
+    : { ring: "aura-glass-tone-warning", btn: "is-warning is-strong", icon: "text-amber-300" };
 
   const node = (
     <div
-      className="fixed inset-0 z-[10000] flex items-center justify-center p-6 bg-black/60 backdrop-blur-sm"
+      className="fixed inset-0 z-[10000] flex items-center justify-center p-6"
       onClick={onCancel}
     >
+      {/* Dim + blur on a sibling layer: on the wrapper it would blind the
+          card's own glass (an ancestor backdrop-filter is a backdrop root). */}
+      <div aria-hidden className="aura-modal-backdrop-in absolute inset-0 bg-black/60 backdrop-blur-sm" />
       <div
         role="dialog"
         aria-modal="true"
         onClick={(e) => e.stopPropagation()}
-        className={`max-w-[400px] w-full rounded-2xl bg-zinc-900/95 border border-white/15 ${accent.ring}
-                    shadow-glass-edge ring-1 p-6 space-y-4`}
+        className={`aura-float-glass aura-modal-card-in relative max-w-[400px] w-full rounded-2xl ${accent.ring} p-6 space-y-4`}
       >
         <div className="flex items-start gap-3">
           <span className={`flex-shrink-0 mt-0.5 text-2xl leading-none ${accent.icon}`} aria-hidden>
@@ -514,7 +517,7 @@ function ClearConfirmModal({
             </h3>
             <p className="text-white/70 text-[13px] leading-relaxed">
               {pending.target === HISTORY_DISK_ID
-                ? "This erases your watch history on this device. If you are signed in, it also replaces the Aura Cloud copy with the empty list within seconds, and another signed-in device that still holds these rows can bring them back when it next syncs. Plays already scrobbled stay on Trakt, AniList and Simkl. A snapshot is taken first, so you can roll back from Settings > Backup & Restore."
+                ? "This erases your watch history on this device. If you are signed in, it also replaces the Aura Cloud copy with the empty list within seconds, and another signed-in device that still holds these rows can bring them back when it next syncs. Plays already scrobbled stay on AniList and Simkl. A snapshot is taken first, so you can roll back from Settings > Backup & Restore."
                 : pending.destructive
                 ? `This will permanently erase ${pending.kind === "local" ? `the ${pending.label.toLowerCase()} of every account` : `your ${pending.label.toLowerCase()}`} on this device. If you are signed in, Cloud Sync may restore some of it on the next pull, and Settings > Backup & Restore keeps local snapshots you can roll back to. Otherwise it is not recoverable.`
                 : isImages
@@ -528,8 +531,8 @@ function ClearConfirmModal({
           <button
             type="button"
             onClick={onCancel}
-            className="px-4 py-1.5 rounded-lg border border-white/15 bg-white/5
-                       text-white/80 text-[12px] font-medium hover:bg-white/10 transition-colors"
+            className="aura-glass-flat aura-glass-press px-4 py-1.5 rounded-lg
+                       text-white/80 text-[12px] font-medium"
           >
             Cancel
           </button>
@@ -537,7 +540,7 @@ function ClearConfirmModal({
             type="button"
             onClick={onConfirm}
             autoFocus
-            className={`px-4 py-1.5 rounded-lg border text-[12px] font-medium transition-colors ${accent.btn}`}
+            className={`aura-glass-flat aura-glass-press ${accent.btn} px-4 py-1.5 rounded-lg text-[12px] font-medium`}
           >
             {pending.destructive ? "Yes, wipe" : isImages ? "Reload" : "Clear"}
           </button>

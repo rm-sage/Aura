@@ -122,6 +122,20 @@ fn dep_for(name: &str) -> Option<&'static Dep> {
     DEPS.iter().find(|d| d.name == name)
 }
 
+/// One download lock per `DEPS` entry (same index). Two ensures of the same
+/// binary (skip detection's ffmpeg fetch plus a Settings > Runtime components
+/// click, or two quick trailer clicks) would otherwise share one `.part` file:
+/// the second `File::create` truncates it under the first writer and both
+/// fail their checksum. The second caller now waits, then finds the verified
+/// file and returns without touching the network. Bounded by shape.
+static DEP_LOCKS: [tokio::sync::Mutex<()>; DEPS.len()] =
+    [const { tokio::sync::Mutex::const_new(()) }; DEPS.len()];
+
+/// Stall bounds for the asset download. No whole-request timeout: the files
+/// are large (libmpv ~115 MB) and a slow but moving link must still finish.
+const DOWNLOAD_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+const DOWNLOAD_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Streamed hex SHA-256 so a 200 MB binary isn't slurped into memory.
 fn sha256_file(path: &Path) -> std::io::Result<String> {
     use std::io::Read;
@@ -156,9 +170,17 @@ pub async fn ensure_runtime_dep<R: Runtime>(
     app: AppHandle<R>,
     name: String,
 ) -> Result<String, String> {
-    let dep = dep_for(&name).ok_or_else(|| format!("unknown runtime dep: {name}"))?;
+    let idx = DEPS
+        .iter()
+        .position(|d| d.name == name)
+        .ok_or_else(|| format!("unknown runtime dep: {name}"))?;
+    let dep = &DEPS[idx];
     let dir = dir().ok_or_else(|| "runtime dir unavailable".to_string())?;
     let target = dir.join(dep.name);
+
+    // Held for the whole check + download + install, so a concurrent ensure of
+    // the same binary re-checks the target only after this one has finished.
+    let _download_guard = DEP_LOCKS[idx].lock().await;
 
     // Already present + correct → done (no network).
     if target.is_file() {
@@ -176,11 +198,29 @@ pub async fn ensure_runtime_dep<R: Runtime>(
     }
 
     crate::devlog!(info, "runtime", "downloading {} from {}", dep.name, dep.url);
-    let mut resp = reqwest::Client::new()
+    // A bare `Client::new()` had no timeouts, so a connection that stalled
+    // mid-body (sleep / resume, Wi-Fi handover) left `chunk()` pending forever:
+    // the engine gate froze at its percentage with no Retry, and every later
+    // ffmpeg ensure in the session waited on the same hung promise. The read
+    // timeout is per read, so it only fires when no bytes arrive for 60 s.
+    let client = reqwest::Client::builder()
+        .https_only(true)
+        .connect_timeout(DOWNLOAD_CONNECT_TIMEOUT)
+        .read_timeout(DOWNLOAD_READ_TIMEOUT)
+        .build()
+        .map_err(|e| format!("download {}: client: {e}", dep.name))?;
+    let stalled = |e: &reqwest::Error| e.is_timeout() || e.is_connect();
+    let mut resp = client
         .get(dep.url)
         .send()
         .await
-        .map_err(|e| format!("download {}: {e}", dep.name))?;
+        .map_err(|e| {
+            if stalled(&e) {
+                format!("download {} could not connect or stalled; check the connection and try again", dep.name)
+            } else {
+                format!("download {}: {e}", dep.name)
+            }
+        })?;
     if !resp.status().is_success() {
         return Err(format!("download {}: HTTP {}", dep.name, resp.status().as_u16()));
     }
@@ -198,7 +238,13 @@ pub async fn ensure_runtime_dep<R: Runtime>(
         while let Some(chunk) = resp
             .chunk()
             .await
-            .map_err(|e| format!("read {}: {e}", dep.name))?
+            .map_err(|e| {
+                if e.is_timeout() {
+                    format!("download {} stalled (no data for 60 s); try again", dep.name)
+                } else {
+                    format!("read {}: {e}", dep.name)
+                }
+            })?
         {
             file.write_all(&chunk).map_err(|e| format!("write {}: {e}", part.display()))?;
             downloaded += chunk.len() as u64;

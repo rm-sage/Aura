@@ -9,9 +9,11 @@
 // this panel only drives the room lifecycle + presence.
 // ---------------------------------------------------------------------------
 
-import { useEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useWatchTogether } from "./watchTogether/useWatchTogether";
+import { useGlassStyle } from "./glassStyle";
 import { readPartyAnchor, type PartyAnchor } from "./partyAnchor";
+import { usePopPresence } from "./popPresence";
 import {
   createRoom, createRoomWithCode, joinRoom, leaveRoom, transferLeader, setWatchConfig,
   openRoomVideo, clearPartyStream, getRelayUrl, getDisplayName, getAppToken,
@@ -24,6 +26,10 @@ import type { MemberStat } from "./watchTogether/types";
 interface Props {
   open: boolean;
   onClose: () => void;
+  /** A player is up: the panel floats over the mpv video, which the webview's
+   *  backdrop pass cannot sample, so it takes the player MATERIAL
+   *  (.aura-glass-player: baked base, no backdrop, no refraction). */
+  overPlayer?: boolean;
 }
 
 // Exit-animation duration — the card stays mounted this long after `open`
@@ -31,47 +37,79 @@ interface Props {
 // step with the `transform`/`opacity` transition below.
 const EXIT_MS = 200;
 
-export default function WatchTogetherPanel({ open, onClose }: Props) {
+/** Eat the click that follows a dismissing press on `scope`, in the window
+ *  capture phase so no React handler sees it, plus the rest of the same
+ *  multi-click (later clicks and the dblclick with `detail` 2 or more).
+ *  The press's own click is the FIRST trusted click after it, however long
+ *  the press is held: when that click lands outside `scope` (the press was
+ *  dragged off before release), or a new press comes with no click at all,
+ *  nothing is eaten and it ends, so a later deliberate click (reopening from
+ *  the rail row, pausing the video) always goes through. A new single click
+ *  (`detail` 1) ends it too. Self-removing (a 10 s cap bounds a lost
+ *  gesture): it outlives the panel's effect, which ends with the close. */
+function swallowNextClickIn(scope: Element) {
+  let started = false;
+  const eat = (e: MouseEvent) => {
+    if (!e.isTrusted) return;
+    const t = e.target as Node | null;
+    if (!t || !scope.contains(t) || (started && e.detail < 2)) { done(); return; }
+    started = true;
+    e.stopPropagation();
+    e.preventDefault();
+    clearTimeout(timer);
+    timer = setTimeout(done, 1000);
+  };
+  // Added during the dismissing pointerdown's own dispatch, so it first sees
+  // the NEXT press: before the click, that press means the first one made
+  // none; after it, it is the second press of a double-click.
+  const onDown = (e: PointerEvent) => { if (e.isTrusted && !started) done(); };
+  const done = () => {
+    window.removeEventListener("click", eat, true);
+    window.removeEventListener("dblclick", eat, true);
+    window.removeEventListener("pointerdown", onDown, true);
+    clearTimeout(timer);
+  };
+  let timer = setTimeout(done, 10_000);
+  window.addEventListener("click", eat, true);
+  window.addEventListener("dblclick", eat, true);
+  window.addEventListener("pointerdown", onDown, true);
+}
+
+// App passes a fresh inline `onClose` on every render, and App re-renders on
+// every playback-update tick. Handed straight through, it re-bound the open
+// panel's window capture listeners (Escape, outside press) on each tick and
+// re-rendered the whole panel. The wrapper passes a stable callback that calls
+// the latest prop, and the memoized body renders only when `open`,
+// `overPlayer` or the party store changes.
+export default function WatchTogetherPanel(props: Props) {
+  const latestClose = useRef(props.onClose);
+  useLayoutEffect(() => { latestClose.current = props.onClose; });
+  const onClose = useCallback(() => latestClose.current(), []);
+  return <WatchTogetherPanelBody open={props.open} overPlayer={props.overPlayer} onClose={onClose} />;
+}
+
+const WatchTogetherPanelBody = memo(function WatchTogetherPanelBody({ open, onClose, overPlayer = false }: Props) {
   const w = useWatchTogether();
+  const glass = useGlassStyle();
   const [relayUrl, setRelayUrl] = useState(getRelayUrl());
   const [name, setName] = useState(getDisplayName());
   const [token, setToken] = useState(getAppToken());
   const [joinCode, setJoinCode] = useState("");
   const [copied, setCopied] = useState(false);
   const [editingConfig, setEditingConfig] = useState(false);
-  // Mount + animation lifecycle. `render` keeps the card alive through the exit
-  // animation; `visible` drives the enter/exit transition; `anchor` pins the
-  // card next to whichever party button opened it (top-left PartyButton while
-  // browsing, top-right presence cluster during playback) so it grows out of
-  // that icon — same anchor the PartyToast stack spawns from.
-  const [render, setRender] = useState(open);
-  const [visible, setVisible] = useState(false);
+  // Mount + animation lifecycle (usePopPresence). `render` keeps the card alive
+  // through the exit animation; `visible` drives the enter/exit transition;
+  // `anchor` pins the card next to whichever party button opened it (top-left
+  // PartyButton while browsing, top-right presence cluster during playback) so
+  // it grows out of that icon, same anchor the PartyToast stack spawns from.
   const [anchor, setAnchor] = useState<PartyAnchor>({ side: "right", top: 70, right: 16 });
-
-  // Drive the spawn / despawn. On open: snapshot the anchor, mount, then flip
-  // `visible` on the next frame so the transition runs from the collapsed
-  // state. On close: flip `visible` off and unmount once the exit finishes.
-  useEffect(() => {
-    if (open) {
-      setAnchor(readPartyAnchor());
-      setRender(true);
-      // Capture BOTH rAF handles: if the panel is closed inside the ~16ms
-      // between the two frames, cancelling only the outer would leave the
-      // inner to fire setVisible(true) after the close already set it false
-      // — popping the card away with no exit animation.
-      let inner = 0;
-      const outer = requestAnimationFrame(() => {
-        inner = requestAnimationFrame(() => setVisible(true));
-      });
-      return () => {
-        cancelAnimationFrame(outer);
-        cancelAnimationFrame(inner);
-      };
-    }
-    setVisible(false);
-    const t = setTimeout(() => setRender(false), EXIT_MS);
-    return () => clearTimeout(t);
+  // Snapshot the anchor on open. A layout effect declared BEFORE the presence
+  // hook, so setAnchor batches with its mount into one sync render.
+  useLayoutEffect(() => {
+    if (open) setAnchor(readPartyAnchor());
   }, [open]);
+  const pop = usePopPresence<HTMLDivElement>(open, EXIT_MS);
+  const { render, visible } = pop;
 
   // Re-pin to the button if the window resizes while the panel is open.
   useEffect(() => {
@@ -100,6 +138,42 @@ export default function WatchTogetherPanel({ open, onClose }: Props) {
     return () => window.removeEventListener("keydown", onKey, true);
   }, [open, onClose]);
 
+  // Outside press closes, and the press still lands (2026-11-22, the user: the
+  // first click after opening "will always just close the panel instead of
+  // closing it and clicking on whatever was focused; hovering things doesn't
+  // work either"). This was a full-window click-catcher (fixed inset-0 under
+  // the card), which ate that click and every hover while the panel was up.
+  // Now a window CAPTURE press, as the Downloads panel: left button only,
+  // and not on the panel itself, a context menu raised over it, the
+  // Performance Monitor, the title bar (dragging the window keeps it open) or
+  // the hover card below. POINTERDOWN, not mousedown: a control that cancels
+  // its pointerdown (the player's seek bar) suppresses the mousedown, so a
+  // press there seeked and left the panel open; and a touch or pen tap closes
+  // at contact, before its click.
+  // Two presses close WITHOUT their click going through:
+  //  - a party trigger (`data-party-anchor`: the rail row, the player's party
+  //    pill, the party toasts): it only ever OPENS the panel, so its click would
+  //    reopen what the press just closed; eaten, the trigger toggles;
+  //  - the player's bare video (`data-player-click-layer`): that click pauses,
+  //    and the catcher existed so a dismissing click over playback would not.
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e: PointerEvent) => {
+      if (e.button !== 0) return;
+      const t = e.target as Element | null;
+      if (!t || !t.closest) return;
+      if (pop.ref.current?.contains(t)) return;
+      // The hover card the party's video row raises is part of the panel too
+      // (now reachable: the catcher used to cover it).
+      if (t.closest("[data-aura-context-menu], [data-perf-monitor], [data-aura-titlebar], [data-hover-panel]")) return;
+      const eat = t.closest("[data-party-anchor], [data-player-click-layer]");
+      if (eat) swallowNextClickIn(eat);
+      onClose();
+    };
+    window.addEventListener("pointerdown", onDown, true);
+    return () => window.removeEventListener("pointerdown", onDown, true);
+  }, [open, onClose, pop.ref]);
+
   // Keep the local fields in step if the panel re-opens.
   useEffect(() => {
     if (open) {
@@ -117,6 +191,17 @@ export default function WatchTogetherPanel({ open, onClose }: Props) {
   if (!render) return null;
 
   const reduced = document.documentElement.getAttribute("data-reduced-motion") === "true";
+  // Liquid grows the card out of its trigger like a droplet: squashed toward
+  // the button, then a springy overshoot that settles (the same curve as the
+  // glass pop morph). Frosted keeps the short slide and scale.
+  const liquid = glass === "liquid";
+  const hiddenTransform = reduced ? "none"
+    : liquid ? "translateY(-8px) scale(0.88, 0.66)" : "translateY(-8px) scale(0.96)";
+  const openTransition = reduced
+    ? "opacity 160ms ease"
+    : liquid
+      ? "opacity 200ms ease, transform var(--aura-spring-bouncy-dur) var(--aura-spring-bouncy)"
+      : "opacity 200ms ease, transform 240ms cubic-bezier(0.16, 1, 0.3, 1)";
   const horizontal = anchor.side === "left" ? { left: anchor.left } : { right: anchor.right };
   const transformOrigin = anchor.side === "left" ? "top left" : "top right";
 
@@ -136,40 +221,29 @@ export default function WatchTogetherPanel({ open, onClose }: Props) {
 
   return (
     <>
-      {/* Click-catcher. Sits above the player chrome (z below) so an outside
-          click during playback closes the panel instead of pausing the video. */}
       <div
-        className="fixed inset-0 z-[10040]"
-        onClick={onClose}
-        style={{
-          opacity: visible ? 1 : 0,
-          // opacity:0 still hit-tests — without this the catcher stays a
-          // full-screen click-trap through the 200ms exit, swallowing the
-          // next click (e.g. a play/pause toggle during playback). Only the
-          // active (visible) modal layer should capture.
-          pointerEvents: visible ? "auto" : "none",
-          transition: "opacity 180ms ease",
-        }}
-      />
-      <div
-        className="fixed z-[10041] w-[360px] max-w-[92vw] rounded-2xl
-                   aura-float-glass p-5 overflow-y-auto"
+        ref={pop.ref}
+        className={`fixed z-[10041] w-[360px] max-w-[92vw] rounded-2xl p-5 overflow-y-auto ${
+          overPlayer ? "aura-glass-player" : "aura-float-glass"}`}
+        data-liquid={overPlayer ? "off" : undefined}
+        // Liquid: no lens build until the pop settles (holdLensDuringPop; a lens
+        // already built for its size binds from the first frame).
+        data-lg-pop=""
         style={{
           top: anchor.top,
           ...horizontal,
           maxHeight: `calc(100vh - ${anchor.top + 16}px)`,
           transformOrigin,
           opacity: visible ? 1 : 0,
+          // Click-through while it collapses, so the 200 ms exit never eats
+          // the press on whatever sits under it.
+          pointerEvents: visible ? undefined : "none",
           // Grow out of / collapse back into the party button corner.
-          transform: visible
-            ? "translateY(0) scale(1)"
-            : reduced ? "none" : "translateY(-8px) scale(0.96)",
-          transition: reduced
-            ? "opacity 160ms ease"
-            : "opacity 200ms ease, transform 240ms cubic-bezier(0.16, 1, 0.3, 1)",
+          transform: visible ? "translateY(0) scale(1)" : hiddenTransform,
+          transition: openTransition,
         }}
         role="dialog"
-        aria-label="Watch Together"
+        aria-label="Watch Party"
       >
         {/* No close button, matching the notifications panel and the profile
             popover: all three dismiss on an outside click and on Escape, and a
@@ -178,7 +252,7 @@ export default function WatchTogetherPanel({ open, onClose }: Props) {
             full white over a hairline, bled to the card edges. */}
         <div className="-mx-5 -mt-1 px-5 pb-3 mb-4 border-b border-white/8">
           <h2 className="text-white text-[16px] font-semibold tracking-tight flex items-center gap-2">
-            <PeopleGlyph /> Watch Together
+            <PeopleGlyph /> Watch Party
           </h2>
         </div>
 
@@ -239,7 +313,7 @@ export default function WatchTogetherPanel({ open, onClose }: Props) {
       </div>
     </>
   );
-}
+});
 
 // ── Sub-views ───────────────────────────────────────────────────────────────
 
@@ -423,8 +497,8 @@ function Room({
         <button
           type="button"
           onClick={onClearStream}
-          className="w-full h-8 rounded-xl text-[12.5px] font-medium bg-white/8 text-white/90
-                     border border-white/14 hover:bg-white/14 hover:text-white transition-colors"
+          className="aura-glass-flat w-full h-8 rounded-xl text-[12.5px] font-medium text-white/90
+                     hover:text-white"
         >
           Clear party stream
         </button>
@@ -448,7 +522,7 @@ function Room({
             return (
               <li
                 key={m.id}
-                className="group flex items-center gap-2 text-[13.5px] rounded-xl px-2 py-1.5 -mx-2 hover:bg-white/6"
+                className="aura-glass-row group flex items-center gap-2 text-[13.5px] rounded-xl px-2 py-1.5 -mx-2"
               >
                 <span
                   className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${onTitle ? "bg-emerald-400" : "bg-amber-400/70"}`}
@@ -471,9 +545,9 @@ function Room({
                       type="button"
                       onClick={() => onTransfer(m.id)}
                       title={`Make ${m.name} the host`}
-                      className="flex-shrink-0 hidden group-hover:inline-flex focus:inline-flex
-                                 text-[11.5px] font-medium px-2 py-0.5 rounded-md bg-white/8 text-white/85
-                                 hover:text-white hover:bg-white/14 border border-white/14"
+                      className="aura-glass-flat flex-shrink-0 hidden group-hover:inline-flex focus:inline-flex
+                                 text-[11.5px] font-medium px-2 py-0.5 rounded-md text-white/85
+                                 hover:text-white"
                     >
                       Make host
                     </button>
@@ -597,18 +671,19 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
   );
 }
 
+// Glass classes carry the fill, border and hover (GLASS SYSTEM in App.css), so
+// no bg / border utilities here: a direct one would override both materials.
 const inputCls =
-  "w-full h-9 px-3 rounded-xl bg-white/8 border border-white/12 text-[13.5px] text-white/90 " +
-  "placeholder:text-white/40 focus:outline-none focus:border-ln-accent/40";
+  "aura-glass-field w-full h-9 px-3 rounded-xl text-[13.5px] text-white/90 " +
+  "placeholder:text-white/40 focus:outline-none";
 const primaryBtn =
-  "w-full h-9 rounded-xl text-[13.5px] font-medium bg-ln-accent/15 text-ln-accent border border-ln-accent/40 " +
-  "hover:bg-ln-accent/25 disabled:opacity-40 disabled:cursor-not-allowed transition-colors";
+  "aura-glass-flat is-primary w-full h-9 rounded-xl text-[13.5px] font-medium " +
+  "disabled:opacity-40 disabled:cursor-not-allowed";
 const secondaryBtn =
-  "px-3.5 h-9 rounded-xl text-[13.5px] font-medium bg-white/8 text-white/90 border border-white/14 " +
-  "hover:bg-white/14 hover:text-white disabled:opacity-40 disabled:cursor-not-allowed transition-colors flex-shrink-0";
+  "aura-glass-flat px-3.5 h-9 rounded-xl text-[13.5px] font-medium text-white/90 " +
+  "hover:text-white disabled:opacity-40 disabled:cursor-not-allowed flex-shrink-0";
 const dangerBtn =
-  "w-full h-9 rounded-xl text-[13.5px] font-medium text-rose-300/90 border border-rose-400/25 " +
-  "hover:bg-rose-400/10 transition-colors";
+  "aura-glass-flat is-danger w-full h-9 rounded-xl text-[13.5px] font-medium";
 
 function Spinner() {
   return <span className="w-3.5 h-3.5 rounded-full border-2 border-white/15 border-t-ln-accent animate-spin inline-block" />;

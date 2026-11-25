@@ -188,9 +188,14 @@ export default function HeroBackdropPicker({
       // aura-float-glass carries the background, border and shadow.
       // Arbitrary sizes on purpose: tailwind.config.ts replaces the maxWidth
       // scale, so a named max-w token would emit nothing.
-      className="aura-float-glass fixed z-[10045] flex flex-col w-[480px] max-w-[calc(100vw-32px)]
+      className="aura-float-glass aura-glass-pop-in fixed z-[10045] flex flex-col w-[480px] max-w-[calc(100vw-32px)]
                  max-h-[min(540px,calc(100vh-60px))] rounded-2xl overflow-hidden select-none"
-      style={{ left: pos.left, top: pos.top, animation: "fade-in 140ms ease-out" }}
+      style={{
+        left: pos.left,
+        top: pos.top,
+        // Grows from the click point (the glass pop).
+        "--lg-origin": `${Math.round(x - pos.left)}px ${Math.round(y - pos.top)}px`,
+      } as React.CSSProperties}
       // Keys pressed in here stop here. App's window-level keybindings do not
       // check defaultPrevented and bind the arrows (volume, seek) and Space
       // (pause) by default, so without this every arrow step through the
@@ -203,7 +208,7 @@ export default function HeroBackdropPicker({
       <header className="flex items-center gap-2 pl-4 pr-2.5 pt-3 pb-2">
         <div className="flex-1 min-w-0">
           <h2 className="text-[13px] font-semibold text-white/85">Backdrop</h2>
-          <p className="text-[11px] text-white/45 truncate">
+          <p className="text-[11px] text-white/60 truncate">
             Remembered for this title on this device.
           </p>
         </div>
@@ -211,8 +216,8 @@ export default function HeroBackdropPicker({
           type="button"
           aria-label="Close"
           onClick={onClose}
-          className="w-7 h-7 rounded-md flex items-center justify-center text-white/50
-                     hover:text-white hover:bg-white/10 transition-colors"
+          className="aura-glass-item w-7 h-7 rounded-lg flex items-center justify-center text-white/65
+                     hover:text-white"
         >
           <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor"
                strokeWidth="2" strokeLinecap="round" aria-hidden>
@@ -240,14 +245,14 @@ export default function HeroBackdropPicker({
               tabIndex={i === focusIdx ? 0 : -1}
               onFocus={() => setFocusIdx(i)}
               onClick={() => onPick(t.value)}
-              className="group min-w-0 p-1.5 rounded-lg text-left outline-none transition-colors
-                         hover:bg-white/6 focus-visible:bg-white/8"
+              // A glass item (round 11): the selected tile wears the item's
+              // selected face (Liquid: raised, no accent ring), the thumb the
+              // card bezel instead of a ring.
+              className="aura-glass-item group min-w-0 p-1.5 rounded-[10px] text-left outline-none
+                         focus-visible:bg-white/8"
             >
               <span
-                className={`relative block aspect-video rounded-md overflow-hidden bg-white/6 transition-shadow
-                            ${selected
-                              ? "ring-2 ring-ln-accent"
-                              : "ring-1 ring-white/10 group-hover:ring-white/25 group-focus-visible:ring-white/60"}`}
+                className="relative block aspect-video rounded-md overflow-hidden bg-white/6"
               >
                 {t.url ? (
                   <ImageLoader
@@ -258,14 +263,17 @@ export default function HeroBackdropPicker({
                     imgClassName="w-full h-full object-cover"
                   />
                 ) : (
-                  <span className="absolute inset-0 flex items-center justify-center text-[11px] text-white/35">
+                  <span className="absolute inset-0 flex items-center justify-center text-[11px] text-white/60">
                     No artwork
                   </span>
                 )}
                 {selected && (
                   <span
                     aria-hidden
-                    className="absolute top-1 right-1 w-[18px] h-[18px] rounded-full bg-ln-accent text-black
+                    // The accent MARK with its dark ink (a dark custom accent
+                    // still reads).
+                    className="absolute top-1 right-1 z-30 w-[18px] h-[18px] rounded-full
+                               bg-[var(--ln-accent-mark)] text-[rgb(var(--ln-accent-mark-ink-rgb))]
                                flex items-center justify-center shadow-[0_1px_4px_rgba(0,0,0,0.6)]"
                   >
                     <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor">
@@ -273,18 +281,19 @@ export default function HeroBackdropPicker({
                     </svg>
                   </span>
                 )}
+                <span aria-hidden data-glass-light="rim" className="aura-card-bezel" />
               </span>
               <span className="mt-1.5 px-0.5 flex items-baseline gap-1.5 min-w-0">
                 {/* "Automatic" never gives way to its source name; the source
                     truncates instead. */}
                 <span
                   className={`${i === 0 ? "shrink-0" : "truncate"} text-[11.5px]
-                              ${selected ? "text-ln-accent" : "text-white/75"}`}
+                              ${selected ? "text-[color:var(--ln-accent-mark-text)]" : "text-white/80"}`}
                 >
                   {t.label}
                 </span>
                 {i === 0 && automaticSource && (
-                  <span className="truncate text-[10.5px] text-white/40">{automaticSource}</span>
+                  <span className="truncate text-[10.5px] text-white/60">{automaticSource}</span>
                 )}
               </span>
             </button>

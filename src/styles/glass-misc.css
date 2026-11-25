@@ -1,0 +1,327 @@
+/* Aura - (c) 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice. */
+/* SPDX-License-Identifier: AGPL-3.0-or-later */
+
+/* Glass surface rules for the "misc" group. Loaded once, after App.css (main.tsx),
+   so a rule here at equal specificity wins over App.css. Uses the GLASS SYSTEM
+   classes and custom properties defined in App.css; never redefine them here. */
+
+/* ------------------------------------------------------------------ */
+/* Player surfaces (.aura-glass-player): legibility lift.              */
+/* The old .aura-glass-menu / .aura-glass-bar gave every descendant a  */
+/* soft text shadow so small text reads over a bright frame bleeding   */
+/* through. The player material keeps it (text-shadow inherits, so the */
+/* surface alone carries it); form controls opt out so the shadow does */
+/* not bleed across a range thumb or a typed value.                    */
+/* ------------------------------------------------------------------ */
+.aura-glass-player {
+  text-shadow:
+    0 1px 2px rgba(0, 0, 0, 0.55),
+    0 0 1px rgba(0, 0, 0, 0.45);
+}
+.aura-glass-player :is(input, textarea, select) { text-shadow: none; }
+
+/* ------------------------------------------------------------------ */
+/* Real glass over video (opt-in, src/realGlass.ts): an mpv shader     */
+/* blurs the live video under a surface marked data-real-glass="on",   */
+/* lifts it slightly (a lit material), soft-caps its BRIGHT parts and  */
+/* lifts its saturation (glass.rs `look`), so the baked dark base      */
+/* steps aside. The shader's luminance cap carries the bright-frame    */
+/* legibility; the face here is only a flat faint tint in Frosted and  */
+/* only a flat white sheen with a lit rim in Liquid, with a softer     */
+/* drop shadow (the default ones darken the video around the bar), a   */
+/* tight text and icon shadow (no halo), no cursor glint, and lighter  */
+/* nested Liquid buttons, wells and pill (the opaque-bar darks read as */
+/* dark spots on the glass). Tuned together with the shader's cap/lift */
+/* and the PlayerOverlay vignette below (0 under real glass): change   */
+/* them together. Only set while the shader draws there: a             */
+/* surface mostly over the letterbox bars (which the shader cannot     */
+/* reach) or on a GPU that cannot run it keeps the normal fill. Never  */
+/* on the High Contrast themes (an accessibility floor; realGlass.ts   */
+/* does not mark or send there either).                                */
+/* ------------------------------------------------------------------ */
+html:not([data-theme="contrast"]):not([data-theme="contrast-azure"]) .aura-glass-player[data-real-glass="on"] {
+  /* Flat, not a vertical ramp: over the smooth blurred backdrop a 0.03 to
+     0.06 ramp across the bar's height stepped as faint horizontal bands. */
+  --lg-face: linear-gradient(rgba(0, 0, 0, 0.045), rgba(0, 0, 0, 0.045));
+  --lg-drop: 0 10px 28px -10px rgb(0 0 0 / 0.34);
+}
+/* Liquid: one flat white sheen, no dark tint layer, and a lit rim. The
+   edge keeps its 4-entry inset shape so state changes still interpolate. */
+html[data-glass="liquid"]:not([data-theme="contrast"]):not([data-theme="contrast-azure"]) .aura-glass-player[data-real-glass="on"] {
+  --lg-face: linear-gradient(rgb(255 255 255 / 0.03), rgb(255 255 255 / 0.03));
+  --lg-edge:
+    inset 0 8px 12px -10px rgb(255 255 255 / 0.16),
+    inset 0 10px 14px -12px rgb(0 0 0 / 0.10),
+    inset 0 -12px 18px -10px rgb(0 0 0 / 0.16),
+    inset 0 0 0 0.5px rgb(255 255 255 / 0.14);
+  --lg-drop: 0 10px 28px -10px rgb(0 0 0 / 0.32);
+}
+/* Legibility over a lighter face: a tight text shadow (inherited by the
+   whole surface) and a tight drop shadow on icons. Form controls opt out.
+   No wide halo: an 8 px 0.42 black halo merged each text run (the time
+   readout, the speed chip, the upscaler pill) into a soft dark pill, and a
+   wider icon shadow read as a dark disc around round glyphs, both plain to
+   see on the smooth lifted glass. The shader's lower cap carries the
+   bright-frame legibility instead. */
+html:not([data-theme="contrast"]):not([data-theme="contrast-azure"]) .aura-glass-player[data-real-glass="on"] {
+  text-shadow: 0 1px 2px rgb(0 0 0 / 0.5);
+}
+html:not([data-theme="contrast"]):not([data-theme="contrast-azure"]) .aura-glass-player[data-real-glass="on"] svg {
+  filter: drop-shadow(0 1px 1px rgb(0 0 0 / 0.35));
+}
+/* No cursor glint on a real-glass surface or anything inside it. Over the
+   smooth blurred backdrop the old 5% light and its grain disc were composited
+   at 8 bits with no dither: the light stepped into contour rings, and the
+   grain's own mean (+1.4 codes) ended in a wide faint ring (the light is a
+   dithered image now; not re-measured over real glass). glassGlint.ts
+   also skips these elements, so this only covers a fade in progress when the
+   mark arrives. The rim keeps its one-inset shape. */
+html:not([data-theme="contrast"]):not([data-theme="contrast-azure"]) .aura-glass-player[data-real-glass="on"],
+html:not([data-theme="contrast"]):not([data-theme="contrast-azure"]) .aura-glass-player[data-real-glass="on"] :is(.aura-glass-flat, .aura-glass-field, .aura-glass-control) {
+  --lg-glint: linear-gradient(transparent, transparent);
+  --lg-rimlight: inset 0 0 0 0 transparent;
+}
+/* Liquid buttons inside a real-glass surface (the play button, menu
+   buttons): the flat face's tint (a dark 0.24..0.40 when this was tuned)
+   and its drop were sized for
+   the opaque bar and read as dark discs on the lifted glass. A light sheen
+   instead; the drop keeps its 2-entry shape at zero alpha. is-primary keeps
+   its accent deco and ring. The border stays transparent here, not the
+   Liquid --lg-face-ring: that dark ring (0.55 black at the bottom) stands in
+   for the refraction filter's outer pixel on page glass, and these buttons
+   are never bound, so on the lifted glass it only drew a dark outline round
+   the play button. Wins over the Liquid flat hover rule on specificity. */
+html[data-glass="liquid"]:not([data-theme="contrast"]):not([data-theme="contrast-azure"]) .aura-glass-player[data-real-glass="on"] .aura-glass-flat {
+  --lg-face: linear-gradient(rgb(255 255 255 / 0.10), rgb(255 255 255 / 0.05));
+  --lg-border-c: transparent;
+  --lg-drop: 0 1px 1px rgb(0 0 0 / 0), 0 3px 8px -3px rgb(0 0 0 / 0);
+}
+/* Liquid wells inside a real-glass menu: lighter than the opaque-menu ones
+   (black 0.30 / 0.26 with deep inset shadows read as dark holes). The edge
+   keeps its 3-entry shape. */
+html[data-glass="liquid"]:not([data-theme="contrast"]):not([data-theme="contrast-azure"]) .aura-glass-player[data-real-glass="on"] .aura-glass-field {
+  --lg-face: linear-gradient(rgb(0 0 0 / 0.16), rgb(0 0 0 / 0.16));
+  --lg-edge: inset 0 1px 4px rgb(0 0 0 / 0.28), inset 0 -1px 0 rgb(255 255 255 / 0.05), inset 0 0 0 0.5px rgb(255 255 255 / 0.10);
+}
+html[data-glass="liquid"]:not([data-theme="contrast"]):not([data-theme="contrast-azure"]) .aura-glass-player[data-real-glass="on"] .aura-glass-field:is(:focus, :focus-within) {
+  --lg-face: linear-gradient(rgb(0 0 0 / 0.11), rgb(0 0 0 / 0.11));
+}
+html[data-glass="liquid"]:not([data-theme="contrast"]):not([data-theme="contrast-azure"]) .aura-glass-player[data-real-glass="on"] .aura-glass-seg {
+  background: rgb(0 0 0 / 0.14);
+  box-shadow: inset 0 1px 4px rgb(0 0 0 / 0.25), inset 0 -1px 0 rgb(255 255 255 / 0.05), inset 0 0 0 0.5px rgb(255 255 255 / 0.10);
+}
+html:not([data-theme="contrast"]):not([data-theme="contrast-azure"]) .aura-glass-player[data-real-glass="on"] :is(input, textarea, select) {
+  text-shadow: none;
+}
+/* The bar's dim 12 px time text (duration, DVR "behind"): at white/55 it
+   measured about 2.3:1 over a white frame under real glass, so it brightens
+   here. The current time is already white/85. */
+html:not([data-theme="contrast"]):not([data-theme="contrast-azure"]) .aura-glass-player[data-real-glass="on"] .aura-player-time-dim {
+  color: rgb(255 255 255 / 0.8);
+}
+
+/* PlayerOverlay's bottom vignette (.aura-player-vignette): full strength
+   over raw video, but under a real-glass bar it would stack a second dark
+   layer on the lit glass (and dim the video around it), so it drops to 0
+   while the bar is marked: the shader's cap carries bright-frame
+   legibility there. The match relies on the vignette staying a PRECEDING
+   SIBLING of the bar's wrapper (PlayerOverlay.tsx); reordered, it silently
+   falls back to 0.75. */
+@property --aura-vignette-a {
+  syntax: "<number>";
+  inherits: false;
+  initial-value: 0.75;
+}
+/* Smoothstep ramp (zero slope at both ends, the same mean darkness as the
+   old 2-stop linear one): the linear ramp's kink at its top edge read as a
+   Mach band over dark video. No grain: it would show over letterbox black. */
+.aura-player-vignette {
+  background: linear-gradient(to top,
+    rgb(0 0 0 / var(--aura-vignette-a)) 0%,
+    rgb(0 0 0 / calc(var(--aura-vignette-a) * 0.972)) 10%,
+    rgb(0 0 0 / calc(var(--aura-vignette-a) * 0.896)) 20%,
+    rgb(0 0 0 / calc(var(--aura-vignette-a) * 0.784)) 30%,
+    rgb(0 0 0 / calc(var(--aura-vignette-a) * 0.648)) 40%,
+    rgb(0 0 0 / calc(var(--aura-vignette-a) * 0.5)) 50%,
+    rgb(0 0 0 / calc(var(--aura-vignette-a) * 0.352)) 60%,
+    rgb(0 0 0 / calc(var(--aura-vignette-a) * 0.216)) 70%,
+    rgb(0 0 0 / calc(var(--aura-vignette-a) * 0.104)) 80%,
+    rgb(0 0 0 / calc(var(--aura-vignette-a) * 0.028)) 90%,
+    rgb(0 0 0 / 0) 100%);
+  transition: opacity 500ms ease-in-out, --aura-vignette-a 300ms ease;
+}
+html:not([data-theme="contrast"]):not([data-theme="contrast-azure"]) .aura-player-vignette:has(~ * .aura-player-bar[data-real-glass="on"]) {
+  --aura-vignette-a: 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Rows and items that cannot act: no hover face.                      */
+/* (A disabled button still matches :hover.) The selected one keeps     */
+/* its face: the playing episode while a pick resolves, the playing    */
+/* source in the switcher.                                             */
+/* ------------------------------------------------------------------ */
+:is(.aura-glass-row, .aura-glass-item):disabled:not(.is-selected):hover {
+  background-color: transparent;
+}
+html[data-glass="liquid"] :is(.aura-glass-row, .aura-glass-item):disabled:not(.is-selected):hover {
+  background: transparent;
+  box-shadow: none;
+}
+
+/* ------------------------------------------------------------------ */
+/* Player menu switch rows (playerMenu.tsx PlayerMenuToggle).          */
+/* The row is role=switch with aria-checked, which the GLASS SYSTEM    */
+/* reads as SELECTED. An on switch is not a selected row: its state is */
+/* the switch itself, so the row keeps the plain row look.             */
+/* ------------------------------------------------------------------ */
+.aura-glass-row[role="switch"][aria-checked="true"]:not(.is-selected) {
+  color: rgb(255 255 255 / 0.9);
+  font-weight: inherit;
+}
+html[data-glass="liquid"] .aura-glass-row[role="switch"][aria-checked="true"]:not(.is-selected):not(:hover) {
+  background: transparent;
+  box-shadow: none;
+  color: rgb(255 255 255 / 0.9);
+}
+html[data-glass="liquid"] .aura-glass-row[role="switch"][aria-checked="true"]:not(.is-selected):hover {
+  background: linear-gradient(rgb(255 255 255 / 0.075), rgb(255 255 255 / 0.035));
+  box-shadow: inset 0 6px 10px -8px rgb(255 255 255 / 0.07), inset 0 -8px 12px -9px rgb(0 0 0 / 0.35);
+  color: #fff;
+}
+
+/* ------------------------------------------------------------------ */
+/* Player control bar pill (the Upscaler pill, PlayerOverlay).         */
+/* An .aura-glass-item with a resting rim of its own, since it sits in  */
+/* the bar as a button rather than in a list. Hover and is-selected    */
+/* come from the GLASS SYSTEM (both at higher specificity than these). */
+/* ------------------------------------------------------------------ */
+.aura-player-pill {
+  background-color: rgb(255 255 255 / 0.05);
+  box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.10);
+}
+html[data-glass="liquid"] .aura-player-pill {
+  background: linear-gradient(rgb(255 255 255 / 0.06), rgb(255 255 255 / 0.025));
+  box-shadow:
+    inset 0 6px 10px -8px rgb(255 255 255 / 0.07),
+    inset 0 -8px 12px -9px rgb(0 0 0 / 0.35),
+    inset 0 0 0 0.5px rgb(0 0 0 / 0.30);
+}
+/* Under real glass the pill's dark bottom pool and black hairline read as a
+   darker pill on the lifted glass: a lit top and a white hairline instead.
+   Selected keeps the GLASS SYSTEM look. */
+html[data-glass="liquid"]:not([data-theme="contrast"]):not([data-theme="contrast-azure"]) .aura-glass-player[data-real-glass="on"] .aura-player-pill:not(:is([aria-selected="true"], [aria-current="page"], [aria-current="true"], [aria-pressed="true"], [aria-checked="true"], .is-selected)) {
+  box-shadow:
+    inset 0 6px 10px -8px rgb(255 255 255 / 0.10),
+    inset 0 0 0 0.5px rgb(255 255 255 / 0.14);
+}
+
+/* The episode strip handle on the player's right edge. */
+.aura-player-handle {
+  transition: width 150ms ease, opacity 150ms ease, --lg-lift 150ms ease;
+}
+.aura-player-handle:hover { --lg-lift: 0.08; }
+
+/* Player material buttons (Exit playback): a soft lift on hover. The
+   press transitions are restated because this rule replaces
+   .aura-glass-press's transition list. */
+.aura-player-btn.aura-glass-press {
+  transition: scale var(--aura-spring-bouncy-dur) var(--aura-spring-bouncy), translate 200ms ease, --lg-lift 180ms ease, color 150ms ease;
+}
+.aura-player-btn:hover { --lg-lift: var(--lg-lift-hover); }
+
+/* ------------------------------------------------------------------ */
+/* Hero carousel arrows: hover-revealed floating controls. Their       */
+/* opacity fade rides beside the press motion (a transition utility    */
+/* would lose to .aura-glass-press's transition list).                 */
+/* ------------------------------------------------------------------ */
+.aura-hero-arrow {
+  transition: opacity 300ms ease, scale var(--aura-spring-bouncy-dur) var(--aura-spring-bouncy), translate 200ms ease, --lg-lift 180ms ease, color 150ms ease;
+}
+
+/* ------------------------------------------------------------------ */
+/* Detail page Library / Queue / Trailer buttons (floating controls).  */
+/* In the library / queue = SELECTED (is-selected): Frosted's accent   */
+/* ring, Liquid's raised face with an accent label. Hovering a         */
+/* selected one offers removal, so it turns rose (a destructive hint,  */
+/* not a selection state, in both materials). Everything goes through  */
+/* the glass hooks; Liquid's border stays the tier's face ring.        */
+/* ------------------------------------------------------------------ */
+.aura-detail-toggle {
+  transition: color 150ms ease, border-color 160ms ease, box-shadow 200ms ease, --lg-lift 160ms ease;
+}
+html:not([data-glass="liquid"]) .aura-detail-toggle:not(.is-selected):not(:disabled):hover {
+  --lg-border-c: rgb(255 255 255 / 0.24);
+}
+html:not([data-glass="liquid"]) .aura-detail-toggle.is-selected:hover {
+  --lg-deco: linear-gradient(rgb(244 63 94 / 0.15), rgb(244 63 94 / 0.15));
+  --lg-border-c: rgb(253 164 175 / 0.4);
+  --lg-ring: 0 0 #0000;
+  color: rgb(254 205 211);
+}
+html[data-glass="liquid"] .aura-detail-toggle.is-selected:hover {
+  --lg-deco: linear-gradient(rgb(244 63 94 / 0.08), rgb(244 63 94 / 0.16));
+  color: rgb(254 205 211);
+}
+
+/* ------------------------------------------------------------------ */
+/* Flat controls: extensions used by the misc group.                   */
+/* ------------------------------------------------------------------ */
+/* A selected / open flat control (History's Jump to date while its
+   calendar is open). Frosted: an accent wash and hairline. Liquid: the
+   raised face and an accent label only (its face and face-ring border
+   win on specificity), never an accent fill or ring. */
+.aura-glass-flat.is-selected {
+  --lg-face: linear-gradient(rgb(var(--ln-accent-rgb) / 0.14), rgb(var(--ln-accent-rgb) / 0.14));
+  --lg-border-c: rgb(var(--ln-accent-rgb) / 0.35);
+  color: var(--ln-accent-mark);
+}
+html[data-glass="liquid"] .aura-glass-flat.is-selected { --lg-lift: var(--lg-lift-selected); }
+
+/* Destructive on hover only (Remove, Clear history): neutral at rest. */
+.aura-glass-flat.aura-danger-hover:hover:not(:disabled) { color: rgb(254 205 211); }
+html:not([data-glass="liquid"]) .aura-glass-flat.aura-danger-hover:hover:not(:disabled) {
+  --lg-face: linear-gradient(rgb(244 63 94 / 0.15), rgb(244 63 94 / 0.15));
+  --lg-border-c: rgb(253 164 175 / 0.4);
+}
+html[data-glass="liquid"] .aura-glass-flat.aura-danger-hover:hover:not(:disabled) {
+  --lg-deco: linear-gradient(rgb(244 63 94 / 0.06), rgb(244 63 94 / 0.14));
+}
+
+/* A slightly louder primary (History's selection-mode Scrobble). */
+html:not([data-glass="liquid"]) .aura-glass-flat.is-primary.aura-primary-strong {
+  --lg-face: linear-gradient(rgb(var(--ln-accent-rgb) / 0.20), rgb(var(--ln-accent-rgb) / 0.20));
+  --lg-border-c: rgb(var(--ln-accent-rgb) / 0.45);
+}
+html[data-glass="liquid"] .aura-glass-flat.is-primary.aura-primary-strong {
+  --lg-deco: linear-gradient(rgb(var(--ln-accent-rgb) / 0.12), rgb(var(--ln-accent-rgb) / 0.20));
+}
+
+/* The right half of a split button: one shared seam, not two borders. */
+.aura-glass-flat.aura-split-r { border-left-width: 0; }
+
+/* A glass <select> in a narrow column (AuraSkip's segment Type): a
+   tighter chevron so "Opening (mixed)" still fits. */
+.aura-glass-select.aura-select-compact {
+  padding-right: 24px;
+  --lg-deco: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 24 24' fill='rgba(255,255,255,0.45)'%3E%3Cpath d='M7 10l5 5 5-5z'/%3E%3C/svg%3E") right 8px center / 10px 10px no-repeat;
+}
+
+/* ToggleSwitch size="xs" (32 x 18 track, 14 px knob): the knob travels 14 px. */
+.aura-glass-toggle.aura-toggle-xs[aria-checked="true"] .aura-glass-knob { translate: 14px 0; }
+
+/* ------------------------------------------------------------------ */
+/* Success / accent tone hairlines. UNUSED since round 8: no toast     */
+/* carries them any more (AppToast, PartyToast and FlyUpToast default  */
+/* and success toasts have no coloured hairline; their colour is the   */
+/* entry flash in the theme accent, see .claude/rules/frontend-ui.md). */
+/* Kept for a surface that needs a persistent tone ring. Only          */
+/* -danger (errors) and -warning (a party host change) remain on toasts. */
+/* Twins of .aura-glass-tone-danger / -warning (glass-settings.css):   */
+/* a tone hairline through the --lg-ring hook, never border utilities, */
+/* which the glass border would override. Liquid keeps it inside the   */
+/* rim and fainter, so there is no crisp coloured outline.             */
+/* ------------------------------------------------------------------ */
+.aura-glass-tone-success { --lg-ring: 0 0 0 1px rgb(110 231 183 / 0.40); }
+.aura-glass-tone-accent { --lg-ring: 0 0 0 1px rgb(var(--ln-accent-rgb) / 0.35); }
+html[data-glass="liquid"] .aura-glass-tone-success { --lg-ring: inset 0 0 0 1px rgb(110 231 183 / 0.22); }
+html[data-glass="liquid"] .aura-glass-tone-accent { --lg-ring: inset 0 0 0 1px rgb(var(--ln-accent-rgb) / 0.22); }

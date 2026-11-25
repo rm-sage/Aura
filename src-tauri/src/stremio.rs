@@ -53,7 +53,11 @@ static MANIFEST_CACHE_PATH: OnceLock<PathBuf> = OnceLock::new();
 /// Wire format version for the on-disk manifest cache. Bump on any
 /// breaking change to `WireManifest` / `WireCatalogEntry` so a stale
 /// file from an older Aura build is dropped instead of misparsed.
-const MANIFEST_CACHE_FILE_VERSION: u32 = 1;
+/// 2: `WireBehaviorHints` keeps `wrappedAddons` / `landscapeArt`; a v1 entry
+/// was written with them thrown away and would read as "declares nothing"
+/// for up to MANIFEST_TTL.
+/// 3: it keeps `addonStatus` too, for the same reason.
+const MANIFEST_CACHE_FILE_VERSION: u32 = 3;
 
 #[derive(Clone)]
 struct ManifestCacheEntry {
@@ -390,7 +394,7 @@ fn client() -> &'static reqwest::Client {
             // (this caps IDLE retention, not in-flight connections).
             .pool_max_idle_per_host(1)
             .pool_idle_timeout(Duration::from_secs(30))
-            .user_agent("Aura/0.6.6")
+            .user_agent(concat!("Aura/", env!("CARGO_PKG_VERSION")))
             .build()
             .expect("HTTP client init failed")
     })
@@ -406,7 +410,7 @@ fn account_client() -> &'static reqwest::Client {
             .tcp_keepalive(Duration::from_secs(60))
             .pool_max_idle_per_host(1)
             .pool_idle_timeout(Duration::from_secs(30))
-            .user_agent("Aura/0.6.6")
+            .user_agent(concat!("Aura/", env!("CARGO_PKG_VERSION")))
             .build()
             .expect("Account HTTP client init failed")
     })
@@ -450,6 +454,30 @@ struct WireManifest {
 struct WireBehaviorHints {
     #[serde(default)]
     configurable: bool,
+    /// `wrappedAddons` / `landscapeArt` (`addons::wrapped_from_hints`), kept
+    /// raw so a malformed value cannot fail the whole manifest parse.
+    #[serde(default, rename = "wrappedAddons", skip_serializing_if = "Option::is_none")]
+    wrapped_addons: Option<serde_json::Value>,
+    #[serde(default, rename = "landscapeArt", skip_serializing_if = "Option::is_none")]
+    landscape_art: Option<serde_json::Value>,
+    /// `addonStatus`: the addon serves `api/status/addons.json`, the health of
+    /// the addons it wraps (service_status.rs). Raw for the same reason.
+    #[serde(default, rename = "addonStatus", skip_serializing_if = "Option::is_none")]
+    addon_status: Option<serde_json::Value>,
+}
+
+impl WireBehaviorHints {
+    fn wrapped(&self) -> (Vec<crate::addons::WrappedAddon>, bool) {
+        let mut h = serde_json::Map::new();
+        if let Some(v) = &self.wrapped_addons { h.insert("wrappedAddons".into(), v.clone()); }
+        if let Some(v) = &self.landscape_art { h.insert("landscapeArt".into(), v.clone()); }
+        crate::addons::wrapped_from_hints(Some(&serde_json::Value::Object(h)))
+    }
+
+    /// `addonStatus: true`, exactly; any other value reads as not declared.
+    fn addon_status(&self) -> bool {
+        self.addon_status.as_ref().and_then(|v| v.as_bool()) == Some(true)
+    }
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -572,6 +600,16 @@ pub struct AddonManifest {
     pub name: String,
     pub catalogs: Vec<CatalogInfo>,
     pub has_search: bool,
+    /// `behaviorHints.wrappedAddons` / `landscapeArt` of the LIVE manifest
+    /// (`addons::wrapped_from_hints`). The frontend reads them from here, not
+    /// from `AddonEntry`: a signed-in entry is built from the manifest stored
+    /// in the Stremio collection, and stremio-core drops unknown
+    /// behaviorHints whenever an official app re-saves that collection.
+    pub wrapped: Vec<crate::addons::WrappedAddon>,
+    pub landscape_art: bool,
+    /// `behaviorHints.addonStatus` of the live manifest: the addon reports the
+    /// health of the addons it wraps (service_status.rs `nested`).
+    pub addon_status: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -913,6 +951,15 @@ pub struct StreamEntry {
     /// formatter's text, which a formatter can truncate ("The Pirate Ba...")
     /// or join ("GROUP · INDEXER"). `None` without streamData.
     pub facts: Option<StreamFacts>,
+    /// When this entry was read from its addon (or its meta), in ms since the
+    /// Unix epoch. An addon url is not a fixed address: AIOStreams' proxy token
+    /// never expires and re-runs its debrid lookup (and failover) on EVERY
+    /// request, so a day-old url can answer one request from one release and
+    /// the next from another (mpv then decodes H.264 packets under an HEVC
+    /// header and never shows a frame). The frontend re-reads a source whose
+    /// url is older than `STREAM_URL_MAX_AGE_MS` before playing it. 0 for a
+    /// stream embedded in a meta, which is re-read through the meta instead.
+    pub resolved_at_ms: u64,
 }
 
 /// The few `streamData` fields the stream row shows, read field by field so
@@ -1162,11 +1209,29 @@ fn cap(s: String, max: usize) -> String {
 /// malformed meta entry can't blank out an entire payload. Spec-violating
 /// entries (numeric ids, missing `type`/`name`) are logged at the call
 /// site but never crash the response.
+/// An AIOStreams error item standing in for a meta or catalog entry: a
+/// wrapped addon's failure, answered with HTTP 200 as
+/// `{id: "aiostreamserror.<json>", name: "[❌] <addon>", description: <error>}`
+/// (also with errors hidden it can still carry the id). Never a title.
+/// The `errors` entry `parse_meta_array` records for a dropped error item.
+const ADDON_ERROR_ITEM: &str = "addon error item";
+
+pub(crate) fn is_addon_error_item(v: &serde_json::Value) -> bool {
+    v.get("id")
+        .and_then(|i| i.as_str())
+        .is_some_and(|i| i.get(..16).is_some_and(|p| p.eq_ignore_ascii_case("aiostreamserror.")))
+}
+
 fn parse_meta_array(raw: Vec<serde_json::Value>) -> (Vec<WireMeta>, usize, Vec<String>) {
     let mut out = Vec::with_capacity(raw.len());
     let mut dropped = 0usize;
     let mut errors = Vec::new();
     for value in raw {
+        if is_addon_error_item(&value) {
+            dropped += 1;
+            errors.push(ADDON_ERROR_ITEM.to_string());
+            continue;
+        }
         match serde_json::from_value::<WireMeta>(value.clone()) {
             Ok(m) if !m.id.is_empty() => out.push(m),
             Ok(_) => { dropped += 1; errors.push("empty id".to_string()); }
@@ -1369,12 +1434,12 @@ async fn fetch_manifest(base: &str) -> Result<(WireManifest, bool), String> {
         .get(format!("{base}/manifest.json"))
         .send()
         .await
-        .map_err(|e| format!("Manifest fetch failed: {e}"))?
+        .map_err(|e| format!("Manifest fetch failed: {}", reqwest_err_for_log(&e)))?
         .error_for_status()
-        .map_err(|e| format!("Manifest HTTP error: {e}"))?
+        .map_err(|e| format!("Manifest HTTP error: {}", e.status().map(|s| s.as_u16().to_string()).unwrap_or_default()))?
         .json()
         .await
-        .map_err(|e| format!("Manifest parse error: {e}"))?;
+        .map_err(|e| format!("Manifest parse error: {}", reqwest_err_for_log(&e)))?;
 
     let has_search = manifest_declares_search(
         wire.catalogs.iter().map(|c| c.extra.as_slice()),
@@ -3245,6 +3310,8 @@ pub async fn get_addon_manifest(addon_url: String) -> Result<AddonManifest, Stri
 /// The frontend view of a manifest: display-ready catalogs plus the search
 /// flag. Shared by `get_addon_manifest` and `refresh_addon_manifest`.
 fn addon_manifest_from_wire(wire: WireManifest, has_search: bool) -> AddonManifest {
+    let (wrapped, landscape_art) = wire.behavior_hints.wrapped();
+    let addon_status = wire.behavior_hints.addon_status();
     let catalogs = wire
         .catalogs
         .into_iter()
@@ -3274,7 +3341,7 @@ fn addon_manifest_from_wire(wire: WireManifest, has_search: bool) -> AddonManife
         })
         .collect();
 
-    AddonManifest { name: wire.name, catalogs, has_search }
+    AddonManifest { name: wire.name, catalogs, has_search, wrapped, landscape_art, addon_status }
 }
 
 /// A catalog is "search-only" when one of its `extra` parameters is `search`
@@ -3290,26 +3357,31 @@ fn catalog_is_search_only(extras: &[serde_json::Value]) -> bool {
 }
 
 /// A catalog is "hidden from home" when it has a required `extra` parameter
-/// other than `search` that has no `options` default — the addon can't
-/// produce rows without a user-supplied filter (genre, year, etc.). This is
-/// Stremio's standard "Discover-only" pattern AND how AIOMetadata's
-/// "enabled but hidden from home" toggle surfaces in the manifest. Distinct
-/// from `is_search_only` so the Discover tab can offer these as picks.
+/// other than `search` that the addon cannot default: no `options` at all
+/// (the addon can't produce rows without a user-supplied filter: genre,
+/// year, etc.; Stremio's standard "Discover-only" pattern), or a single
+/// `"None"` option. The latter is the sentinel AIOMetadata's "hidden from
+/// home" toggle emits beside `showInHome: false`, and the only signal left
+/// when AIOMetadata is wrapped inside AIOStreams, whose manifest drops
+/// `showInHome` (`2fce3b0.flixpatrol.aggregate.movie`: required genre
+/// `["None"]`). Distinct from `is_search_only` so the Discover tab can offer
+/// these as picks.
 fn catalog_is_hidden_from_home(extras: &[serde_json::Value]) -> bool {
     extras.iter().any(|ex| {
         let name = ex.get("name").and_then(|v| v.as_str()).unwrap_or("");
         if name == "search" || name.is_empty() { return false; }
         let required = ex.get("isRequired").and_then(|v| v.as_bool()) == Some(true);
         if !required { return false; }
-        // Required extras with a non-empty `options` array are still
-        // home-eligible — the addon can default to the first option.
-        // Required extras without options need user input.
-        let has_options = ex
-            .get("options")
-            .and_then(|v| v.as_array())
-            .map(|a| !a.is_empty())
-            .unwrap_or(false);
-        !has_options
+        // Required extras with real `options` are still home-eligible: the
+        // addon can default to the first option. Required extras without
+        // options need user input, and a lone "None" is a hide marker.
+        match ex.get("options").and_then(|v| v.as_array()) {
+            None => true,
+            Some(a) if a.is_empty() => true,
+            Some(a) => {
+                a.len() == 1 && a[0].as_str().is_some_and(|s| s.trim().eq_ignore_ascii_case("none"))
+            }
+        }
     })
 }
 
@@ -3346,6 +3418,7 @@ pub async fn add_addon<R: tauri::Runtime>(
 /// all stream lookups).
 fn addon_entry_from_wire(url: String, wire: &WireManifest, has_search: bool) -> AddonEntry {
     let (stream_types, stream_id_prefixes) = collect_wire_stream_resource_info(wire);
+    let (wrapped, landscape_art) = wire.behavior_hints.wrapped();
     AddonEntry {
         url,
         name: wire.name.clone(),
@@ -3357,6 +3430,8 @@ fn addon_entry_from_wire(url: String, wire: &WireManifest, has_search: bool) -> 
         id_prefixes: collect_wire_id_prefixes(wire),
         stream_id_prefixes,
         configurable: wire.behavior_hints.configurable,
+        wrapped,
+        landscape_art,
     }
 }
 
@@ -3494,14 +3569,19 @@ pub async fn fetch_catalog(
                     return Ok(stale);
                 }
             }
-            return Err(format!("Catalog fetch {cat}: {e}"));
+            // Never `{e}`: reqwest's Display appends the full (tokenized)
+            // url, and the Catalog page shows this string.
+            return Err(format!("Catalog fetch {cat}"));
         }
     };
     let resp = match resp.error_for_status() {
         Ok(r) => r,
         Err(e) => {
             crate::devlog!(warn, "catalog", "[{}] HTTP {:?}", label, e.status());
-            return Err(format!("Catalog HTTP error: {e}"));
+            return Err(format!(
+                "Catalog HTTP error: {}",
+                e.status().map(|s| s.as_u16().to_string()).unwrap_or_default(),
+            ));
         }
     };
     let response: CatalogResponse = match resp.json().await {
@@ -3514,7 +3594,7 @@ pub async fn fetch_catalog(
                 warn, "catalog", "[{}] {}/{} JSON parse error ({})",
                 label, catalog_type, catalog_id, reqwest_err_for_log(&e),
             );
-            return Err(format!("Catalog parse error: {e}"));
+            return Err("Catalog parse error".to_string());
         }
     };
 
@@ -3532,6 +3612,23 @@ pub async fn fetch_catalog(
         );
     }
     let kept = metas.len();
+    // A page made only of AIOStreams error items is the wrapped addon's
+    // FAILURE (a timeout, an HTTP error), not an empty catalog: answered as
+    // one, Home would hide the row instead of keeping it with a Retry, and
+    // the stale fallback a network failure gets would be skipped. So it
+    // takes the network-failure path.
+    if kept == 0 && dropped > 0 && errors.iter().all(|e| e == ADDON_ERROR_ITEM) {
+        mark_catalog_failed(&base, &catalog_type, &catalog_id);
+        if let Some(stale) = cached_catalog_metas(&base, &catalog_type, &catalog_id) {
+            crate::devlog!(
+                info, "catalog",
+                "[{}] {}/{} addon error page, serving {} stale item(s)",
+                label, catalog_type, catalog_id, stale.len(),
+            );
+            return Ok(stale);
+        }
+        return Err(format!("Catalog addon error: {catalog_type}/{catalog_id}"));
+    }
     crate::devlog!(
         info, "catalog",
         "[{}] {}/{} skip={} → {} item(s){}{}",
@@ -3685,22 +3782,71 @@ pub struct SearchGroup {
     pub items:        Vec<MetaPreview>,
 }
 
-/// Search ONE addon's catalogs and return its groups. Splits the existing
-/// `global_search_grouped` per-addon body into a standalone command so the
-/// frontend can fan out N parallel calls (one per addon) and populate each
-/// row independently as it completes — progressive display instead of the
-/// "wait for the slowest addon" one-shot pattern.
+/// One search catalog of an addon, announced before any of them is fetched so
+/// the Search view can hold a row for each in manifest order.
+#[derive(Clone, Serialize)]
+pub struct SearchCatalogPlan {
+    pub order:        usize,
+    pub addon_url:    String,
+    pub catalog_id:   String,
+    pub catalog_name: String,
+    pub media_type:   String,
+}
+
+/// Progress of one `search_addon_grouped` call, sent through its channel: first the plan (every search catalog, in manifest order), then
+/// one `catalog` message per catalog as it lands (`group` is None for a
+/// catalog with no results or a failed request; `failed` tells the two
+/// apart, so the Search view can say "did not answer" instead of hiding
+/// the row as if nothing matched).
+#[derive(Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SearchProgress {
+    Plan { catalogs: Vec<SearchCatalogPlan> },
+    Catalog { order: usize, group: Option<SearchGroup>, failed: bool },
+}
+
+/// Names the ONE catalog a `search_addon_grouped` retry asks (the Search
+/// view's per-catalog Retry). Same pacing as a full search.
+#[derive(Clone, Deserialize)]
+pub struct SearchOnly {
+    pub media_type: String,
+    pub catalog_id: String,
+}
+
+/// At most this many search catalogs of ONE addon are requested at once.
+/// AIOStreams limits catalog requests per IP (upstream's default was 30 per
+/// 5 s; the rm-sage fork allows 200 per 10 s since 2026-11-16), and an addon
+/// wrapping AIOMetadata can declare a dozen search catalogs: 12 asks such an
+/// addon's catalogs in one round. The per-window budget is kept by
+/// `addon_rate` in `search_one_catalog`; this caps requests in flight.
+const SEARCH_CATALOG_CONCURRENCY: usize = 12;
+
+/// Search ONE addon's catalogs and return its groups in manifest order. The
+/// frontend fans out one call per addon; within the addon the catalogs are
+/// requested concurrently and each one is reported through `on_progress` the
+/// moment it lands, so one slow catalog no longer holds back the rest (with
+/// AIOMetadata wrapped inside AIOStreams, every catalog belongs to one addon).
 ///
-/// Returns the addon's search-capable catalog groups in manifest order. An
-/// empty Vec means: addon has no search-capable catalogs OR every catalog
-/// returned zero items OR the manifest fetch failed (the warn devlog
-/// captures the failure cause). Callers can treat empty as "this addon
-/// contributed nothing" without distinguishing the underlying cause.
+/// An empty Vec means: addon has no search-capable catalogs OR every catalog
+/// answered with zero items OR failed. A catalog that failed (no answer,
+/// HTTP error, bad JSON, still rate limited after its retry) is reported
+/// through `on_progress` with `failed: true`; one that answered with nothing
+/// has `failed: false`. A manifest that cannot be read fails the whole call
+/// ("Addon did not answer"), so the view can offer a retry for the addon.
+///
+/// `only` (the Search view's per-catalog Retry) asks that ONE catalog, paced
+/// exactly like a full search; no plan is sent, and the call fails when the
+/// catalog fails, so the returned value alone tells empty from failed.
+/// Error strings never carry a url.
 #[tauri::command]
 pub async fn search_addon_grouped(
     addon: AddonEntry,
     query: String,
+    on_progress: tauri::ipc::Channel<SearchProgress>,
+    only: Option<SearchOnly>,
 ) -> Result<Vec<SearchGroup>, String> {
+    use futures_util::StreamExt;
+
     let query = query.trim().to_string();
     if query.is_empty() || !addon.has_search {
         return Ok(vec![]);
@@ -3709,78 +3855,182 @@ pub async fn search_addon_grouped(
     let base = normalise_addon_base(&addon.url);
     let Ok((wire, _)) = fetch_manifest(&base).await else {
         crate::devlog!(warn, "search", "[{}] manifest fetch failed", addon.name);
-        return Ok(vec![]);
+        return Err("Addon did not answer".to_string());
     };
     let addon_name_str = wire.name.clone();
 
-    let mut out: Vec<SearchGroup> = Vec::new();
-    for c in wire.catalogs.iter() {
-        let supports_search = c.extra.iter().any(|ex| {
-            ex.get("name").and_then(|v| v.as_str()) == Some("search")
-        });
-        if !supports_search { continue; }
+    let plan: Vec<SearchCatalogPlan> = wire
+        .catalogs
+        .iter()
+        .filter(|c| c.extra.iter().any(|ex| ex.get("name").and_then(|v| v.as_str()) == Some("search")))
+        .enumerate()
+        .map(|(order, c)| SearchCatalogPlan {
+            order,
+            addon_url:    base.clone(),
+            catalog_id:   c.id.clone(),
+            catalog_name: c
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("{} · {}", title_case(&c.media_type), c.id)),
+            media_type:   c.media_type.clone(),
+        })
+        .collect();
+    // A send fails only when the page that asked is gone; the search still
+    // completes for the returned value.
+    let send = |msg: SearchProgress| { let _ = on_progress.send(msg); };
+    // A retry asks one catalog. Its order stays the catalog's place in the
+    // full plan, so the view can match it to the row it holds.
+    let asked: Vec<SearchCatalogPlan> = match &only {
+        Some(o) => {
+            let one: Vec<SearchCatalogPlan> = plan
+                .iter()
+                .filter(|p| p.media_type == o.media_type && p.catalog_id == o.catalog_id)
+                .take(1)
+                .cloned()
+                .collect();
+            if one.is_empty() {
+                crate::devlog!(warn, "search", "[{}] retry: {}/{} is no longer a search catalog", addon_name_str, o.media_type, o.catalog_id);
+                return Err("Catalog not found".to_string());
+            }
+            one
+        }
+        None => {
+            send(SearchProgress::Plan { catalogs: plan.clone() });
+            plan.clone()
+        }
+    };
 
+    let fetches = asked.into_iter().map(|p| {
         let url = format!(
             "{base}/catalog/{ty}/{id}/search={encoded}.json",
-            ty = c.media_type,
-            id = c.id,
+            ty = p.media_type,
+            id = p.catalog_id,
         );
-        crate::devlog!(info, "search", "[{}] GET {}", addon_name_str, redact_sensitive_url(&url));
-        let items: Vec<MetaPreview> = match client().get(&url).send().await {
-            Ok(resp) => {
-                if !resp.status().is_success() {
-                    crate::devlog!(
-                        warn, "search",
-                        "[{}] {}/{} → HTTP {}",
-                        addon_name_str, c.media_type, c.id, resp.status().as_u16(),
-                    );
-                    continue;
-                }
-                match resp.json::<CatalogResponse>().await {
-                    Ok(cr) => {
-                        let (metas, _, _) = parse_meta_array(cr.metas);
-                        metas.into_iter().map(sanitize_meta).collect()
-                    }
-                    Err(e) => {
-                        crate::devlog!(
-                            warn, "search",
-                            "[{}] {}/{} JSON parse failed ({})",
-                            addon_name_str, c.media_type, c.id, reqwest_err_for_log(&e),
-                        );
-                        continue;
-                    }
-                }
+        let name = addon_name_str.clone();
+        async move {
+            let result = search_one_catalog(&name, &p.addon_url, &url, &p.media_type, &p.catalog_id).await;
+            (p, result)
+        }
+    });
+    let mut stream = futures_util::stream::iter(fetches).buffer_unordered(SEARCH_CATALOG_CONCURRENCY);
+    let mut landed: Vec<Option<SearchGroup>> = vec![None; plan.len()];
+    let mut any_failed = false;
+    while let Some((p, result)) = stream.next().await {
+        let failed = result.is_err();
+        any_failed |= failed;
+        let items = result.unwrap_or_default();
+        let group = (!items.is_empty()).then(|| {
+            crate::devlog!(
+                info, "search",
+                "[{}] {} → {} item(s)",
+                addon_name_str, p.catalog_name, items.len(),
+            );
+            SearchGroup {
+                addon_name:   addon_name_str.clone(),
+                addon_url:    p.addon_url.clone(),
+                catalog_id:   p.catalog_id.clone(),
+                catalog_name: p.catalog_name.clone(),
+                media_type:   p.media_type.clone(),
+                items,
             }
+        });
+        send(SearchProgress::Catalog { order: p.order, group: group.clone(), failed });
+        landed[p.order] = group;
+    }
+    if only.is_some() && any_failed {
+        return Err("Catalog did not answer".to_string());
+    }
+    Ok(landed.into_iter().flatten().collect())
+}
+
+/// How long one search catalog may wait for a slot in the host's published
+/// catalog budget (`addon_rate`), and how many times a refusal is tried.
+const SEARCH_RATE_WAIT: Duration = Duration::from_secs(12);
+const SEARCH_RATE_ATTEMPTS: u32 = 2;
+
+/// One search catalog request. Every failure is logged and returned as
+/// `Err` (a short reason for the log, never a url), so the caller reports the
+/// catalog as failed rather than empty; one broken catalog still never fails
+/// the rest of the addon's search.
+///
+/// Paced to the catalog budget the host publishes (`addon_rate`, key
+/// "catalog"): `SEARCH_CATALOG_CONCURRENCY` caps requests in flight, not per
+/// window, and a search abandoned for a corrected query keeps running, so a
+/// few quick searches against upstream AIOStreams' 30 per 5 s could go over
+/// it. Over the budget AIOStreams answers HTTP 200 with an error item, which
+/// would otherwise read as an empty catalog; it is retried once after the
+/// reset, and fails the catalog when it is refused again.
+async fn search_one_catalog(addon_name: &str, base: &str, url: &str, media_type: &str, catalog_id: &str) -> Result<Vec<MetaPreview>, &'static str> {
+    let rate_key = crate::addon_rate::key("catalog", base);
+    let deadline = Instant::now() + SEARCH_RATE_WAIT;
+    let mut attempt = 0u32;
+    let raw: Vec<serde_json::Value> = loop {
+        attempt += 1;
+        if let Err(wait) = crate::addon_rate::acquire(&rate_key, deadline).await {
+            crate::devlog!(
+                warn, "search", "[{}] {}/{} rate limited: the next slot is {} ms away, giving up",
+                addon_name, media_type, catalog_id, wait.as_millis(),
+            );
+            return Err("rate limited");
+        }
+        crate::devlog!(info, "search", "[{}] GET {}", addon_name, redact_sensitive_url(url));
+        let resp = match client().get(url).send().await {
+            Ok(resp) => resp,
+            Err(e) => {
+                crate::devlog!(warn, "search", "[{}] {}/{} {}", addon_name, media_type, catalog_id, reqwest_err_for_log(&e));
+                return Err("no answer");
+            }
+        };
+        let headers = resp.headers().clone();
+        let status = resp.status();
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            crate::addon_rate::record(&rate_key, &headers, true);
+            if attempt < SEARCH_RATE_ATTEMPTS { continue; }
+        }
+        if !status.is_success() {
+            crate::devlog!(
+                warn, "search",
+                "[{}] {}/{} → HTTP {}",
+                addon_name, media_type, catalog_id, status.as_u16(),
+            );
+            return Err("http error");
+        }
+        let cr = match resp.json::<CatalogResponse>().await {
+            Ok(cr) => cr,
             Err(e) => {
                 crate::devlog!(
                     warn, "search",
-                    "[{}] {}/{} {}",
-                    addon_name_str, c.media_type, c.id, reqwest_err_for_log(&e),
+                    "[{}] {}/{} JSON parse failed ({})",
+                    addon_name, media_type, catalog_id, reqwest_err_for_log(&e),
                 );
-                continue;
+                return Err("bad json");
             }
         };
-        if items.is_empty() { continue; }
-
-        let display_name = c
-            .name
-            .clone()
-            .unwrap_or_else(|| format!("{} · {}", title_case(&c.media_type), c.id));
-        crate::devlog!(
-            info, "search",
-            "[{}] {} → {} item(s)",
-            addon_name_str, display_name, items.len(),
-        );
-        out.push(SearchGroup {
-            addon_name:   addon_name_str.clone(),
-            addon_url:    base.clone(),
-            catalog_id:   c.id.clone(),
-            catalog_name: display_name,
-            media_type:   c.media_type.clone(),
-            items,
-        });
+        // A host with budget left (Remaining > 0) did not refuse: that item is
+        // a wrapped addon's own rate limit, relayed, and is dropped like any
+        // other error item rather than retried.
+        let refused = crate::addon_rate::published_remaining(&headers).map_or(true, |r| r == 0)
+            && cr.metas.iter().any(|m| {
+                is_addon_error_item(m)
+                    && crate::addon_rate::is_rate_limit_text(m.get("description").and_then(|v| v.as_str()).unwrap_or(""))
+            });
+        crate::addon_rate::record(&rate_key, &headers, refused);
+        if refused && attempt < SEARCH_RATE_ATTEMPTS {
+            crate::devlog!(info, "search", "[{}] {}/{} rate limited, retrying after the reset", addon_name, media_type, catalog_id);
+            continue;
+        }
+        if refused {
+            crate::devlog!(warn, "search", "[{}] {}/{} rate limited twice, reporting the catalog as failed", addon_name, media_type, catalog_id);
+            return Err("rate limited");
+        }
+        break cr.metas;
+    };
+    let (metas, _, errors) = parse_meta_array(raw);
+    let addon_errors = errors.iter().filter(|e| e.as_str() == ADDON_ERROR_ITEM).count();
+    if addon_errors > 0 {
+        crate::devlog!(warn, "search", "[{}] {}/{} answered with {} addon error item(s)", addon_name, media_type, catalog_id, addon_errors);
     }
-    Ok(out)
+    Ok(metas.into_iter().map(sanitize_meta).collect())
 }
 
 /// Expanded search — re-fetch a SINGLE search catalog with a `skip`
@@ -3814,14 +4064,21 @@ pub async fn fetch_search_catalog_expanded(
         .get(&url)
         .send()
         .await
-        .map_err(|e| format!("{}: {e}", describe_reqwest_err(&e)))?;
+        .map_err(|e| {
+            crate::devlog!(warn, "search", "[expand] {}", reqwest_err_for_log(&e));
+            // Never `{e}`: its Display appends the full (tokenized) url.
+            describe_reqwest_err(&e).to_string()
+        })?;
     if !resp.status().is_success() {
         return Err(format!("HTTP {}", resp.status().as_u16()));
     }
     let cr = resp
         .json::<CatalogResponse>()
         .await
-        .map_err(|e| format!("JSON parse failed: {e}"))?;
+        .map_err(|e| {
+            crate::devlog!(warn, "search", "[expand] JSON parse failed ({})", reqwest_err_for_log(&e));
+            "JSON parse failed".to_string()
+        })?;
     let (metas, _, _) = parse_meta_array(cr.metas);
     let items: Vec<MetaPreview> = metas.into_iter().map(sanitize_meta).collect();
     crate::devlog!(info, "search", "[expand] {} → {} item(s)", redact_sensitive_url(&url), items.len());
@@ -3980,12 +4237,12 @@ pub async fn cloud_add_addon(
         .get(format!("{base}/manifest.json"))
         .send()
         .await
-        .map_err(|e| format!("Manifest fetch failed: {e}"))?
+        .map_err(|e| format!("Manifest fetch failed: {}", reqwest_err_for_log(&e)))?
         .error_for_status()
-        .map_err(|e| format!("Manifest HTTP error: {e}"))?
+        .map_err(|e| format!("Manifest HTTP error: {}", e.status().map(|s| s.as_u16().to_string()).unwrap_or_default()))?
         .json()
         .await
-        .map_err(|e| format!("Manifest parse error: {e}"))?;
+        .map_err(|e| format!("Manifest parse error: {}", reqwest_err_for_log(&e)))?;
 
     // The entry goes into the collection verbatim, where one manifest
     // stremio-core cannot parse fails the official apps' whole addon pull.
@@ -4025,6 +4282,7 @@ pub async fn cloud_add_addon(
     let id_prefixes = extract_manifest_id_prefixes(&manifest_json);
     let (stream_types, stream_id_prefixes) = extract_stream_resource_info(&manifest_json);
     let configurable = extract_manifest_configurable(&manifest_json);
+    let (wrapped, landscape_art) = crate::addons::wrapped_from_hints(manifest_json.get("behaviorHints"));
 
     Ok(AddonEntry {
         url: base,
@@ -4037,6 +4295,8 @@ pub async fn cloud_add_addon(
         id_prefixes,
         stream_id_prefixes,
         configurable,
+        wrapped,
+        landscape_art,
     })
 }
 
@@ -4288,6 +4548,15 @@ fn reorder_collection(
 // Commands — meta detail (Phase 3 Task B)
 // ---------------------------------------------------------------------------
 
+/// How long one meta fetch may wait for a rate-limited host's budget, all
+/// attempts together. Long enough for a few 5 s windows (a Calendar visit
+/// queues dozens of titles behind one), short enough that a page waiting on
+/// a single title still hears back.
+const META_RATE_WAIT: Duration = Duration::from_secs(30);
+/// Requests one meta fetch makes at most when the host refuses for its rate
+/// limit.
+const META_RATE_ATTEMPTS: u32 = 3;
+
 /// Fetch the full meta object for a single id from a specific addon.
 /// Which addon to ask is decided on the frontend (`electMetaAddons` in
 /// `src/addonElection.ts`); this command only fetches and maps.
@@ -4320,33 +4589,92 @@ pub async fn fetch_meta_detail(
         addon_name.clone()
     };
 
-    crate::devlog!(info, "meta", "[{}] GET {}", label, redact_sensitive_url(&url));
-
-    let json: serde_json::Value = client()
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| {
+    // Paced to the budget the host publishes (`addon_rate`): AIOStreams
+    // allows 15 metas per 5 s per IP by default and turns the rest away with
+    // an error item, which the Calendar's fan-out over the library hit for
+    // most titles. A refusal is retried after the reset, within META_RATE_WAIT.
+    let rate_key = crate::addon_rate::key("meta", &base);
+    let rate_deadline = Instant::now() + META_RATE_WAIT;
+    let mut attempt = 0u32;
+    let (json, refused): (serde_json::Value, bool) = loop {
+        attempt += 1;
+        if let Err(wait) = crate::addon_rate::acquire(&rate_key, rate_deadline).await {
+            crate::devlog!(
+                warn, "meta", "[{}] {}/{} rate limited: the next slot is {} ms away, giving up",
+                label, media_type, id, wait.as_millis(),
+            );
+            return Err("Meta rate limited".to_string());
+        }
+        crate::devlog!(info, "meta", "[{}] GET {}", label, redact_sensitive_url(&url));
+        let resp = client().get(&url).send().await.map_err(|e| {
             let cat = describe_reqwest_err(&e);
             crate::devlog!(warn, "meta", "[{}] {}/{} {}", label, media_type, id, reqwest_err_for_log(&e));
-            format!("Meta fetch {cat}: {e}")
-        })?
-        .error_for_status()
-        .map_err(|e| {
-            crate::devlog!(warn, "meta", "[{}] HTTP {:?}", label, e.status());
-            format!("Meta HTTP error: {e}")
-        })?
-        .json()
-        .await
-        .map_err(|e| {
-            crate::devlog!(warn, "meta", "[{}] {}/{} JSON parse error ({})", label, media_type, id, reqwest_err_for_log(&e));
-            format!("Meta parse error: {e}")
+            // Never `{e}`: reqwest's Display appends the full (tokenized)
+            // url, and this string is shown on screen.
+            format!("Meta fetch {cat}")
         })?;
+        let headers = resp.headers().clone();
+        if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            crate::addon_rate::record(&rate_key, &headers, true);
+            if attempt < META_RATE_ATTEMPTS {
+                crate::devlog!(info, "meta", "[{}] {}/{} HTTP 429, retrying after the reset", label, media_type, id);
+                continue;
+            }
+        }
+        let json: serde_json::Value = resp
+            .error_for_status()
+            .map_err(|e| {
+                crate::devlog!(warn, "meta", "[{}] HTTP {:?}", label, e.status());
+                format!("Meta HTTP error: {}", e.status().map(|s| s.as_u16().to_string()).unwrap_or_default())
+            })?
+            .json()
+            .await
+            .map_err(|e| {
+                crate::devlog!(warn, "meta", "[{}] {}/{} JSON parse error ({})", label, media_type, id, reqwest_err_for_log(&e));
+                "Meta parse error".to_string()
+            })?;
+        // The HOST refused only when its own budget is spent (Remaining 0) or
+        // it published none: AIOStreams relays a wrapped addon's own rate
+        // limit with the same error item while its budget is still open, and
+        // that must neither empty the shared bucket nor be retried.
+        let refused = crate::addon_rate::published_remaining(&headers).map_or(true, |r| r == 0)
+            && json.get("meta").is_some_and(|m| {
+                is_addon_error_item(m)
+                    && crate::addon_rate::is_rate_limit_text(
+                        m.get("description").and_then(|v| v.as_str()).unwrap_or(""),
+                    )
+            });
+        crate::addon_rate::record(&rate_key, &headers, refused);
+        if refused && attempt < META_RATE_ATTEMPTS {
+            crate::devlog!(info, "meta", "[{}] {}/{} rate limited, retrying after the reset", label, media_type, id);
+            continue;
+        }
+        break (json, refused);
+    };
+    if refused {
+        crate::devlog!(
+            warn, "meta", "[{}] {}/{} rate limited on every attempt, giving up",
+            label, media_type, id,
+        );
+        return Err("Meta rate limited".to_string());
+    }
 
     let meta = json.get("meta").ok_or_else(|| {
         crate::devlog!(warn, "meta", "[{}] response missing `meta` key", label);
         "Meta missing in response".to_string()
     })?;
+    // AIOStreams answers a wrapped addon's failure (a timeout, an HTTP error,
+    // or its plain "not found") with HTTP 200 and a pseudo-meta named
+    // "[❌] <addon>". It has a name, so taken as a meta it would be cached as
+    // the title (7 days for a movie) and overwrite a good cached copy.
+    if is_addon_error_item(meta) {
+        let why = meta.get("description").and_then(|v| v.as_str()).unwrap_or("");
+        crate::devlog!(
+            warn, "meta", "[{}] {}/{} addon error meta: {}",
+            label, media_type, id, redact_urls_in_text(&why.chars().take(200).collect::<String>()),
+        );
+        return Err("Meta addon error".to_string());
+    }
 
     // ── Mapping summary ────────────────────────────────────────────────
     // Surfacing what we resolved from this addon's meta blob makes it
@@ -5148,6 +5476,10 @@ fn extract_embedded_streams(
         .filter_map(|s| sanitize_stream(s, addon_name))
         .filter(|s| s.url.is_some())
         .filter(|s| seen.insert(stream_dedup_key(s)))
+        // No read time: an embedded url is re-read through its META (the
+        // detail page's TTL_EMBEDDED_STREAMS_MS, advanceToEpisode), and the
+        // stream-addon fan-out the play-time re-read uses never offers it.
+        .map(|mut s| { s.resolved_at_ms = 0; s })
         .collect();
     let cut = streams.len() > budget;
     streams.truncate(budget);
@@ -6407,6 +6739,10 @@ fn sanitize_stream(s: &serde_json::Value, addon_name: &str) -> Option<StreamEntr
         video_size,
         early_release,
         facts: stream_facts(s.get("streamData")),
+        resolved_at_ms: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0),
     })
 }
 
@@ -6986,6 +7322,8 @@ mod tests {
             id_prefixes: own(id_prefixes),
             stream_id_prefixes: Vec::new(),
             configurable: false,
+            wrapped: Vec::new(),
+            landscape_art: false,
         }
     }
 
@@ -7493,6 +7831,48 @@ mod tests {
         let out = redact_sensitive_url(&deep);
         assert!(out.starts_with("https://a/?d=<redacted>"), "{}", &out[..40.min(out.len())]);
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    /// Hidden from home: a required non-search extra with no options, or the
+    /// lone "None" sentinel (what AIOMetadata emits, and all that survives
+    /// inside AIOStreams). A real option list stays home-eligible.
+    #[test]
+    fn hidden_from_home_rule() {
+        let ex = |v: serde_json::Value| vec![v];
+        use serde_json::json;
+        assert!(catalog_is_hidden_from_home(&ex(json!({"name": "genre", "isRequired": true, "options": ["None"]}))));
+        assert!(catalog_is_hidden_from_home(&ex(json!({"name": "genre", "isRequired": true, "options": ["none "]}))));
+        assert!(catalog_is_hidden_from_home(&ex(json!({"name": "genre", "isRequired": true, "options": []}))));
+        assert!(catalog_is_hidden_from_home(&ex(json!({"name": "calendarVideosIds", "isRequired": true}))));
+        assert!(!catalog_is_hidden_from_home(&ex(json!({"name": "genre", "isRequired": true, "options": ["Action"]}))));
+        assert!(!catalog_is_hidden_from_home(&ex(json!({"name": "genre", "isRequired": true, "options": ["None", "Action"]}))));
+        assert!(!catalog_is_hidden_from_home(&ex(json!({"name": "genre", "options": ["None"]}))));
+        assert!(!catalog_is_hidden_from_home(&ex(json!({"name": "search", "isRequired": true}))));
+        assert!(!catalog_is_hidden_from_home(&[]));
+    }
+
+    /// AIOStreams' error pseudo-meta is never a title: not a meta, not a
+    /// catalog item. Ordinary ids (even ones mentioning it later) pass.
+    #[test]
+    fn aiostreams_error_items_are_not_titles() {
+        let err = serde_json::json!({
+            "id": "aiostreamserror.%7B%22title%22%3A%22x%22%7D", "type": "movie",
+            "name": "[\u{274c}] AIOMetadata", "description": "Request timed out"
+        });
+        assert!(is_addon_error_item(&err));
+        assert!(is_addon_error_item(&serde_json::json!({"id": "AIOStreamsError.x"})));
+        assert!(!is_addon_error_item(&serde_json::json!({"id": "tt0434665", "name": "Bleach"})));
+        assert!(!is_addon_error_item(&serde_json::json!({"id": "kitsu:aiostreamserror."})));
+        assert!(!is_addon_error_item(&serde_json::json!({"id": "aiostreams"})));
+        assert!(!is_addon_error_item(&serde_json::json!({"name": "no id"})));
+        let (kept, dropped, errors) = parse_meta_array(vec![
+            err,
+            serde_json::json!({"id": "tt0434665", "type": "series", "name": "Bleach"}),
+        ]);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].id, "tt0434665");
+        assert_eq!(dropped, 1);
+        assert_eq!(errors, vec!["addon error item".to_string()]);
     }
 
     /// libmpv's own lines are prose around a URL. Only the URL changes, the

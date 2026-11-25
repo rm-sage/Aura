@@ -1,7 +1,7 @@
 // Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactElement } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactElement } from "react";
 import { createPortal, flushSync } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import type {
@@ -147,15 +147,31 @@ import Tooltip from "../Tooltip";
 import { BrandLogo, ratingDomain, groupRatingsByBrand } from "../logodev";
 import { hasUsableRating } from "../ratingValue";
 import ArcGrid, { ArcGridSkeleton } from "../ArcGrid";
+import { useListDroplet } from "../glassListDroplet";
 import {
   arcChapterRange, derivedRange, episodeChapterHint, formatRange, hasMangaData, isLastRealArc,
   mangaEligible, mangaFact, useArcChapterRanges, useEpisodeChapters, useMangaSeries, useMangaState,
 } from "../mangaChapters";
 import GroupingToggle from "../EpisodeGroupingToggle";
+import { ToggleSwitch } from "../settingsControls";
+import { useWindowHidden } from "../windowVisibility";
+import { isStaleStreamUrl, linkRefreshKey, type LinkRefreshPending } from "../streamFreshness";
 import {
   absoluteEpisodeMap, arcArtFor, arcPositionOf, arcResultIsInterim, arcsLikelyAvailable, arcYearRange, absoluteEpisodeHint, formatAbsoluteEpisode, loadArcMode, peekCachedArcs, preferredGroupingId, saveArcMode, stripArcKindSuffix, useStoryArcs,
   type EpisodeGrouping, type StoryArc,
 } from "../storyArcs";
+
+/** Exit fade length (ms). Shorter than the 320 ms enter on purpose: leaving
+ *  should feel quicker than arriving. App keeps the closing instance mounted
+ *  for this long (plus a small margin) so it can fade over the page beneath. */
+export const DETAIL_EXIT_MS = 220;
+
+/** True when the user asked for reduced motion (OS or the Settings override):
+ *  `<html data-reduced-motion>` is stamped by `applyReducedMotionAttribute`.
+ *  House rule: keep the fade, drop travel and scale. */
+function reducedMotionOn(): boolean {
+  return document.documentElement.dataset.reducedMotion === "true";
+}
 
 // ---------------------------------------------------------------------------
 // DetailView — full-bleed cinematic detail page with a "Command Center" feel.
@@ -188,6 +204,9 @@ interface Props {
       id: string;
       media_type: string;
       name: string;
+      /** The title logo the hero shows (the latched hero art), so the
+       *  player's buffering overlay uses the SAME logo. */
+      logo?: string | null;
       episode?: string;
       episode_title?: string;
       /** AIOMetadata-sourced inputs for the audio scoring algorithm.
@@ -201,6 +220,10 @@ interface Props {
       };
     },
   ) => void;
+  /** The play re-reading an old stream link right now (App's handlePlayStream),
+   *  or null. The matching stream row shows it is working and takes no clicks
+   *  until the re-read ends. */
+  linkRefresh?: LinkRefreshPending | null;
   /** Watch-party: the leader's chosen stream match-key — highlights the
    *  matching row so a member can one-tap the same stream. */
   partyStreamKey?: string | null;
@@ -277,6 +300,10 @@ interface Props {
    *  the initial mount effect runs). Lets the parent clear the hint
    *  so a later open from an unrelated card doesn't inherit it. */
   onConsumeOpenInStreamsMode?: () => void;
+  /** True while the page is leaving: App keeps this same instance mounted for
+   *  DETAIL_EXIT_MS so it can fade out over the page it returns to. Inert and
+   *  click-through for that time. */
+  closing?: boolean;
 }
 
 const CloseIcon = () => (
@@ -750,6 +777,16 @@ function ProgressBlock({
     // Season 0 is specials, which are not part of "have I finished this".
     const main = videos.filter((v) => (v.season ?? 1) > 0);
     if (main.length === 0) return null;
+    // The saved resume episode reads "In progress" here too, as on the
+    // Continue Watching bar (CinemaRows `resumeActive`: offset > 0 and under
+    // 95%; with no duration the ratio is unknown and it counts as started).
+    // The ratio cancels the unit, as long as both fields share one.
+    const root = byId.get(seriesId)?.state;
+    const off = Number(root?.timeOffset) || 0;
+    const dur = Number(root?.duration) || 0;
+    const resumeId = off > 0 && (dur <= 0 || off / dur < 0.95)
+      && typeof root?.video_id === "string" && root.video_id.length > 0
+      ? root.video_id : null;
     // Per-episode states, in order, so the bar can be drawn as SEGMENTS rather
     // than a single fill. That is what makes it match the Continue Watching
     // tile: the same show reads the same way in both places, and a skipped run
@@ -763,7 +800,7 @@ function ProgressBlock({
       // describe the same episode with the same word.
       const kind = isSkipped(v.id) ? ("skipped" as const)
         : isEpisodeWatched(byId, v.id) ? ("watched" as const)
-        : getManualWatchedState(v.id) === "in-progress" ? ("in-progress" as const)
+        : getManualWatchedState(v.id) === "in-progress" || v.id === resumeId ? ("in-progress" as const)
         : isVideoAired(v) ? ("available" as const)
         : ("unaired" as const);
       return { kind, video: v };
@@ -854,7 +891,7 @@ function HudSectionLabel({ children }: { children: React.ReactNode }) {
   );
 }
 
-function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPlayStream, onSearchByName, inLibrary, onLibraryToggle, onQueueToggle, onPlayTrailer, trailerLaunchingId, trailerDepProgress, addonsSettled = true, libraryLoaded = true, openOnEpisodeId, onConsumeOpenHint, highlightEpisodeId, onConsumeHighlight, ignoreResumeHint, openInStreamsMode, onConsumeOpenInStreamsMode }: Props) {
+function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPlayStream, linkRefresh, onSearchByName, inLibrary, onLibraryToggle, onQueueToggle, onPlayTrailer, trailerLaunchingId, trailerDepProgress, addonsSettled = true, libraryLoaded = true, openOnEpisodeId, onConsumeOpenHint, highlightEpisodeId, onConsumeHighlight, ignoreResumeHint, openInStreamsMode, onConsumeOpenInStreamsMode, closing = false }: Props) {
   const [detail, setDetail]                 = useState<MetaDetail | null>(null);
   // Resume pointer, read BEFORE the latch below because the latch's seed
   // needs it synchronously on the first render to pick the right arc's art.
@@ -932,7 +969,10 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
     returnFocus: HTMLElement | null;
   } | null>(null);
   const closeBackdropPicker = useCallback(() => setBackdropPicker(null), []);
-  const [streams, setStreams]               = useState<StreamEntry[]>([]);
+  // The picker portals to document.body, outside the root that fades on
+  // close, so drop it the moment the page starts leaving.
+  useEffect(() => { if (closing) setBackdropPicker(null); }, [closing]);
+  const [streams, setStreams]              = useState<StreamEntry[]>([]);
   const [streamMeta, setStreamMeta]         = useState<StreamMetadata>({
     errors: [], warnings: [], info: [], stats: [],
   });
@@ -1422,7 +1462,7 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
   // ── Multi-source ratings enrichment ──
   // Hits a Rust aggregator (fetch_aggregate_ratings) that fans out to
   // every available source — MDBList (IMDb / RT / Metacritic / TMDB /
-  // Trakt / Letterboxd by IMDb id) plus Jikan (MyAnimeList score / rank
+  // Letterboxd by IMDb id) plus Jikan (MyAnimeList score / rank
   // / popularity) and AniList (averageScore) for anime.
   // Empty array on failure / no record — never throws.
   //
@@ -1622,7 +1662,12 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
   // Bumped by every run, so a re-read that fails after a later run took over
   // does not end that run's spinner.
   const streamRunRef = useRef(0);
-  const runStreamFetch = useCallback((force = false): (() => void) | void => {
+  // `keepShown` (the stale re-read on window restore): a fresh fan-out that
+  // leaves the rows on screen (the header spins, as over an embedded list's
+  // Refresh) and swaps them only for an answer that has streams. Cleared
+  // first, an offline restore (Wi-Fi not back yet) turned a usable list into
+  // an empty "no streams" panel.
+  const runStreamFetch = useCallback((force = false, keepShown = false): (() => void) | void => {
     let cancelled = false;
     const run = ++streamRunRef.current;
     // `openEpisodeSnapshot` is the explicitly-requested episode (e.g. a
@@ -1728,10 +1773,12 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
     }
 
     setStreamsLoading(true);
-    setStreams([]);
-    setStreamMeta({ errors: [], warnings: [], info: [], stats: [] });
-    // The previous run's answer must not be recorded once this one started.
-    if (!isEpisodic) setMovieCheck(null);
+    if (!keepShown) {
+      setStreams([]);
+      setStreamMeta({ errors: [], warnings: [], info: [], stats: [] });
+      // The previous run's answer must not be recorded once this one started.
+      if (!isEpisodic) setMovieCheck(null);
+    }
 
     // 3-minute in-memory cache — closing and reopening the same
     // episode shouldn't refetch from every addon. Skips both the
@@ -1768,6 +1815,10 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
     }))
       .then((r) => {
         if (superseded()) return;
+        // A background re-read that found nothing (offline, every addon
+        // failing) keeps the rows it was meant to refresh; a click re-reads a
+        // stale pick on its own anyway.
+        if (keepShown && !(Array.isArray(r) ? r : r.streams ?? []).length) return;
         streamCachePut(queryKey, r);
         // Streams for an episode listed as not yet aired: it has (availableEarly.ts).
         if (isEpisodic) {
@@ -1807,6 +1858,27 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
     window.addEventListener("aura:streams-refresh", onRefresh);
     return () => window.removeEventListener("aura:streams-refresh", onRefresh);
   }, [runStreamFetch]);
+
+  // A list shown across a long hide (the tray, a minimize) is read again when
+  // the window comes back, if its links are past STREAM_URL_MAX_AGE_MS: nothing
+  // else re-runs the fetch while the page stays mounted, and an old addon url
+  // can serve two different files (streamFreshness.ts). Playback re-reads a
+  // stale pick on its own too; this only spares the click that wait, so the
+  // re-read keeps the shown rows until fresh ones land. Refs, so the effect
+  // runs on the visibility edge alone.
+  const windowHidden = useWindowHidden();
+  const staleCheckRef = useRef({ streams, streamsLoading, runStreamFetch });
+  staleCheckRef.current = { streams, streamsLoading, runStreamFetch };
+  useEffect(() => {
+    if (windowHidden) return;
+    const { streams: shown, streamsLoading: loading, runStreamFetch: run } = staleCheckRef.current;
+    if (loading) return;
+    const now = Date.now();
+    if (shown.some((s) => isStaleStreamUrl(s, now))) {
+      console.info("[streams] the stream list is past its link age - reading it again");
+      run(true, true);
+    }
+  }, [windowHidden]);
 
   // When `detail.videos` arrives AND the user has a resume target AND no
   // active episode yet, snap the active episode to the resume one. This
@@ -1899,10 +1971,10 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
   // An opaque image fills the hero: the backdrop has decoded and is revealed
   // (not merely "ready" because it failed), or a crossfade's outgoing image,
   // which is fully opaque unless it is the image that failed, is still
-  // mounted. The ambient base under it is then invisible, so its drift is
-  // frozen (.is-covered in App.css): left running, it repainted a blurred
-  // full-viewport layer every display frame for the whole time a detail page
-  // was open.
+  // mounted. The ambient base under it is then invisible. `.is-covered` is
+  // inert now: the base is static (App.css .detail-backdrop-skeleton), so
+  // there is no drift to freeze. The class stays as a hook for any future
+  // paint-heavy layer under the hero.
   const heroCovered =
     (bgUnderlay !== null && bgUnderlay !== bgFailedSrc) ||
     (heroArt !== null && revealed && bgReady && bgFailedSrc !== heroArt);
@@ -2130,6 +2202,11 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
     series_id:  isEpisodic ? meta.id : (video?.id ?? meta.id),
     media_type: meta.media_type,
     name:       detail?.name ?? meta.name,
+    // The logo the hero is showing. Without it App fell back to the CATALOG
+    // preview's `logo` (selectedMeta), which many catalog rows do not carry
+    // even when the meta detail does, so the buffering overlay showed the
+    // text title for a film whose detail page showed a logo (The Odyssey).
+    logo:       heroArtLatch?.logo ?? detail?.logo ?? meta.logo ?? null,
     // AIOMetadata-supplied scoring inputs — drives the Original Language
     // Audio algorithm in PlayerOverlay. Falls back through genres /
     // country when the structured fields aren't populated (e.g. when
@@ -2146,8 +2223,8 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
         : undefined)
       : undefined,
     episode_title: video?.title ?? undefined,
-    // Numeric pass-through for scrobble.rs's dual-numbering Trakt
-    // payload. The picker's VideoEntry numbers are authoritative —
+    // Numeric pass-through for scrobble.rs's dual-numbering
+    // payloads. The picker's VideoEntry numbers are authoritative:
     // they're what the user selected and what the toast displays.
     season:      video?.season ?? undefined,
     episode_num: video?.episode ?? undefined,
@@ -2159,9 +2236,16 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
     setPanelMode("streams");
   };
 
+  // Reduced motion keeps both fades and drops the card zoom and the exit
+  // scale (house rule: fades stay, travel and scale go).
+  const reduceMotion = reducedMotionOn();
+  const restTransform = "translate3d(0,0,0) scale(1)";
+
   return (
     <div
       className="fixed left-0 right-0 bottom-0 z-[60] overflow-hidden"
+      inert={closing || undefined}
+      aria-hidden={closing || undefined}
       onContextMenu={onHeroContextMenu}
       onTransitionEnd={(e) => {
         // Only the transform settle matters for badge anchoring (the
@@ -2178,9 +2262,18 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
         // can still drag / minimise / close the window while a detail page
         // is open. The title bar is `h-9` (36 px).
         top: 36,
-        opacity:        opening ? 0 : 1,
-        transform:      opening ? openTransform : "translate3d(0,0,0) scale(1)",
-        transition:     "opacity 320ms ease-out, transform 380ms cubic-bezier(0.2, 0.8, 0.2, 1)",
+        opacity:        opening || closing ? 0 : 1,
+        // The exit never zooms back into the card rect: that card may have
+        // been scrolled away or windowed out by useRowWindow by now.
+        transform:      opening
+                          ? (reduceMotion ? restTransform : openTransform)
+                          : closing && !reduceMotion
+                            ? "translate3d(0,0,0) scale(0.985)"
+                            : restTransform,
+        pointerEvents:  closing ? "none" : undefined,
+        transition:     closing
+                          ? `opacity ${DETAIL_EXIT_MS}ms cubic-bezier(0.4, 0, 1, 1), transform ${DETAIL_EXIT_MS}ms cubic-bezier(0.4, 0, 1, 1)`
+                          : "opacity 320ms ease-out, transform 380ms cubic-bezier(0.2, 0.8, 0.2, 1)",
         transformOrigin: "center center",
       }}
     >
@@ -2266,7 +2359,9 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
         <button
           onClick={onClose}
           aria-label="Back"
-          className="aura-float-glass aura-nav-back pointer-events-auto flex items-center
+          // The page scrolls under Back / Close: Liquid's solid base (App.css).
+          data-glass-base=""
+          className="aura-float-glass aura-glass-control aura-nav-back pointer-events-auto flex items-center
                      gap-2 px-3 h-9 rounded-full
                      text-white/85 hover:text-white text-xs font-medium tracking-wide"
         >
@@ -2275,7 +2370,8 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
         <button
           onClick={onClose}
           aria-label="Close"
-          className="aura-float-glass aura-nav-close pointer-events-auto w-9 h-9 rounded-full
+          data-glass-base=""
+          className="aura-float-glass aura-glass-control aura-nav-close pointer-events-auto w-9 h-9 rounded-full
                      flex items-center justify-center text-white/85 hover:text-white"
         >
           <span className="aura-nav-close-glyph flex"><CloseIcon /></span>
@@ -2369,12 +2465,16 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
                   detail's originalLanguage + productionCountries, which
                   catches IMDb-id'd anime films that lack mal/kitsu/
                   anidb anchors (Chainsaw Man, Jujutsu Kaisen, etc.). */}
+              {/* Real frost on the key art (glass-cards.css `.aura-frost`, two
+                  or three per page, bounded), glass-detail.css radius. */}
               {isAnimeDetail && (
-                <span className="px-2.5 py-1 rounded-sm bg-pink-500/25 border border-pink-400/40
-                                 text-pink-100 text-[12px] font-semibold backdrop-blur-sm">Anime</span>
+                <span data-glass-light="rim"
+                      className="aura-frost aura-hero-chip is-anime px-2.5 py-1
+                                 text-pink-100 text-[12px] font-semibold">Anime</span>
               )}
-              <span className="px-2.5 py-1 rounded-sm bg-black/35 border border-white/25
-                               text-white/90 text-[12px] font-semibold backdrop-blur-sm">
+              <span data-glass-light="rim"
+                    className="aura-frost aura-hero-chip px-2.5 py-1
+                               text-white/90 text-[12px] font-semibold">
                 {typeLabel(detail?.media_type ?? meta.media_type)}
               </span>
               {(detail?.release_info ?? meta.release_info) && (
@@ -2433,7 +2533,7 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
                 return (
                   <Stat
                     label={`S${String(selectedSeason).padStart(2, "0")} air`}
-                    value={`${fmt(first)} – ${fmt(last)}`}
+                    value={`${fmt(first)} to ${fmt(last)}`}
                   />
                 );
               })()}
@@ -2457,9 +2557,9 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
                   Movies only; hidden until the dates resolve. */}
               {detail && isInTheaters(detail.media_type ?? meta.media_type, releaseDates) && (
                 <span
-                  className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-sm
-                             bg-amber-500/20 border border-amber-400/40 text-amber-100
-                             text-[12px] font-semibold backdrop-blur-sm cursor-help"
+                  data-glass-light="rim"
+                  className="aura-frost aura-hero-chip is-theaters inline-flex items-center gap-1.5 px-2.5 py-1
+                             text-amber-100 text-[12px] font-semibold cursor-help"
                   title={inTheatersHover(releaseDates)}
                 >
                   <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
@@ -2536,12 +2636,13 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
                 <button
                   type="button"
                   onClick={(e) => onLibraryToggle({ x: e.clientX, y: e.clientY })}
-                  className={`group/lib flex items-center gap-2 px-4 py-2 rounded-full text-[13px] font-medium
-                              border transition-colors duration-150
-                              ${inLibrary
-                                ? "bg-ln-accent/20 text-ln-accent border-ln-accent/40 hover:bg-rose-500/15 hover:text-rose-200 hover:border-rose-300/40"
-                                : "aura-float-glass text-white/85 hover:text-ln-accent hover:border-ln-accent/40"
-                              }`}
+                  // Floating glass controls (App.css GLASS SYSTEM). In the
+                  // library = SELECTED (is-selected); the hover-to-remove rose
+                  // wash and the hover states are .aura-detail-toggle in
+                  // glass-misc.css, through the glass hooks.
+                  className={`group/lib aura-float-glass aura-glass-control aura-detail-toggle
+                              flex items-center gap-2 px-4 py-2 rounded-full text-[13px] font-medium
+                              ${inLibrary ? "is-selected text-ln-accent" : "text-white/85 hover:text-ln-accent"}`}
                 >
                   {inLibrary ? (
                     <>
@@ -2577,12 +2678,9 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
                   <button
                     type="button"
                     onClick={(e) => onQueueToggle({ x: e.clientX, y: e.clientY })}
-                    className={`group/queue flex items-center gap-2 px-4 py-2 rounded-full text-[13px] font-medium
-                                border transition-colors duration-150
-                                ${inQueue
-                                  ? "bg-ln-accent/20 text-ln-accent border-ln-accent/40 hover:bg-rose-500/15 hover:text-rose-200 hover:border-rose-300/40"
-                                  : "aura-float-glass text-white/85 hover:text-ln-accent hover:border-ln-accent/40"
-                                }`}
+                    className={`group/queue aura-float-glass aura-glass-control aura-detail-toggle
+                                flex items-center gap-2 px-4 py-2 rounded-full text-[13px] font-medium
+                                ${inQueue ? "is-selected text-ln-accent" : "text-white/85 hover:text-ln-accent"}`}
                   >
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
                       <path d="M17 3H7c-1.1 0-2 .9-2 2v16l7-3 7 3V5c0-1.1-.9-2-2-2z" />
@@ -2615,12 +2713,9 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
                     type="button"
                     disabled={launching}
                     onClick={() => onPlayTrailer(detail.trailer_yt_id!, detail?.name ?? meta.name)}
-                    className={`flex items-center gap-2 px-4 py-2 rounded-full text-[13px] font-medium
-                               border transition-colors duration-150
-                               aura-float-glass text-white/85
-                               ${launching
-                                 ? "cursor-progress"
-                                 : "hover:bg-ln-accent/20 hover:text-ln-accent hover:border-ln-accent/40"}`}
+                    className={`aura-float-glass aura-glass-control aura-detail-toggle
+                               flex items-center gap-2 px-4 py-2 rounded-full text-[13px] font-medium text-white/85
+                               ${launching ? "cursor-progress" : "hover:text-ln-accent"}`}
                   >
                     {launching ? (
                       <svg className="animate-spin" width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden>
@@ -2944,6 +3039,11 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
               setPanelMode("episodes");
             }}
             onPlay={(s) => onPlayStream(s, targetForPlay(activeVideo))}
+            // The source key of the row whose old link App is re-reading, when
+            // that re-read is for the episode (or film) these streams are for.
+            refreshingKey={linkRefresh && linkRefresh.targetId === targetForPlay(activeVideo).id
+              ? linkRefresh.key
+              : null}
             addons={addons}
             addonsPending={addonsPending}
             onLeave={onClose}
@@ -2995,7 +3095,7 @@ function DetailViewBody({ meta, addons, fromRect, partyStreamKey, onClose, onPla
               that whole overflow chain — the cluster lives in viewport
               coordinates, immune to any ancestor's overflow rules. */}
           {panelMode === "streams" && streams.length > 0 && (
-            <StreamMetaBadges metadata={streamMeta} anchorRef={asideRef} entered={entered} />
+            <StreamMetaBadges metadata={streamMeta} anchorRef={asideRef} entered={entered} closing={closing} />
           )}
         </aside>
       </div>
@@ -3342,7 +3442,7 @@ function SynopsisSection({
       ? `S${String(s).padStart(2, "0")}E${String(e).padStart(2, "0")}`
       : null;
   const title = (activeVideo?.title ?? "").trim();
-  const subLine = isEpisode ? (seCode && title ? `${seCode} — ${title}` : seCode ?? title) : null;
+  const subLine = isEpisode ? (seCode && title ? `${seCode} · ${title}` : seCode ?? title) : null;
 
   const shouldBlur = isEpisode && blurOn && !isWatched && !revealed;
 
@@ -3828,6 +3928,9 @@ interface PanelProps {
   onPickEpisode: (v: VideoEntry) => void;
   onBackToEpisodes: () => void;
   onPlay: (s: StreamEntry) => void;
+  /** `linkRefreshKey` of the row whose old link is being re-read before it
+   *  plays, or null. That row shows it is working and takes no clicks. */
+  refreshingKey?: string | null;
   /** Installed addons, for the streams panel's no-providers warning. */
   addons: AddonEntry[];
   /** `addons` is empty only because no load has finished yet (after a
@@ -3860,7 +3963,7 @@ interface PanelProps {
 
 function UnifiedPanel({
   mode, partyStreamKey, isEpisodic, seriesId, seriesMediaType, videos, activeVideo, streams, streamMeta, streamsLoading, earlyNote,
-  groupedStreams, metaLoading, onPickEpisode, onBackToEpisodes, onPlay, addons, addonsPending, onLeave, menuCtx,
+  groupedStreams, metaLoading, onPickEpisode, onBackToEpisodes, onPlay, refreshingKey, addons, addonsPending, onLeave, menuCtx,
   scrollToVideoId, onScrollHandled, seasonHint, seasonNames, highlightVideoId, seriesArt, detail,
 }: PanelProps) {
   // Absolute-episode annotation for the streams header (e.g. "(E88)" next to
@@ -3876,21 +3979,23 @@ function UnifiedPanel({
   // status icons (rendered with `absolute -top-3 -left-3`) anchor to its
   // top-left edge instead of escaping the entire detail view.
   return (
-    // The panel reads as a defined card: a crisp 1px border (brighter along the
-    // top edge for a lit-from-above feel) plus the elevation shadow — replacing
-    // the old alpha-fade edge mask that left the outer edges undefined. overflow
-    // stays visible so floating status icons can anchor just outside the corner.
+    // Round 11: the notifications sheet's material (the Liquid menu tier,
+    // Frosted in Matte), CSS face only (`data-liquid="off"`: far over the
+    // lens size cap, and it must match the info panel beside it). Its edge is
+    // the glass system's (idle rim, cursor light), never a border utility.
+    // overflow stays visible so floating status icons can anchor just outside
+    // the corner.
     <div
       // Not hero: a right-click in here is never the backdrop menu, even on
       // the panel's own chrome between rows (see HERO_MENU_EXEMPT).
       data-hero-menu-exempt
-      className="aura-hud-surface relative flex flex-col h-full rounded-xl
-                 border-t-white/[0.16]
-                 shadow-[0_24px_48px_-18px_rgba(0,0,0,0.7)]
+      data-liquid="off"
+      data-glass-light="panel"
+      className="aura-float-glass aura-detail-panel relative flex flex-col h-full
                  [overflow:visible]"
     >
       {mode === "episodes" ? (
-        <div className="flex flex-col h-full overflow-hidden rounded-xl">
+        <div className="flex flex-col h-full overflow-hidden rounded-[20px]">
           <EpisodesPanel
             seriesId={seriesId}
             seriesMediaType={seriesMediaType}
@@ -3909,7 +4014,7 @@ function UnifiedPanel({
         </div>
       ) : (
         <>
-          <div className="flex flex-col h-full overflow-hidden rounded-xl">
+          <div className="flex flex-col h-full overflow-hidden rounded-[20px]">
             <StreamsPanel
               isEpisodic={isEpisodic}
               activeVideo={activeVideo}
@@ -3921,6 +4026,7 @@ function UnifiedPanel({
               partyStreamKey={partyStreamKey}
               onBack={isEpisodic ? onBackToEpisodes : undefined}
               onPlay={onPlay}
+              refreshingKey={refreshingKey ?? null}
               addons={addons}
               addonsPending={addonsPending}
               onLeave={onLeave}
@@ -3945,7 +4051,12 @@ function UnifiedPanel({
 // title, overview, and a watched check on the bottom-right of the thumb.
 // ---------------------------------------------------------------------------
 
-const EpisodeRow = ({
+// Memoized: a season can hold 100+ rows, each running several store hooks and
+// an ImageLoader, and every DetailView re-render (ratings, art reveal, library
+// ticks) re-rendered them all. Every prop is a primitive, a stable list or a
+// stable callback (EpisodesPanel's `pickEpisode`); the per-row store hooks
+// still re-render a row on their own changes.
+const EpisodeRow = memo(({
   video, seriesId, seriesMediaType, isActive, onPick, seasonVideos, isNextAiring, isDeepLinked, seriesArt, seriesName, groupLabel = "season", absoluteNumber = null, absoluteTag = "", chapterHint = "",
 }: {
   video: VideoEntry;
@@ -4082,7 +4193,6 @@ const EpisodeRow = ({
           season: v.season,
           episode: v.episode,
           episodeTitle: v.title ?? null,
-          episodeReleased: v.released ?? null,
           poster: seriesArt ?? null,
           background: null,
           anilistId: (v as { anilist_id?: number | null }).anilist_id ?? null,
@@ -4374,14 +4484,16 @@ const EpisodeRow = ({
 
         openContextMenu(x, y, items);
       }}
-      className={`hover-glow w-full text-left flex items-stretch gap-4 px-3 py-3.5 rounded-md
-                  border
-                  ${isActive
-                    ? "bg-ln-accent/15 border-ln-accent/40"
-                    : "border-transparent hover:bg-white/6 border-white/0"}${isDeepLinked ? " ring-2 ring-ln-accent/80" : ""}`}
+      // A content row (round 11): no card, no border, no hover loop. The
+      // list's one droplet is the Liquid hover; the active episode wears the
+      // rail pill's face (its rim lit by the cursor light while selected); a
+      // deep link lands with one accent wash that fades. glass-detail.css.
+      data-glass-light={isActive ? "rim" : undefined}
+      className={`aura-ep-row w-full text-left flex items-stretch gap-4 px-3 py-3.5${
+        isActive ? " is-selected" : ""}${isDeepLinked ? " is-target" : ""}`}
     >
       <div
-        className="relative flex-shrink-0 w-40 rounded overflow-hidden bg-white/5 border border-white/10"
+        className="aura-ep-thumb relative flex-shrink-0 w-40 rounded-md overflow-hidden bg-white/5"
         style={{ aspectRatio: "16 / 9" }}
       >
         {unaired && seriesArt ? (
@@ -4458,7 +4570,7 @@ const EpisodeRow = ({
         {progress?.partial && (
           <div className="absolute inset-x-0 bottom-0 h-[3px] bg-black/55">
             <div
-              className="h-full bg-ln-accent"
+              className="h-full bg-[var(--ln-accent-mark)]"
               style={{ width: `${progress.ratio * 100}%` }}
             />
           </div>
@@ -4473,7 +4585,7 @@ const EpisodeRow = ({
       <div className="flex-1 min-w-0 flex flex-col py-1 justify-center gap-1.5">
         <p className="flex items-baseline gap-3 font-mono text-[14px] tracking-[0.16em] uppercase">
           <span
-            className={`${isActive ? "text-ln-accent" : "text-white/65"}${
+            className={`aura-ep-num text-white/65${
               numberHover
                 ? " underline decoration-dotted decoration-white/30 underline-offset-4 cursor-help"
                 : ""}`}
@@ -4502,8 +4614,21 @@ const EpisodeRow = ({
       </div>
     </button>
   );
-};
+});
 
+
+/** A row's offset inside a scroll list, from the top of its scrolled content.
+ *  Measured from the rects, so it holds whether or not the list is the row's
+ *  offsetParent (the list is `relative` since round 11, for its droplet). */
+function rowOffsetIn(list: HTMLElement, row: HTMLElement): number {
+  // Rects include ancestor transforms, and the page opens under a scale (the
+  // card-to-page grow, or 0.96): the landing runs during it, so the rect delta
+  // is the layout offset times that scale. offsetHeight / rect height undoes
+  // it (translation cancels in the delta).
+  const lr = list.getBoundingClientRect();
+  const k = lr.height > 0 ? list.offsetHeight / lr.height : 1;
+  return (row.getBoundingClientRect().top - lr.top) * k + list.scrollTop;
+}
 
 // ---------------------------------------------------------------------------
 // EpisodesPanel — season dropdown + scrollable episode list.
@@ -4555,11 +4680,10 @@ function EpisodeCountChip({
   /** Tooltip suffix, e.g. "this season". */
   scope?: string;
 }) {
+  // The header's mono count chip (glass-detail.css), in the accent mark's
+  // colours: a dark custom accent still reads on the glass.
   const chip = (
-    <span className="shrink-0 inline-flex items-center gap-1.5 rounded-md
-                     bg-ln-accent/[0.12] border border-ln-accent/30
-                     px-2.5 py-1 text-[11px] font-mono font-semibold uppercase
-                     tracking-[0.14em] text-ln-accent tabular-nums">
+    <span className="aura-detail-count is-accent gap-1.5 font-mono font-semibold tabular-nums">
       <span>{label}</span>
       {(filler > 0 || recap > 0) && (
         <span className="inline-flex items-center gap-1" aria-hidden>
@@ -4768,7 +4892,6 @@ function EpisodesPanel({
       season: v.season,
       episode: v.episode,
       episodeTitle: v.title ?? null,
-      episodeReleased: v.released ?? null,
       poster: detail?.poster ?? null,
       background: detail?.background ?? null,
       anilistId: (v as { anilist_id?: number | null }).anilist_id ?? null,
@@ -5098,6 +5221,13 @@ function EpisodesPanel({
   // be empty on first mount (meta hasn't resolved yet) and the row
   // appears a moment later.
   const listRef = useRef<HTMLDivElement>(null);
+  const epDroplet = useListDroplet<HTMLDivElement>(".aura-ep-row");
+  // One stable pick handler for every (memoized) EpisodeRow: the parent's
+  // `onPick` is a fresh closure each render, which would defeat the memo.
+  // The click always reaches the latest one through the ref.
+  const onPickRef = useRef(onPick);
+  useLayoutEffect(() => { onPickRef.current = onPick; });
+  const pickEpisode = useCallback((v: VideoEntry) => onPickRef.current(v), []);
   useEffect(() => {
     // Prefer the resolved id (handles stale-shape library entries via
     // the tuple / absolute fallback in resolveResumeEpisode). Falls
@@ -5121,7 +5251,7 @@ function EpisodesPanel({
       // scroll value clamps and the row stays highlighted — exactly the
       // "if can't scroll any further, keep highlighted" fallback the
       // user asked for.
-      list.scrollTop = row.offsetTop - list.offsetTop;
+      list.scrollTop = rowOffsetIn(list, row);
       done = true;
       // Tell the parent we honoured the hint so it can clear it. We
       // schedule the callback in a microtask to avoid setting parent
@@ -5163,7 +5293,7 @@ function EpisodesPanel({
     const row = target
       ? list.querySelector<HTMLElement>(`[data-episode-id="${CSS.escape(target)}"]`)
       : null;
-    list.scrollTop = row ? row.offsetTop - list.offsetTop : 0;
+    list.scrollTop = row ? rowOffsetIn(list, row) : 0;
   };
 
   // A season lands only on a pick or on leaving Arcs: the ones Aura selects itself come
@@ -5232,7 +5362,7 @@ function EpisodesPanel({
           <div className="space-y-3" aria-label="Loading episodes" role="status">
             <div className="h-px bg-gradient-to-r from-transparent via-ln-accent/55 to-transparent animate-pulse" />
             <p className="text-white/55 text-[12px] italic">
-              Loading episodes — this can take a moment for long-running anime.
+              Loading episodes: this can take a moment for long-running anime.
             </p>
             {/* Row-shaped skeleton placeholders. 5 rows is enough to
                 signal "list is coming" without dominating the panel,
@@ -5241,11 +5371,10 @@ function EpisodesPanel({
             {[0, 1, 2, 3, 4].map((i) => (
               <div
                 key={i}
-                className="flex items-stretch gap-4 px-3 py-3.5 rounded-md
-                           border border-transparent"
+                className="flex items-stretch gap-4 px-3 py-3.5 rounded-xl"
               >
                 <div
-                  className="w-40 rounded bg-white/8 animate-pulse"
+                  className="w-40 rounded-md bg-white/8 animate-pulse"
                   style={{ aspectRatio: "16 / 9" }}
                 />
                 <div className="flex-1 min-w-0 flex flex-col justify-center gap-2">
@@ -5306,8 +5435,8 @@ function EpisodesPanel({
                       type="button"
                       onClick={() => setOpenArcId(null)}
                       title={openArc.name}
-                      className="flex items-center gap-1.5 px-3 h-7 min-w-0 rounded-lg text-[12px] font-medium
-                                 text-white/70 hover:text-white bg-white/6 hover:bg-white/12 transition-colors"
+                      className="aura-glass-flat aura-glass-press flex items-center gap-1.5 px-3 h-7 min-w-0 rounded-[10px]
+                                 text-[12px] font-medium text-white/80 hover:text-white"
                     >
                       <span aria-hidden>&larr;</span>
                       <span className="truncate min-w-0 max-w-[22rem]">{openArc.name}</span>
@@ -5368,24 +5497,27 @@ function EpisodesPanel({
               </div>
             )}
 
-            {/* Episode list — typography +25 % vs previous, thumbs +25 %.
-                Padding on every side gives the rotating hover-glow
-                (~14 px blur + 6 px offset) full clearance from the
-                panel edges, including above the first row and below
-                the last so neither gets clipped. */}
+            {/* Episode list: content rows under ONE shared hover droplet
+                (Liquid; Frosted rows keep their own fill). A flex column,
+                not space-y: the droplet is the first child, and space-y
+                would push a margin onto the first row. `relative` so the
+                droplet scrolls with the rows. */}
             <div
               ref={listRef}
-              className="flex-1 min-h-0 overflow-y-auto px-3 pt-3 pb-4 space-y-1.5"
-              style={{ scrollbarWidth: "thin", scrollbarColor: "rgba(255,255,255,0.08) transparent" }}
+              {...epDroplet.listProps}
+              className="relative flex-1 min-h-0 overflow-y-auto px-3 pt-3 pb-4 flex flex-col gap-1.5"
+              style={{ scrollbarWidth: "thin", scrollbarColor: "rgba(255,255,255,0.12) transparent" }}
             >
+              <span ref={epDroplet.ref} aria-hidden className="aura-glass-hl aura-detail-hl" style={{ left: 12, right: 12 }} />
               {visibleEpisodes.map((v) => (
-                <div key={v.id} data-episode-id={v.id}>
+                <div key={v.id} data-episode-id={v.id}
+                     className={`aura-ep-item${activeVideo?.id === v.id ? " is-sel" : ""}`}>
                   <EpisodeRow
                     video={v}
                     seriesId={seriesId}
                     seriesMediaType={seriesMediaType}
                     isActive={activeVideo?.id === v.id}
-                    onPick={onPick}
+                    onPick={pickEpisode}
                     seasonVideos={visibleEpisodes}
                     groupLabel={arcMode ? "arc" : "season"}
                     absoluteNumber={arcMode ? absoluteById.get(v.id) ?? null : null}
@@ -5530,6 +5662,7 @@ function StreamMetaBadges({
   metadata,
   anchorRef,
   entered,
+  closing,
 }: {
   metadata: StreamMetadata;
   anchorRef: React.RefObject<HTMLElement | null>;
@@ -5540,13 +5673,19 @@ function StreamMetaBadges({
    *  centre and never recovers (a parent transform doesn't resize the
    *  aside, so the ResizeObserver below never re-fires). */
   entered: boolean;
+  /** True while the detail page fades out. The cluster is portalled to
+   *  document.body, outside the fading root, so it fades on its own. */
+  closing: boolean;
 }) {
   // Position relative to the streams-panel aside. Recomputed on resize
   // and on scroll bubbling (capture phase, so any ancestor scroll counts).
-  // Bottom-left anchored: 48 px outside the panel's left edge (extra gap
-  // beyond the panel's mask gradient so the cluster never crowds the
-  // stream rows) and floating 16 px above the panel's bottom edge so the
-  // cluster grows upward without colliding with the title/header band.
+  // Bottom-left anchored in the GUTTER between the two panels: the gutter is
+  // the left section's 48 px right padding plus the aside's 12 px left
+  // padding, so 38 px left of the aside's edge centres a 40 px badge in it,
+  // about 10 px clear of each glass panel (round 11: at 48 px it sat on the
+  // info panel's rounded corner and rim). Floating 16 px above the panel's
+  // bottom edge so the cluster grows upward without colliding with the
+  // title/header band.
   const [pos, setPos] = useState<{ left: number; bottom: number; ready: boolean }>({
     left: 0, bottom: 0, ready: false,
   });
@@ -5556,7 +5695,7 @@ function StreamMetaBadges({
     if (!el) return;
     const r = el.getBoundingClientRect();
     setPos({
-      left:   r.left - 48,
+      left:   r.left - 38,
       bottom: window.innerHeight - r.bottom + 16,
       ready:  true,
     });
@@ -5615,18 +5754,21 @@ function StreamMetaBadges({
       style={{
         left:    pos.left,
         bottom:  pos.bottom,
-        opacity: pos.ready ? 1 : 0,
+        opacity: pos.ready && !closing ? 1 : 0,
+        transition: "opacity 180ms ease-in",
+        // The class keeps pointer-events-auto; this wins while leaving.
+        pointerEvents: closing ? "none" : undefined,
       }}
     >
       {buckets.map(({ kind, rows }) => (
-        <StreamMetaBadge key={kind} kind={kind} rows={rows} />
+        <StreamMetaBadge key={kind} kind={kind} rows={rows} closing={closing} />
       ))}
     </div>,
     document.body,
   );
 }
 
-function StreamMetaBadge({ kind, rows }: { kind: MessageKind; rows: StreamMessage[] }) {
+function StreamMetaBadge({ kind, rows, closing }: { kind: MessageKind; rows: StreamMessage[]; closing: boolean }) {
   const style = KIND_STYLES[kind];
   const btnRef = useRef<HTMLButtonElement>(null);
   const [open, setOpen] = useState(false);
@@ -5656,17 +5798,21 @@ function StreamMetaBadge({ kind, rows }: { kind: MessageKind; rows: StreamMessag
         // Disable the parent <button> click — we don't want the badge to
         // bubble up as a "play stream" trigger if it's ever nested.
         onClick={(e) => e.stopPropagation()}
-        className={`flex items-center gap-1 px-1.5 py-1 rounded-full
-                    backdrop-blur-xl border transition-transform
-                    hover:scale-110 focus:outline-none focus:ring-2 focus:ring-white/30
-                    ${style.iconBtn}`}
+        // Real frost on the key art (0 to 4 of them, bounded); the kind's
+        // colour rides the glyph and the count only. glass-detail.css.
+        data-glass-light="rim"
+        className={`aura-frost aura-notice-badge is-${kind} flex items-center gap-1 px-1.5 py-1 rounded-full
+                    focus:outline-none`}
       >
         {ICONS[kind]}
         <span className="text-[10px] font-mono font-bold leading-none pr-0.5 tabular-nums">
           {rows.length}
         </span>
       </button>
-      {open && (
+      {/* The popover portals to document.body on its own (not inside the
+          badge cluster), so it would outlive the page's exit fade: drop it
+          as soon as the page starts leaving. */}
+      {open && !closing && (
         <NoticePopover
           anchorRef={btnRef}
           kind={kind}
@@ -5759,11 +5905,9 @@ function NoticePopover({ anchorRef, kind, rows, onMouseEnter, onMouseLeave }: No
       onMouseLeave={onMouseLeave}
       // Stop wheel events from chaining to the streams panel beneath.
       onWheel={(e) => e.stopPropagation()}
-      className="fixed z-[300] pointer-events-auto
+      className="aura-float-glass fixed z-[300] pointer-events-auto
                  w-[340px] max-w-[80vw] max-h-[60vh] overflow-y-auto
                  p-3 rounded-lg
-                 bg-black/85 backdrop-blur-2xl border border-white/15
-                 shadow-[0_24px_48px_-18px_rgba(0,0,0,0.9)]
                  transition-opacity duration-150 ease-out"
       style={{
         left: pos.left,
@@ -5866,7 +6010,7 @@ function StreamMessagesEmptyState({ metadata }: { metadata: StreamMetadata }) {
 const STREAM_FORMAT_HINT_KEY = "aura:stream-format-hint-dismissed";
 
 function StreamsPanel({
-  isEpisodic, activeVideo, streams, streamMeta, loading, earlyNote, groups, partyStreamKey, onBack, onPlay, addons, addonsPending, onLeave, menuCtx, absoluteTag,
+  isEpisodic, activeVideo, streams, streamMeta, loading, earlyNote, groups, partyStreamKey, onBack, onPlay, refreshingKey, addons, addonsPending, onLeave, menuCtx, absoluteTag,
 }: {
   isEpisodic: boolean;
   activeVideo: VideoEntry | null;
@@ -5878,6 +6022,8 @@ function StreamsPanel({
   partyStreamKey?: string | null;
   onBack?: () => void;
   onPlay: (s: StreamEntry) => void;
+  /** See PanelProps.refreshingKey. */
+  refreshingKey: string | null;
   /** Installed addons, for the no-providers warning. */
   addons: AddonEntry[];
   /** No addon load has finished yet, so an empty `addons` proves nothing. */
@@ -5946,6 +6092,22 @@ function StreamsPanel({
   const streamProvidersEmpty = !addonsPending
     && !streamQueryAddons(addons).some(isStreamProvider);
 
+  const streamDroplet = useListDroplet<HTMLDivElement>(".aura-stream-row");
+
+  // Stable handlers for the memoized rows. `onPlay` and `menuCtx` are rebuilt
+  // by the parent on every render, so passing them straight down re-rendered
+  // every row (dozens of tooltips and chip lines each) on any DetailView
+  // update. Both are only read at event time, through these refs, so a click
+  // or right-click still sees the latest values.
+  const onPlayRef = useRef(onPlay);
+  const menuCtxRef = useRef(menuCtx);
+  useLayoutEffect(() => {
+    onPlayRef.current = onPlay;
+    menuCtxRef.current = menuCtx;
+  });
+  const playStream = useCallback((s: StreamEntry) => onPlayRef.current(s), []);
+  const getMenuCtx = useCallback(() => menuCtxRef.current, []);
+
   return (
     <>
       <PanelHeader
@@ -5962,10 +6124,7 @@ function StreamsPanel({
             disabled={loading}
             aria-label="Refresh streams"
             title="Refresh streams"
-            className="flex items-center justify-center w-7 h-7 -my-1 rounded-md
-                       text-white/55 hover:text-white hover:bg-white/8
-                       disabled:opacity-40 disabled:hover:bg-transparent
-                       disabled:cursor-default transition-colors"
+            className="aura-detail-iconbtn -my-1"
           >
             <svg
               width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden
@@ -5978,16 +6137,20 @@ function StreamsPanel({
         )}
       />
       {subtitle && (
-        <div className="px-4 py-3 border-b border-white/8">
+        <div className="aura-detail-head px-4 py-3">
           <p className="text-white/90 text-[16px] font-medium tracking-tight text-center break-words">
             {subtitle}
           </p>
         </div>
       )}
       <div
+        {...streamDroplet.listProps}
         className="aura-page-scroller relative flex-1 min-h-0 overflow-y-auto overflow-x-hidden px-2 py-3"
-        style={{ scrollbarWidth: "thin", scrollbarColor: "rgba(255,255,255,0.08) transparent" }}
+        style={{ scrollbarWidth: "thin", scrollbarColor: "rgba(255,255,255,0.12) transparent" }}
       >
+        {/* ONE hover droplet for every stream row (Liquid; Frosted rows keep
+            their own fill). The rows paint over it (positioned, later). */}
+        <span ref={streamDroplet.ref} aria-hidden className="aura-glass-hl aura-detail-hl" style={{ left: 8, right: 8 }} />
         {loading && streams.length === 0 ? (
           // Particles racing a path and leaving neon trails, resolving into a
           // symbol picked fresh on every play. The cap (7 s movies, 12 s
@@ -6031,25 +6194,23 @@ function StreamsPanel({
                 refresh glyph and the "Searching..." chip). */}
             {groups.map(([provider, list]) => (
               <div key={provider} className="space-y-1.5">
-                <div className="flex items-center gap-2 px-2">
-                  <span className="w-px h-3 bg-white/15" aria-hidden />
-                  <p className="text-white/50 text-[11px] font-mono font-semibold
-                                tracking-[0.18em] uppercase">
-                    {provider}
-                  </p>
-                  <span className="text-white/30 text-[11px] font-mono">
-                    {list.length}
-                  </span>
+                {/* Provider group: mono caps like the notifications sheet's
+                    day groups, the count beside it. */}
+                <div className="aura-stream-group flex items-center gap-2 px-3 pt-1 font-mono font-semibold">
+                  <p>{provider}</p>
+                  <span className="font-normal tabular-nums">{list.length}</span>
                 </div>
-                <div className="space-y-1">
+                <div className="flex flex-col gap-1">
                   {list.map((s, idx) => {
                     const key = `${s.url ?? s.info_hash ?? "x"}:${idx}`;
                     const partyMatch = !!partyStreamKey && streamMatchKey(s) === partyStreamKey;
+                    const refreshing = refreshingKey != null && linkRefreshKey(s) === refreshingKey;
                     const rowProps = {
                       stream: s,
                       partyMatch,
-                      onPlay: () => onPlay(s),
-                      menuCtx,
+                      refreshing,
+                      onPlay: playStream,
+                      getMenuCtx,
                     };
                     return formatterOn
                       ? <StreamRow key={key} {...rowProps} earlyEstimate={!!earlyNote?.estimate} />
@@ -6084,16 +6245,18 @@ function PanelHeader({
   action?: React.ReactNode;
 }) {
   return (
-    <div className="flex items-center gap-2.5 px-4 py-2.5 border-b border-white/10 bg-white/[0.015]">
-      {/* Left zone — back action as a defined chip, fenced off from the title. */}
+    // The rail's hairline under the header (white 0.09), no strip fill. The
+    // back action is a small flat glass pill; the accent bar is the accent
+    // MARK with no glow. glass-detail.css.
+    <div className="aura-detail-head flex items-center gap-2.5 px-4 py-2.5">
+      {/* Left zone: back action as a flat glass pill, fenced off from the title. */}
       {onBack && (
         <>
           <button
             onClick={onBack}
-            className="flex items-center gap-1.5 pl-1.5 pr-2.5 h-7 rounded-lg shrink-0
-                       text-white/55 hover:text-white bg-white/[0.04] hover:bg-white/[0.09]
-                       border border-white/8 hover:border-white/15
-                       text-[11px] font-mono tracking-[0.1em] uppercase transition-colors"
+            className="aura-glass-flat aura-glass-press flex items-center gap-1.5 pl-1.5 pr-2.5 h-7 rounded-[10px] shrink-0
+                       text-white/80 hover:text-white
+                       text-[11px] font-mono tracking-[0.1em] uppercase"
           >
             <ArrowBackSm />
             <span>{backLabel}</span>
@@ -6103,7 +6266,7 @@ function PanelHeader({
       )}
       {/* Title zone. */}
       <div className="flex items-center gap-2 min-w-0">
-        <span className="w-1 h-4 bg-ln-accent rounded-full shadow-accent-glow shrink-0" aria-hidden />
+        <span className="aura-detail-headbar w-1 h-4 rounded-full shrink-0" aria-hidden />
         <h3 className="text-white/95 text-[12.5px] font-mono font-semibold tracking-[0.22em] uppercase truncate">
           {title}
         </h3>
@@ -6112,8 +6275,7 @@ function PanelHeader({
       {/* Right zone — count badge + controls, grouped. */}
       {right && (
         typeof right === "string" ? (
-          <span className="px-2 py-1 rounded-md shrink-0 bg-white/[0.05] border border-white/8
-                           text-white/50 text-[10px] font-mono uppercase tracking-[0.14em]">
+          <span className="aura-detail-count font-mono">
             {right}
           </span>
         ) : (
@@ -6141,8 +6303,8 @@ function StreamFormatCog({ on, onToggle }: { on: boolean; onToggle: (v: boolean)
         onClick={() => setOpen((o) => !o)}
         aria-label="Stream formatting"
         title="Stream formatting"
-        className="flex items-center justify-center w-7 h-7 -my-1 rounded-md
-                   text-white/55 hover:text-white hover:bg-white/8 transition-colors"
+        aria-expanded={open}
+        className="aura-detail-iconbtn -my-1"
       >
         <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
           <path d="M19.14 12.94c.04-.31.06-.62.06-.94s-.02-.63-.06-.94l2.03-1.58a.5.5 0 0 0 .12-.62l-1.92-3.32a.5.5 0 0 0-.6-.22l-2.39.96a7.03 7.03 0 0 0-1.62-.94l-.36-2.54a.5.5 0 0 0-.5-.42h-3.84a.5.5 0 0 0-.5.42l-.36 2.54c-.59.24-1.13.56-1.62.94l-2.39-.96a.5.5 0 0 0-.6.22L2.27 8.86a.5.5 0 0 0 .12.62l2.03 1.58c-.04.31-.06.62-.06.94s.02.63.06.94l-2.03 1.58a.5.5 0 0 0-.12.62l1.92 3.32c.14.24.42.32.66.22l2.39-.96c.49.38 1.03.7 1.62.94l.36 2.54c.04.24.25.42.5.42h3.84c.25 0 .46-.18.5-.42l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.24.1.52.02.66-.22l1.92-3.32a.5.5 0 0 0-.12-.62l-2.03-1.58zM12 15.5a3.5 3.5 0 1 1 0-7 3.5 3.5 0 0 1 0 7z" />
@@ -6151,23 +6313,25 @@ function StreamFormatCog({ on, onToggle }: { on: boolean; onToggle: (v: boolean)
       {open && (
         <>
           <div className="fixed inset-0 z-40" onClick={() => setOpen(false)} />
-          <div className="absolute right-0 mt-1.5 w-[262px] z-50 rounded-xl border border-white/12
-                          bg-[rgba(14,14,18,0.97)] backdrop-blur-2xl shadow-glass-edge p-3 space-y-2">
+          <div className="aura-float-glass aura-glass-pop-in absolute right-0 mt-1.5 w-[262px] z-50 rounded-xl p-3 space-y-2"
+               style={{ ["--lg-origin" as never]: "top right" }}>
             <button
               type="button"
+              role="switch"
+              aria-checked={on}
               onClick={() => onToggle(!on)}
+              // Keyboard focus rings the switch (App.css .aura-toggle-deco),
+              // as on a Settings switch, not the whole row.
               className="w-full flex items-center justify-between gap-3"
             >
               <span className="text-[12.5px] text-white/90 font-medium font-sans normal-case tracking-normal">
                 Aura stream formatting
               </span>
-              <span className={`relative w-9 h-5 rounded-full flex-shrink-0 transition-colors
-                                ${on ? "bg-ln-accent/80" : "bg-white/15"}`}>
-                <span className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-all
-                                  ${on ? "left-[18px]" : "left-0.5"}`} />
-              </span>
+              {/* The shared glass switch, decorative: the row carries the
+                  switch role, the click and the keyboard. */}
+              <ToggleSwitch decorative size="sm" value={on} />
             </button>
-            <p className="text-[11px] text-white/45 leading-snug font-sans normal-case tracking-normal">
+            <p className="text-[11px] text-white/60 leading-snug font-sans normal-case tracking-normal">
               On: parse stream details into chips (built for AIOStreams' TamTaro format).
               Off: show the addon's raw output, like Stremio.
             </p>
@@ -6210,44 +6374,70 @@ function StreamFormatHint({ onTurnOff, onDismiss }: { onTurnOff: () => void; onD
   );
 }
 
+/** On a stream row whose link is older than STREAM_URL_MAX_AGE_MS while App
+ *  re-reads it before playing (streamFreshness.ts): the "Party pick" pill's
+ *  accent mark on the row's top edge, opposite that pill, with the spinner
+ *  the trailer button and Next-Up card use. A live region, so the wait is
+ *  announced as well as drawn. */
+function LinkRefreshingPill() {
+  return (
+    <span
+      role="status"
+      className="aura-party-pick absolute -top-2 right-3 pl-1 pr-1.5 h-[15px] rounded-full gap-1
+                 text-[9px] font-bold uppercase tracking-wider flex items-center leading-none"
+    >
+      <svg className="animate-spin" width="9" height="9" viewBox="0 0 24 24" fill="none" aria-hidden>
+        <circle cx="12" cy="12" r="9" stroke="currentColor" strokeWidth="3.5"
+                strokeLinecap="round" strokeDasharray="32 16" />
+      </svg>
+      Refreshing link
+    </span>
+  );
+}
+
 /** Raw stream row — shown when the Aura formatter is OFF. Renders the addon's
  *  title + description verbatim (line breaks preserved), like base Stremio, so
  *  no detail is lost when the parser can't read the format. Play + right-click
  *  actions mirror StreamRow. */
-function RawStreamRow({
-  stream, partyMatch, onPlay, menuCtx,
+const RawStreamRow = memo(function RawStreamRow({
+  stream, partyMatch, refreshing, onPlay, getMenuCtx,
 }: {
   stream: StreamEntry;
   partyMatch?: boolean;
-  onPlay: () => void;
-  menuCtx: StreamMenuContext;
+  /** Its old link is being re-read before it plays (LinkRefreshingPill). */
+  refreshing?: boolean;
+  /** Stable (StreamsPanel's `playStream`), so the memo holds. */
+  onPlay: (s: StreamEntry) => void;
+  /** Read at right-click time, so the menu sees the parent's latest context. */
+  getMenuCtx: () => StreamMenuContext;
 }) {
   return (
     <button
       type="button"
-      onClick={onPlay}
+      // A click while its old link is re-read would only be ignored by App:
+      // say so by doing nothing here too.
+      onClick={() => { if (!refreshing) onPlay(stream); }}
+      aria-busy={refreshing || undefined}
       onContextMenu={(e) => {
         e.preventDefault();
         openContextMenu(
           e.clientX, e.clientY,
-          buildStreamMenu(stream, menuCtx),
+          buildStreamMenu(stream, getMenuCtx()),
         );
       }}
       title={stream.filename ?? undefined}
-      className={[
-        "relative hover-glow w-full text-left rounded-xl px-4 py-3 flex flex-col gap-1",
-        "hover:bg-white/[0.08] hover:border-white/18",
-        partyMatch
-          ? "bg-ln-accent/[0.10] border border-ln-accent/45 ring-1 ring-ln-accent/40"
-          : "bg-white/[0.04] border border-white/10",
-      ].join(" ")}
+      // A content row (round 11, glass-detail.css): the party's pick wears
+      // the selected face, never an accent ring.
+      data-glass-light={partyMatch ? "rim" : undefined}
+      className={`aura-stream-row w-full text-left px-4 py-3 flex flex-col gap-1${partyMatch ? " is-selected" : ""}${refreshing ? " cursor-progress" : ""}`}
     >
       {partyMatch && (
-        <span className="absolute -top-2 left-3 px-1.5 h-[15px] rounded-full bg-ln-accent text-black
+        <span className="aura-party-pick absolute -top-2 left-3 px-1.5 h-[15px] rounded-full
                          text-[9px] font-bold uppercase tracking-wider flex items-center leading-none">
           Party pick
         </span>
       )}
+      {refreshing && <LinkRefreshingPill />}
       {stream.title && (
         <p className="text-white/90 text-[13.5px] font-medium leading-snug break-words selectable whitespace-pre-wrap">
           {stream.title}
@@ -6263,7 +6453,7 @@ function RawStreamRow({
       )}
     </button>
   );
-}
+});
 
 // ---------------------------------------------------------------------------
 // StreamRow v2 layout:
@@ -6285,16 +6475,23 @@ function RawStreamRow({
 // BOTTOM (under faint hr) — rectangular tag pills for the parsed meta.
 // ---------------------------------------------------------------------------
 
-function StreamRow({
-  stream, partyMatch, onPlay, menuCtx, earlyEstimate,
+// Memoized with stable handlers from StreamsPanel: a row is the heaviest
+// subtree on the page (a parse, chip lines, a tooltip per chip) and it only
+// changes with its own props.
+const StreamRow = memo(function StreamRow({
+  stream, partyMatch, refreshing, onPlay, getMenuCtx, earlyEstimate,
 }: {
   stream: StreamEntry;
   partyMatch?: boolean;
+  /** Its old link is being re-read before it plays (LinkRefreshingPill). */
+  refreshing?: boolean;
   /** The film has no announced digital date (its check ran against the
    *  +45-day Estimate), so an early flag is not "before the official date". */
   earlyEstimate?: boolean;
-  onPlay: () => void;
-  menuCtx: StreamMenuContext;
+  /** Stable (StreamsPanel's `playStream`), so the memo holds. */
+  onPlay: (s: StreamEntry) => void;
+  /** Read at right-click time, so the menu sees the parent's latest context. */
+  getMenuCtx: () => StreamMenuContext;
 }) {
   const ref = useRef<HTMLButtonElement>(null);
   const parsed = useMemo(() => parseStream(stream), [stream]);
@@ -6347,36 +6544,44 @@ function StreamRow({
   return (
     <button
       ref={ref}
-      onClick={onPlay}
+      // A click while its old link is re-read would only be ignored by App:
+      // say so by doing nothing here too.
+      onClick={() => { if (!refreshing) onPlay(stream); }}
       onContextMenu={(e) => {
         e.preventDefault();
         openContextMenu(
           e.clientX, e.clientY,
-          buildStreamMenu(stream, menuCtx),
+          buildStreamMenu(stream, getMenuCtx()),
         );
       }}
+      // A content row (round 11, glass-detail.css): no card, one droplet for
+      // the list. The party's pick wears the selected face. An early release
+      // takes the colour of the note above the list: an emerald bar and wash
+      // when AIOStreams verified the leak, a dashed amber edge when it only
+      // let the stream through.
+      data-glass-light={partyMatch ? "rim" : undefined}
+      aria-busy={refreshing || undefined}
       className={[
-        "relative hover-glow w-full text-left rounded-xl px-4 py-3",
+        "aura-stream-row w-full text-left px-4 py-3",
         "flex flex-col gap-2.5",
+        refreshing ? "cursor-progress" : "",
         partyMatch
-          ? "bg-ln-accent/[0.10] border border-ln-accent/45 ring-1 ring-ln-accent/40 hover:bg-white/[0.08]"
-          // An early release takes the colour of the note above the list:
-          // emerald when AIOStreams verified the leak, a dashed amber edge
-          // when it only let the stream through.
+          ? "is-selected"
           : early && earlyVerified
-            ? "bg-emerald-500/[0.07] border border-emerald-400/35 hover:bg-emerald-500/[0.11] hover:border-emerald-300/50"
+            ? "is-early-ok"
             : early
-              ? "bg-amber-500/[0.04] border border-dashed border-amber-400/45 hover:bg-amber-500/[0.08]"
-              : "bg-white/[0.04] border border-white/10 hover:bg-white/[0.08] hover:border-white/18",
+              ? "is-early-maybe"
+              : "",
       ].join(" ")}
       aria-description={early ? earlyHover : undefined}
     >
       {partyMatch && (
-        <span className="absolute -top-2 left-3 px-1.5 h-[15px] rounded-full bg-ln-accent text-black
+        <span className="aura-party-pick absolute -top-2 left-3 px-1.5 h-[15px] rounded-full
                          text-[9px] font-bold uppercase tracking-wider flex items-center leading-none">
           Party pick
         </span>
       )}
+      {refreshing && <LinkRefreshingPill />}
       {/* TOP — quality summary on left, title/details on right. */}
       <div className="flex items-stretch gap-3">
         {/* Quality summary box. Three slots:
@@ -6389,9 +6594,8 @@ function StreamRow({
               Fixed width keeps the box visually consistent across all
               streams; long scraper names (e.g. "TorBox Search") shrink
               their font via addonFontClass instead of stretching the box. */}
-        <div className="flex-shrink-0 flex flex-col items-center
-                        px-3 py-2 rounded-lg bg-white/[0.05] border border-white/10
-                        w-[100px]">
+        <div className="aura-stream-quality flex-shrink-0 flex flex-col items-center
+                        px-3 py-2 w-[100px]">
           {/* Centered main content. flex-1 absorbs whatever extra height
               the row gives the box (when the vertical chip stack stretches
               the row tall) so resolution / ripType / direct / cached stay
@@ -6654,7 +6858,7 @@ function StreamRow({
 
     </button>
   );
-}
+});
 
 /** True when the parsed result has at least one chip to show in the chip
  *  stack. Best / Alt Best, the score, indexer, release group, private flag
@@ -6914,7 +7118,7 @@ function ChipPill({ kind, label, tight, sub, subShrinks }: {
   return (
     <span className={`inline-flex items-baseline gap-1 min-w-0 max-w-full px-2 py-0.5 rounded border ${s.bg} ${s.fg} ${s.border} font-medium tracking-wide whitespace-nowrap`}>
       <span className={subShrinks ? "flex-shrink-0" : "min-w-0 truncate"}>{label}</span>
-      {sub && <span className={`opacity-60 ${subShrinks ? "min-w-0 truncate" : "flex-shrink-0"}`}>{sub}</span>}
+      {sub && <span className={`opacity-75 ${subShrinks ? "min-w-0 truncate" : "flex-shrink-0"}`}>{sub}</span>}
     </span>
   );
 }

@@ -1,7 +1,7 @@
 // Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -40,7 +40,7 @@ async function releaseAndClose(): Promise<void> {
   }
 }
 
-export default function ScrobbleClosePrompt({
+function ScrobbleClosePrompt({
   onOpenChange,
 }: {
   /** Lets App suppress the floating progress bar while this prompt owns the screen. */
@@ -101,14 +101,16 @@ export default function ScrobbleClosePrompt({
   const pct = Math.round((run.done / Math.max(1, run.total)) * 100);
 
   return (
-    <div className="aura-modal-backdrop-in fixed inset-0 z-[400] flex items-center justify-center
-                    bg-black/70 backdrop-blur-sm">
+    <div className="fixed inset-0 z-[400] flex items-center justify-center">
+      {/* Dim + blur on a sibling layer, never the wrapper: an ancestor's
+          backdrop-filter (or fading opacity) would blind the card's glass. */}
+      <div aria-hidden className="aura-modal-backdrop-in absolute inset-0 bg-black/70 backdrop-blur-sm" />
       <div
         role="dialog"
         aria-modal="true"
         aria-label="Scrobble in progress"
-        className="aura-modal-card-in glass-panel-elevated rounded-3xl px-7 py-6 w-full max-w-[460px] mx-4
-                   shadow-glass-edge flex flex-col gap-5"
+        className="aura-modal-card-in aura-float-glass relative rounded-3xl px-7 py-6 w-full max-w-[460px] mx-4
+                   flex flex-col gap-5"
       >
         <div className="flex flex-col gap-2">
           <h2 className="text-white text-lg font-semibold tracking-tight">
@@ -116,7 +118,7 @@ export default function ScrobbleClosePrompt({
           </h2>
           <p className="text-white/70 text-sm leading-relaxed">
             {waiting
-              ? "Finishing up — Aura will close as soon as this is done."
+              ? "Finishing up: Aura will close as soon as this is done."
               : "A scrobble is still running. Closing now would leave it half-finished."}
           </p>
         </div>
@@ -126,7 +128,7 @@ export default function ScrobbleClosePrompt({
         <div className="flex flex-col gap-2">
           <div className="flex items-center justify-between text-xs font-mono tabular-nums">
             <span className="text-white/85">
-              {run.backingOff ? "Rate limited — retrying" : "Scrobbling"} {run.done}/{run.total}
+              {run.backingOff ? "Rate limited, retrying" : "Scrobbling"} {run.done}/{run.total}
             </span>
             <span className="text-white/40">
               {run.failed > 0 ? `${run.failed} failed` : `${pct}%`}
@@ -150,9 +152,8 @@ export default function ScrobbleClosePrompt({
             <button
               type="button"
               onClick={keepOpen}
-              className="px-4 py-1.5 rounded-full text-xs font-medium
-                         bg-white/5 text-white/70 border border-white/15
-                         hover:bg-white/12 hover:text-white transition-colors"
+              className="aura-glass-flat aura-glass-press px-4 py-1.5 rounded-full text-xs font-medium
+                         text-white/70 hover:text-white"
             >
               Keep Aura open
             </button>
@@ -160,10 +161,8 @@ export default function ScrobbleClosePrompt({
           <button
             type="button"
             onClick={stopAndClose}
-            className="px-4 py-1.5 rounded-full text-xs font-medium
-                       bg-white/5 text-white/70 border border-white/15
-                       hover:bg-rose-500/20 hover:text-rose-200 hover:border-rose-300/40
-                       transition-colors"
+            className="aura-glass-flat aura-glass-press is-danger-hover px-4 py-1.5 rounded-full text-xs font-medium
+                       text-white/70 hover:text-rose-200"
           >
             Stop and close
           </button>
@@ -172,9 +171,8 @@ export default function ScrobbleClosePrompt({
               type="button"
               autoFocus
               onClick={finishFirst}
-              className="px-4 py-1.5 rounded-full text-xs font-semibold border
-                         bg-ln-accent text-black border-ln-accent
-                         hover:brightness-110 transition-all"
+              className="aura-glass-flat aura-glass-press is-cta px-4 py-1.5 rounded-full text-xs font-semibold
+                         text-ln-accent-ink"
             >
               Finish, then close
             </button>
@@ -184,3 +182,9 @@ export default function ScrobbleClosePrompt({
     </div>
   );
 }
+
+// Memoized: App renders this host with no props (or only primitives / its own
+// stable state) and re-renders on every playback-update tick. The host is
+// driven by its own state and store subscriptions, so skipping those renders
+// changes nothing on screen.
+export default memo(ScrobbleClosePrompt);

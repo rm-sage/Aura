@@ -1,0 +1,231 @@
+/* Aura - (c) 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice. */
+/* SPDX-License-Identifier: AGPL-3.0-or-later */
+
+/* The PLAYER chrome in the A language (round 11): the control bar, the top
+   bar's Exit button, the top-left stack (skip prompt, Next-Up card, tail
+   pill), every docked menu and popover, the centred player dialogs (Switch
+   source, AuraSkip, Resume, End of stream, Cast) and the party HUD. Loaded
+   once, after App.css and the other group sheets (main.tsx), so a rule here at
+   equal specificity wins over them. Uses the GLASS SYSTEM classes and custom
+   properties defined in App.css; never redefine them here.
+
+   MATERIAL ONLY. The video is a native mpv child window UNDER the transparent
+   webview, so a backdrop-filter over it samples only transparent pixels (and
+   still costs a GPU pass): there is no live blur of the video and nothing
+   here may add one. What the A face CAN carry over video is everything that
+   is not the blur: the neutral tint (rgb 14 16 22) with the even 0.02 white
+   lift, the idle corner rim and the cursor light's rim and interior light
+   (glassGlint.ts lights every .aura-glass-player), the A drop shadows, the
+   rail's typography and the sliding droplet hover. The tint is DENSER than
+   the rail's 0.30 because nothing behind is blurred: 0.86, the lightest value
+   that keeps white 0.55 text at 4.5:1 over a pure white frame (measured in
+   the round 11 harness; see .claude/rules/frontend-ui.md "Over the video").
+   Every face is FLAT (one colour, no vertical ramp): a ramp over a 1100 px
+   bar is a staircase at 8 bits.
+
+   The shelved real-glass rules (glass-misc.css, all scoped to
+   [data-real-glass="on"], at higher specificity) still win over these when
+   the flag comes back. */
+
+/* ---- Frosted ("Matte") -------------------------------------------- */
+/* The Frosted float recipe (dark face, lit top hairline, dark bottom one,
+   a thin white ring) at the player density. No idle rim (Frosted has its own
+   hairline); the cursor light's rim and interior still reach it. The lit top
+   is the border's top side, one pixel (round 14, as App.css's Frosted float
+   recipe; the zero-alpha inset keeps the list's shape). */
+html:not([data-glass="liquid"]) .aura-glass-player {
+  --lg-face:
+    linear-gradient(rgb(255 255 255 / 0.025), rgb(255 255 255 / 0.025)),
+    linear-gradient(rgb(12 14 19 / 0.86), rgb(12 14 19 / 0.86));
+  --lg-border-c: rgb(255 255 255 / 0.19) rgb(255 255 255 / 0.12) rgb(255 255 255 / 0.12) rgb(255 255 255 / 0.12);
+  --lg-edge: inset 0 1px 0 0 rgb(255 255 255 / 0), inset 0 -1px 0 0 rgb(0 0 0 / 0.35);
+  --lg-drop: 0 10px 34px -12px rgb(0 0 0 / 0.72);
+}
+
+/* ---- Liquid ("Clear"): the A face ---------------------------------- */
+/* The rail's tint and lift at the player density, no border ring (the idle
+   rim is the edge) and the A drop. The edge keeps four inset entries (the
+   shelved real-glass edge's shape) so a state change still interpolates; the
+   drop is the A pair plus a zero third entry. The first entry is the A inner
+   glow at zero alpha since round 17 (it was white 0.012: a +1 level band
+   about 10 px inside every edge, App.css "Floating controls"). */
+html[data-glass="liquid"] .aura-glass-player {
+  --lg-face:
+    linear-gradient(rgb(255 255 255 / 0.02), rgb(255 255 255 / 0.02)),
+    linear-gradient(rgb(14 16 22 / 0.86), rgb(14 16 22 / 0.86));
+  --lg-border-c: transparent;
+  --lg-edge:
+    inset 0 0 22px 0 rgb(255 255 255 / 0),
+    inset 0 10px 14px -12px rgb(0 0 0 / 0),
+    inset 0 -12px 18px -10px rgb(0 0 0 / 0),
+    inset 0 0 0 0.5px rgb(255 255 255 / 0);
+  --lg-drop: 0 1px 2px rgb(0 0 0 / 0.3), 0 18px 48px rgb(0 0 0 / 0.55), 0 0 0 rgb(0 0 0 / 0);
+  /* The A idle rim (the rail's strengths): static edge definition, so it
+     stays with Cursor glow off. */
+  --lg-idle-tl: 0.18;
+  --lg-idle-mid: 0.03;
+  --lg-idle-br: 0.11;
+}
+/* The ring layer is always on in Liquid (it carries the idle rim); in
+   Frosted it exists only while lit (App.css). Behind @supports: an unknown
+   image function would void the whole background. */
+@supports (background-image: paint(aura-rim)) {
+  html[data-glass="liquid"] .aura-glass-player {
+    --lg-rim-layer: paint(aura-rim) border-box;
+  }
+}
+
+/* ---- The top-left stack (.aura-stack-surface, src/playerStack.ts) --- */
+/* The skip prompt, the Next-Up card and its tail pill carry
+   `.aura-glass-player.aura-stack-surface`: the same face, a touch denser
+   (0.9) because the prompt's large type and 12 px caps sit over whatever the
+   frame is, and nothing else. Its old recipe (black 0.9, a white 0.3 border,
+   the luminous ring and a 40 px backdrop blur that sampled nothing over the
+   video) is gone. */
+html:not([data-glass="liquid"]) .aura-glass-player.aura-stack-surface {
+  --lg-face:
+    linear-gradient(rgb(255 255 255 / 0.025), rgb(255 255 255 / 0.025)),
+    linear-gradient(rgb(12 14 19 / 0.9), rgb(12 14 19 / 0.9));
+}
+html[data-glass="liquid"] .aura-glass-player.aura-stack-surface {
+  --lg-face:
+    linear-gradient(rgb(255 255 255 / 0.02), rgb(255 255 255 / 0.02)),
+    linear-gradient(rgb(14 16 22 / 0.9), rgb(14 16 22 / 0.9));
+}
+
+/* ---- The top bar: back button and title (PlayerOverlay) ------------- */
+/* The back button is an icon-only `.aura-glass-player` disc (40 px). Its
+   focus ring is an outline, so the material's box-shadow stack and rim
+   cannot hide it.
+   The title block has NO surface (the user's call, 2026-11-22: it read as
+   one glass box too many), so the 4.5:1-on-a-surface rule is waived for it
+   alone. Legibility instead comes from three things, measured together
+   (harness, a pure white frame / a bright busy frame, white text against
+   the 95th-percentile pixel 1 to 3 px outside the glyphs): title 7.9 /
+   9.0, episode title 5.3 / 6.0, episode code 4.8 / 5.5.
+   1. The top scrim, a touch denser through the title band than the old
+      0.65 / 0.45 ramp, and ending sooner (0.2 at 72%, so less of the frame
+      is dimmed). Windowed it starts under the 36 px TitleBar.
+   2. A soft corner shade behind the title only (`::after`, a radial
+      0.22 to 0 over about 760 x 130 px): no edge, so it reads as shade,
+      never as a box. It is what lifts the 13.5 px line over a white sky.
+   3. A dense, tight text shadow: two 1 px black rings and a 2 px one that
+      outline every glyph, plus a 3 px drop. Never a wide halo (it reads as
+      a blob over the video).
+   The episode code is the accent mark text with its lightness floored
+   higher (0.88, not 0.8: it sits on the bare video, not a face), so a
+   dark custom accent cannot vanish; the `.aura-glass-player` accent remap
+   above does not reach it here. */
+.aura-player-top-scrim {
+  height: 10rem;
+  background: linear-gradient(to bottom, rgb(0 0 0 / 0.68) 0%, rgb(0 0 0 / 0.55) 40%, rgb(0 0 0 / 0.2) 72%, rgb(0 0 0 / 0) 100%);
+}
+.aura-player-top-scrim::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: min(760px, 60vw);
+  height: 130px;
+  background: radial-gradient(farthest-side at 0 35%, rgb(0 0 0 / 0.22), rgb(0 0 0 / 0.1) 55%, rgb(0 0 0 / 0));
+}
+.aura-player-back:focus-visible {
+  outline: 2px solid rgb(255 255 255 / 0.8);
+  outline-offset: 2px;
+}
+.aura-player-title {
+  text-shadow: 0 0 1px rgb(0 0 0), 0 0 1px rgb(0 0 0), 0 0 2px rgb(0 0 0 / 0.9), 0 1px 3px rgb(0 0 0 / 0.6);
+}
+.aura-player-title-code {
+  color: var(--ln-accent-mark-text);
+}
+@supports (color: oklch(from red l c h)) {
+  .aura-player-title-code {
+    color: oklch(from var(--ln-accent-on-glass) max(l, 0.88) c h);
+  }
+}
+
+/* ---- High Contrast -------------------------------------------------- */
+/* Denser still, and the 0.35 white edge floor every other glass class has
+   (App.css lists the page classes only). The idle rim is off there. */
+html[data-glass]:is([data-theme="contrast"], [data-theme="contrast-azure"]) .aura-glass-player {
+  --lg-face: linear-gradient(rgb(10 11 15 / 0.95), rgb(10 11 15 / 0.95));
+  --lg-border-c: rgba(255, 255, 255, 0.35) !important;
+}
+
+/* ---- Type ----------------------------------------------------------- */
+/* A tight shadow only (the face is dense now): the old 2 px + 1 px pair
+   smudged small text, and a wide halo reads as a dark blob. It inherits;
+   form controls opt out (glass-misc.css). */
+.aura-glass-player {
+  text-shadow: 0 1px 1px rgb(0 0 0 / 0.35);
+}
+
+/* Accent TEXT on player glass is the mark text token (the accent's
+   on-glass mix, lightness floored at 0.8: 4.5:1 on the dense face), never
+   the raw accent (Mica's raw blue measured 2.1 to 2.6:1 on the menus over a
+   white frame). Covers every player surface, including ones built outside
+   these files (Cast, the subtitle sync panel). */
+.aura-glass-player :is(.text-ln-accent, .text-ln-accent\/80, .text-ln-accent\/85, .text-ln-accent\/90) {
+  color: var(--ln-accent-mark-text);
+}
+
+/* ---- Rows ----------------------------------------------------------- */
+/* The selected row of a pick-one list (a menu option, the playing source):
+   the rail's lit label (accent 34% into white in Liquid, the mark text in
+   Frosted, both about 9:1 on the face) and, in Liquid, the rail's active
+   pill as its face: a faint raised white with the pill's idle rim (the
+   cursor light also lights a PlayerMenuRow, which carries
+   data-glass-light="rim" while selected). On-switch rows are not "selected"
+   (glass-misc.css keeps them plain), so aria-checked is not listed. */
+.aura-glass-player :is(.aura-glass-row, .aura-glass-item):is(.is-selected, [aria-current="true"], [aria-selected="true"]) {
+  color: var(--ln-accent-mark-text);
+}
+html[data-glass="liquid"] .aura-glass-player :is(.aura-glass-row, .aura-glass-item):is(.is-selected, [aria-current="true"], [aria-selected="true"]) {
+  color: color-mix(in srgb, rgb(var(--ln-accent-rgb)) 34%, white);
+  background: var(--lg-rim-layer), linear-gradient(rgb(255 255 255 / 0.075), rgb(255 255 255 / 0.075));
+  box-shadow: inset 0 0 12px rgb(255 255 255 / 0), 0 2px 8px rgb(0 0 0 / 0.28);
+  --lg-idle-tl: 0.30;
+  --lg-idle-mid: 0.04;
+  --lg-idle-br: 0.16;
+}
+@supports (background-image: paint(aura-rim)) {
+  html[data-glass="liquid"] .aura-glass-player :is(.aura-glass-row, .aura-glass-item):is(.is-selected, [aria-current="true"], [aria-selected="true"]) {
+    --lg-rim-layer: paint(aura-rim) border-box;
+  }
+}
+/* High Contrast: a clear edge on the selected face instead. */
+html:is([data-theme="contrast"], [data-theme="contrast-azure"]) .aura-glass-player :is(.aura-glass-row, .aura-glass-item):is(.is-selected, [aria-current="true"], [aria-selected="true"]) {
+  box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.35);
+}
+
+/* The hover droplet in a player list (PlayerMenuPanel bodies, Switch
+   source, the in-player Episodes drawer, subtitles search; AuraSkip's menu
+   has none): the rail's faint fill, inset like a menu's
+   (rows sit 6 px in), on the shared spring. Liquid only (App.css hides it
+   elsewhere). */
+.aura-glass-hl.aura-player-hl {
+  left: 6px;
+  right: 6px;
+  border-radius: 12px;
+}
+html[data-glass="liquid"] .aura-glass-hl.aura-player-hl {
+  background: linear-gradient(rgb(255 255 255 / 0.05), rgb(255 255 255 / 0.035));
+  box-shadow: none;
+}
+/* Rows paint above the droplet (it is positioned, they are not). */
+.aura-glass-player [data-glass-droplet] > :is(.aura-glass-row, .aura-glass-item) {
+  position: relative;
+  z-index: 1;
+}
+
+/* Segmented controls inside a player surface (AuraSkip's Off / Prompt /
+   Auto): the idle label at white 0.62 (0.55 sat at 4.6:1 over a white frame
+   on a well), and the Liquid selected label in the rail's lit colour (the raw
+   accent measured 4.4:1 there). */
+.aura-glass-player .aura-glass-seg-btn:not(:is([aria-pressed="true"], [aria-checked="true"], [aria-selected="true"])):not(:hover) {
+  color: rgb(255 255 255 / 0.62);
+}
+html[data-glass="liquid"] .aura-glass-player .aura-glass-seg-btn:is([aria-pressed="true"], [aria-checked="true"], [aria-selected="true"]) {
+  color: color-mix(in srgb, rgb(var(--ln-accent-rgb)) 34%, white);
+}

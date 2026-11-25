@@ -34,6 +34,14 @@
 //!    those are reported as `reachability_only`. Usenet providers publish
 //!    nothing machine-readable at all (researched 2026-11-01).
 //!
+//! An addon that declares `behaviorHints.addonStatus` (the rm-sage AIOStreams
+//! fork) also reports the addons it WRAPS: the frontend lists its index in
+//! `nested`, and beside the manifest probe we read the wrapper's own
+//! `api/status/addons.json`, where the wrapper probed each wrapped addon itself
+//! (their URLs never leave it). Names and short verdicts only come back, each
+//! capped and stripped of anything URL-shaped. Contract:
+//! docs/superpowers/specs/2026-11-15-aiostreams-nested-addon-status.md.
+//!
 //! Provider answers are cached 60 s (one entry per table row, so the cache is
 //! bounded by construction): opening the panel twice in a minute must not
 //! pull TorBox's tens-of-KB status payload twice. A FAILED fetch is cached for
@@ -138,6 +146,15 @@ const RTT_FAMILY_STAGGER: Duration = Duration::from_millis(300);
 /// Caps on what goes back to the frontend per provider.
 const MAX_ITEMS: usize = 6;
 const MAX_TEXT: usize = 100;
+/// A wrapper's nested status report, relative to its base URL.
+const NESTED_STATUS_PATH: &str = "api/status/addons.json";
+/// The wrapper answers within 9 s by contract (anything slower it reports as a
+/// timeout itself); this leaves room for the network and its own setup.
+const NESTED_TIMEOUT: Duration = Duration::from_secs(12);
+/// Body cap for that report: 40 short entries are a few KB.
+const NESTED_BODY_CAP: usize = 128 * 1024;
+/// Most wrapped addons kept per wrapper, matching the wrapper's own cap.
+const MAX_NESTED: usize = 40;
 
 // ---------------------------------------------------------------------------
 // Wire types
@@ -156,6 +173,10 @@ pub enum ServiceStatusAction {
         /// Installed addons' base URLs (or manifest URLs), in display order.
         #[serde(default)]
         addons: Vec<String>,
+        /// Indexes into `addons` whose live manifest declares
+        /// `behaviorHints.addonStatus`: also read their nested report.
+        #[serde(default)]
+        nested: Vec<usize>,
         /// Provider ids from the table below. Unknown ids are ignored.
         #[serde(default)]
         providers: Vec<String>,
@@ -191,6 +212,47 @@ pub struct Probe {
     /// The probe went to this machine, so whatever it found, answering or
     /// not, says nothing about the network (the frontend's offline test).
     pub loopback: bool,
+    /// The addons this one wraps, when it was asked for (`nested`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nested: Option<NestedReport>,
+}
+
+/// A wrapper's report on the addons it wraps.
+#[derive(Debug, Clone, Serialize)]
+pub struct NestedReport {
+    /// Unix ms the wrapper ran its probes (older than now when it answered
+    /// from its own 60 s cache).
+    pub checked_at: Option<u64>,
+    /// Unix ms on THIS machine when the report arrived. With `checked_at` it
+    /// lets the frontend age the wrapper's timestamps on the wrapper's own
+    /// clock: the two clocks need not agree.
+    pub fetched_at: u64,
+    pub addons: Vec<NestedProbe>,
+    /// Why the report could not be read; `addons` is then empty.
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct NestedProbe {
+    pub name: String,
+    /// ok | down | skipped (never requested: disabled, misconfigured).
+    pub state: &'static str,
+    pub http_status: Option<u16>,
+    /// Time to the wrapped addon's response headers, measured by the wrapper.
+    pub latency_ms: Option<u64>,
+    pub error: Option<String>,
+    /// The wrapper's most recent REAL request to this addon, when it keeps one.
+    pub last_request: Option<NestedLastRequest>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct NestedLastRequest {
+    pub ok: bool,
+    /// Unix ms.
+    pub at: Option<u64>,
+    /// stream | meta | catalog | subtitles
+    pub resource: Option<String>,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -335,7 +397,7 @@ fn addon_client() -> Option<&'static reqwest::Client> {
 #[tauri::command]
 pub async fn service_status(action: ServiceStatusAction) -> Result<ServiceStatusReply, String> {
     match action {
-        ServiceStatusAction::Check { aura, relay, addons, providers } => {
+        ServiceStatusAction::Check { aura, relay, addons, nested, providers } => {
             let aura_fut = async {
                 if aura { Some(probe_aura().await) } else { None }
             };
@@ -345,7 +407,7 @@ pub async fn service_status(action: ServiceStatusAction) -> Result<ServiceStatus
                     None => None,
                 }
             };
-            let addons_fut = probe_addons(addons);
+            let addons_fut = probe_addons(addons, nested);
             let providers_fut = check_providers(providers);
             let (aura, relay, addons, providers) =
                 tokio::join!(aura_fut, relay_fut, addons_fut, providers_fut);
@@ -369,6 +431,7 @@ fn failed(error: &str) -> Probe {
         error: Some(error.to_string()),
         not_running: false,
         loopback: false,
+        nested: None,
     }
 }
 
@@ -385,6 +448,7 @@ fn answered(status: reqwest::StatusCode, ok: bool, latency: u64, kind: &'static 
         error: if ok { None } else { Some(format!("HTTP {}", status.as_u16())) },
         not_running: false,
         loopback: false,
+        nested: None,
     }
 }
 
@@ -503,10 +567,23 @@ async fn probe_relay(raw: &str) -> Probe {
     Probe { loopback, ..probe_health(client, url, None, "relay").await }
 }
 
-async fn probe_addons(urls: Vec<String>) -> Vec<Probe> {
+async fn probe_addons(urls: Vec<String>, nested: Vec<usize>) -> Vec<Probe> {
     let urls: Vec<String> = urls.into_iter().take(MAX_ADDONS).collect();
+    let nested: std::collections::HashSet<usize> = nested.into_iter().collect();
     let mut out: Vec<(usize, Probe)> = stream::iter(urls.into_iter().enumerate())
-        .map(|(i, u)| async move { (i, probe_addon(&u).await) })
+        .map(|(i, u)| {
+            let want_nested = nested.contains(&i);
+            async move {
+                // The nested report runs BESIDE the manifest probe, in the same
+                // slot: one wrapper, one slot, however many addons it wraps.
+                let nested_fut = async {
+                    if want_nested { Some(fetch_nested(&u).await) } else { None }
+                };
+                let (mut probe, report) = tokio::join!(probe_addon(&u), nested_fut);
+                probe.nested = report;
+                (i, probe)
+            }
+        })
         // `buffer_unordered` over index-tagged probes, then a sort: the reply
         // stays index-aligned with the request (which is what lets it carry
         // no URLs back) without `buffered`'s head-of-line wait. `buffered`
@@ -709,6 +786,108 @@ async fn probe_addon(raw: &str) -> Probe {
             Probe { loopback, ..failed(short_reason(&e)) }
         }
     }
+}
+
+/// Base URL -> the wrapper's nested status report.
+fn nested_status_url(raw: &str) -> Option<reqwest::Url> {
+    let manifest = addon_manifest_url(raw);
+    let base = manifest.strip_suffix("/manifest.json")?;
+    let url = reqwest::Url::parse(&format!("{base}/{NESTED_STATUS_PATH}")).ok()?;
+    matches!(url.scheme(), "http" | "https").then_some(url)
+}
+
+/// Read a wrapper's nested report. Never fails the wrapper's own probe: a
+/// report that cannot be read comes back with `error` set.
+async fn fetch_nested(raw: &str) -> NestedReport {
+    let fail = |e: &str| NestedReport { checked_at: None, fetched_at: now_ms(), addons: Vec::new(), error: Some(e.to_string()) };
+    let Some(url) = nested_status_url(raw) else { return fail("not a URL") };
+    if url.as_str().len() > MAX_ADDON_URL_LEN {
+        return fail("URL too long");
+    }
+    let Some(client) = addon_client() else { return fail("client unavailable") };
+    let resp = match client
+        .get(url)
+        .timeout(NESTED_TIMEOUT)
+        .header("accept", "application/json")
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            crate::devlog!(info, "status", "nested report from {}: {}",
+                redact_sensitive_url(raw), reqwest_err_for_log(&e));
+            return fail(short_reason(&e));
+        }
+    };
+    let status = resp.status();
+    if !status.is_success() {
+        crate::devlog!(info, "status", "nested report from {} answered HTTP {}",
+            redact_sensitive_url(raw), status.as_u16());
+        return fail(&format!("HTTP {}", status.as_u16()));
+    }
+    let body = match read_capped(resp, NESTED_BODY_CAP).await {
+        Ok(b) if b.len() >= NESTED_BODY_CAP => return fail("report too large"),
+        Ok(b) => b,
+        Err(e) => return fail(short_reason(&e)),
+    };
+    match parse_nested(&body) {
+        Some((checked_at, addons)) => NestedReport { checked_at, fetched_at: now_ms(), addons, error: None },
+        None => fail("not a status report"),
+    }
+}
+
+/// One line of wrapper-supplied text, capped, control characters dropped and
+/// every URL-shaped word replaced whole. The contract forbids URLs here; this
+/// is the guard, and it is stricter than `redact_sensitive_url` (which keeps
+/// word-like path segments) because nothing in a name or verdict needs one.
+fn nested_text(v: Option<&Value>) -> Option<String> {
+    let raw = v?.as_str()?;
+    let flat: String = raw.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
+    let safe = flat
+        .split_whitespace()
+        .map(|w| if w.contains("://") || w.contains('@') { "<link>" } else { w })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let out: String = safe.chars().take(MAX_TEXT).collect();
+    (!out.is_empty()).then_some(out)
+}
+
+/// Parse `{checkedAt, addons: [...]}`. None when it is not that shape; an entry
+/// without a name or a known state is dropped on its own.
+fn parse_nested(body: &[u8]) -> Option<(Option<u64>, Vec<NestedProbe>)> {
+    let v: Value = serde_json::from_slice(body).ok()?;
+    let list = v.get("addons")?.as_array()?;
+    let checked_at = v.get("checkedAt").and_then(Value::as_u64);
+    let addons = list
+        .iter()
+        .filter_map(|a| {
+            let name = nested_text(a.get("name"))?;
+            let state = match a.get("state")?.as_str()? {
+                "ok" => "ok",
+                "down" => "down",
+                "skipped" => "skipped",
+                _ => return None,
+            };
+            let last_request = a.get("lastRequest").and_then(|l| {
+                Some(NestedLastRequest {
+                    ok: l.get("ok")?.as_bool()?,
+                    at: l.get("at").and_then(Value::as_u64),
+                    resource: nested_text(l.get("resource")),
+                    error: nested_text(l.get("error")),
+                })
+            });
+            Some(NestedProbe {
+                name,
+                state,
+                http_status: a.get("httpStatus").and_then(Value::as_u64).and_then(|n| u16::try_from(n).ok()),
+                latency_ms: a.get("latencyMs").and_then(Value::as_u64),
+                error: nested_text(a.get("error")),
+                last_request,
+            })
+        })
+        .take(MAX_NESTED)
+        .collect();
+    Some((checked_at, addons))
 }
 
 async fn read_capped(mut resp: reqwest::Response, cap: usize) -> Result<Vec<u8>, reqwest::Error> {
@@ -1077,6 +1256,112 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 mod tests {
     use super::*;
 
+    /// The whole path against a local stand-in for the fork: the manifest probe
+    /// and the nested report run for the index asked, and only for it.
+    #[tokio::test]
+    async fn nested_report_is_read_from_a_wrapper() {
+        use axum::{routing::get, Json, Router};
+        let app = Router::new()
+            .route("/u/x/manifest.json", get(|| async {
+                Json(serde_json::json!({ "id": "aio", "name": "AIOStreams",
+                    "behaviorHints": { "addonStatus": true } }))
+            }))
+            .route("/u/x/api/status/addons.json", get(|| async {
+                Json(serde_json::json!({ "checkedAt": 1u64, "addons": [
+                    { "name": "Torrentio", "state": "ok", "httpStatus": 200, "latencyMs": 40 },
+                    { "name": "Comet", "state": "down", "error": "timeout" }
+                ] }))
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.ok(); });
+        let base = format!("http://{addr}/u/x");
+        let got = probe_addons(vec![base.clone(), base], vec![0]).await;
+        assert!(got[0].ok && got[1].ok);
+        let report = got[0].nested.as_ref().expect("asked for index 0");
+        assert_eq!(report.error, None);
+        let rows: Vec<_> = report.addons.iter().map(|n| (n.name.as_str(), n.state)).collect();
+        assert_eq!(rows, [("Torrentio", "ok"), ("Comet", "down")]);
+        assert!(got[1].nested.is_none());
+    }
+
+    #[test]
+    fn nested_status_url_sits_beside_the_manifest() {
+        let u = nested_status_url("https://aio.example/stremio/u/alias").unwrap();
+        assert_eq!(u.as_str(), "https://aio.example/stremio/u/alias/api/status/addons.json");
+        let u = nested_status_url("https://aio.example/stremio/u/alias/manifest.json/").unwrap();
+        assert_eq!(u.as_str(), "https://aio.example/stremio/u/alias/api/status/addons.json");
+        assert!(nested_status_url("ftp://aio.example/x").is_none());
+        assert!(nested_status_url("not a url").is_none());
+    }
+
+    #[test]
+    fn nested_report_parses_and_drops_what_does_not_fit() {
+        let body = serde_json::json!({
+            "checkedAt": 1763222400000u64,
+            "addons": [
+                { "name": "Torrentio", "id": "x", "state": "ok", "httpStatus": 200, "latencyMs": 412, "error": null },
+                { "name": "Comet", "state": "down", "httpStatus": 503, "latencyMs": 92, "error": "HTTP 503",
+                  "lastRequest": { "ok": false, "at": 1763222100000u64, "resource": "stream", "error": "timeout" } },
+                { "name": "Store", "state": "skipped", "error": "disabled on this instance" },
+                { "name": "Weird", "state": "exploded" },
+                { "state": "ok" },
+                { "name": "Leaky", "state": "down", "error": "failed https://host.example/abc123/manifest.json" },
+                { "name": "Big", "state": "ok", "httpStatus": 70000 }
+            ]
+        });
+        let (at, list) = parse_nested(body.to_string().as_bytes()).unwrap();
+        assert_eq!(at, Some(1763222400000));
+        let names: Vec<&str> = list.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["Torrentio", "Comet", "Store", "Leaky", "Big"]);
+        assert_eq!(list[0].latency_ms, Some(412));
+        assert_eq!(list[1].last_request.as_ref().map(|l| (l.ok, l.error.as_deref())), Some((false, Some("timeout"))));
+        assert_eq!(list[2].state, "skipped");
+        assert!(!list[3].error.as_deref().unwrap_or("").contains("abc123"));
+        assert_eq!(list[4].http_status, None);
+    }
+
+    /// The fork's `invalid response` category (2026-11-16) and any category this
+    /// build does not know come through as they were sent; an addon with no
+    /// `lastRequest` keeps none.
+    #[test]
+    fn nested_report_keeps_new_and_unknown_request_categories() {
+        let body = serde_json::json!({
+            "checkedAt": 1763300000000u64,
+            "addons": [
+                { "name": "Torrentio", "id": "com.stremio.torrentio.addon", "state": "ok",
+                  "httpStatus": 200, "latencyMs": 380, "error": null,
+                  "lastRequest": { "ok": false, "at": 1763299700000u64, "resource": "stream", "error": "invalid response" } },
+                { "name": "Comet", "id": "comet.elfhosted.com", "state": "ok",
+                  "httpStatus": 200, "latencyMs": 210, "error": null,
+                  "lastRequest": { "ok": false, "at": 1763299800000u64, "resource": "stream", "error": "something new" } },
+                { "name": "Plain", "state": "ok", "httpStatus": 200, "latencyMs": 100, "error": null }
+            ]
+        });
+        let (at, list) = parse_nested(body.to_string().as_bytes()).unwrap();
+        assert_eq!(at, Some(1763300000000));
+        assert_eq!(list.len(), 3);
+        let req = |i: usize| list[i].last_request.clone().unwrap();
+        assert_eq!(req(0), NestedLastRequest {
+            ok: false, at: Some(1763299700000), resource: Some("stream".into()), error: Some("invalid response".into()),
+        });
+        assert_eq!(req(1).error.as_deref(), Some("something new"));
+        assert!(list[2].last_request.is_none());
+        assert!(list.iter().all(|p| p.state == "ok" && p.error.is_none()));
+    }
+
+    #[test]
+    fn nested_report_rejects_other_shapes_and_caps_entries() {
+        assert!(parse_nested(b"not json").is_none());
+        assert!(parse_nested(br#"{"error":"no configuration"}"#).is_none());
+        let many: Vec<_> = (0..100).map(|i| serde_json::json!({ "name": format!("A{i}"), "state": "ok" })).collect();
+        let (_, list) = parse_nested(serde_json::json!({ "addons": many }).to_string().as_bytes()).unwrap();
+        assert_eq!(list.len(), MAX_NESTED);
+        let long = "n".repeat(500);
+        let (_, list) = parse_nested(serde_json::json!({ "addons": [{ "name": long, "state": "ok" }] }).to_string().as_bytes()).unwrap();
+        assert_eq!(list[0].name.chars().count(), MAX_TEXT);
+    }
+
     #[test]
     fn rfc3339_parses_better_stack_shape() {
         assert_eq!(parse_rfc3339_ms("1970-01-01T00:00:00Z"), Some(0));
@@ -1197,10 +1482,13 @@ mod tests {
             long,
             "ftp://example.com".into(),
             "not a url".into(),
-        ])
+        ], vec![1])
         .await;
         let errs: Vec<_> = got.iter().map(|p| p.error.clone().unwrap_or_default()).collect();
         assert_eq!(errs, vec!["URL too long", "not a web address", "not a URL"]);
+        // Only the index asked for gets a nested report, on its own row.
+        let nested: Vec<_> = got.iter().map(|p| p.nested.as_ref().and_then(|n| n.error.clone())).collect();
+        assert_eq!(nested, vec![None, Some("not a URL".to_string()), None]);
     }
 
     fn alldebrid() -> &'static ProviderDef {

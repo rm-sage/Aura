@@ -54,7 +54,8 @@ logs/
 *.log
 
 # ─── AI assistants ─────────────────────────────────────────────────────────
-.claude/
+.claude/*
+!.claude/rules/
 .cursor/
 
 # ─── Internal planning artifacts (not part of the shipped product) ─────────
@@ -87,3 +88,6 @@ src-tauri/shaders/*.hook
 
 # superpowers brainstorm visual companion (local only, not committed)
 .superpowers/
+
+# Playwright MCP session output (screenshots, console logs)
+.playwright-mcp/

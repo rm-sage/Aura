@@ -18,8 +18,8 @@
      base (not transparent): the blur alone can't save white text over a large
      bright region (a blurred yellow poster stays yellow), so tooltips went
      see-through over bright art. ~72% dark keeps the glass/blur look while
-     guaranteeing legible text on any backdrop, matching the .aura-glass-menu
-     player surfaces. The zero-blur themes below (midnight, contrast,
+     guaranteeing legible text on any backdrop, matching the
+     .aura-glass-player surfaces. The zero-blur themes below (midnight, contrast,
      contrast-azure) override this to a fully OPAQUE surface colour since they
      have no blur to lean on at all. */
   --ln-panel-solid: rgba(8, 10, 14, 0.72);
@@ -38,6 +38,18 @@
   --ln-accent-rgb: 91 164 255;
   /* Accent glow — derived from the triplet so it always follows the theme. */
   --ln-accent-glow: rgb(var(--ln-accent-rgb) / 0.4);
+  /* A user's custom accent (Settings > Theme > Accent colour) is written
+     INLINE on <html> by src/themeAccent.ts: `--ln-accent`, `--ln-accent-rgb`
+     and the ink below, beating every theme block. So every other accent token
+     must be DERIVED from the triplet (here, once, on :root, which every theme
+     block also matches), never restated per theme with a literal colour.
+     Ink: text on a SOLID accent fill (`text-ln-accent-ink`). Black for every
+     built-in accent (all light); a custom accent gets black or white by
+     contrast. Hover / pressed / on-glass label: mixes of the triplet. */
+  --ln-accent-ink-rgb: 0 0 0;
+  --ln-accent-hover: color-mix(in oklab, rgb(var(--ln-accent-rgb)) 84%, white);
+  --ln-accent-press: color-mix(in oklab, rgb(var(--ln-accent-rgb)) 80%, black);
+  --ln-accent-on-glass: color-mix(in oklab, rgb(var(--ln-accent-rgb)) 60%, white);
 
   --ln-bg:           transparent;       /* lets Mica show through */
   /* Boot-splash backdrop. Always opaque (alpha=1 — even 3 % bleed-
@@ -60,6 +72,27 @@
      to ensure the sweep is always visible regardless of what shows through. */
   --ln-skeleton-base:      rgba(128, 128, 128, 0.10);
   --ln-skeleton-highlight: rgba(200, 200, 200, 0.32);
+}
+/* Small accent MARKS on dark glass (unread dots, the rail's count badges, the
+   notification sweep and washes): the accent with its OKLCH lightness floored
+   at 0.66, so a dark custom accent still reads. Every built-in accent is
+   already lighter (0.676 and up), so they are unchanged. Text on a mark is
+   `--ln-accent-mark-ink-rgb`: dark, since a mark is always light (about 6:1
+   or more). `--ln-accent-mark-text`: accent TEXT on glass (a chip label),
+   on-glass floored at 0.8 (4.5:1 on the menu glass); built-ins unchanged.
+   Without relative colour syntax both fall back to on-glass. Kept OUT of the
+   block above: its `:root[data-theme="mica"]` half would outrank these plain
+   `:root` rules. No theme block restates them. */
+:root {
+  --ln-accent-mark: var(--ln-accent-on-glass);
+  --ln-accent-mark-text: var(--ln-accent-on-glass);
+  --ln-accent-mark-ink-rgb: 8 10 14;
+}
+@supports (color: oklch(from red l c h)) {
+  :root {
+    --ln-accent-mark: oklch(from rgb(var(--ln-accent-rgb)) max(l, 0.66) c h);
+    --ln-accent-mark-text: oklch(from var(--ln-accent-on-glass) max(l, 0.8) c h);
+  }
 }
 
 :root[data-theme="glass"] {
@@ -456,80 +489,10 @@ select,
                 backdrop-filter 280ms ease;
   }
 
-  /* ----------------------------------------------------------------
-   * Player surfaces — frosted glass with a baked-in dark tint.
-   *
-   * The control bar and its menus sit over an arbitrary video frame
-   * (often a bright/white shot during scenes set on snow, sand, sky,
-   * etc.). A pure translucent white-glass surface would wash the text
-   * out completely on those frames. The trick borrowed from visionOS:
-   * layer a dark linear-gradient INSIDE the surface so the composited
-   * background is *guaranteed* dark even when the video behind is
-   * white, while a 30 px backdrop-blur + 180% saturate retains the
-   * "refracts the light behind it" feel the user is asking for.
-   *
-   * Two specular highlights sell the glass illusion:
-   *   1. inset top edge — a thin highlight that reads as a refraction
-   *      lip at the top of the surface
-   *   2. outer drop shadow — separates the panel from the video
-   * ---------------------------------------------------------------- */
-  .aura-glass-bar {
-    background:
-      linear-gradient(180deg,
-        rgba(0, 0, 0, 0.42),
-        rgba(0, 0, 0, 0.58));
-    border: 1px solid rgba(255, 255, 255, 0.18);
-    backdrop-filter: blur(30px) saturate(180%);
-    -webkit-backdrop-filter: blur(30px) saturate(180%);
-    box-shadow:
-      inset 0 1px 0 rgba(255, 255, 255, 0.10),
-      0 30px 60px -20px rgba(0, 0, 0, 0.85),
-      0 4px 12px rgba(0, 0, 0, 0.45);
-  }
-
-  .aura-glass-menu {
-    background:
-      linear-gradient(180deg,
-        rgba(8, 8, 10, 0.62),
-        rgba(8, 8, 10, 0.78));
-    border: 1px solid rgba(255, 255, 255, 0.18);
-    backdrop-filter: blur(36px) saturate(180%);
-    -webkit-backdrop-filter: blur(36px) saturate(180%);
-    box-shadow:
-      inset 0 1px 0 rgba(255, 255, 255, 0.12),
-      0 24px 48px rgba(0, 0, 0, 0.70);
-  }
-
-  /* ----------------------------------------------------------------
-   * Text legibility lift for player surfaces.
-   *
-   * The glass bar + menus already bake in a dark gradient overlay so
-   * the *surface* itself is dark on every video frame, but the menus
-   * still composite over high-contrast colourful frames (anime line
-   * art, fire, snow). A 1 px drop shadow at low opacity is invisible
-   * over the dark gradient yet adds enough contrast that small
-   * description text reads cleanly even when a bright detail bleeds
-   * through the panel. Applied to every descendant via universal
-   * selector — the cost is one extra paint per text run, negligible
-   * since the glass bar text reflows only on player open / close.
-   *
-   * `pointer-events` and other layout properties are deliberately not
-   * touched — text-shadow is paint-only.
-   * ---------------------------------------------------------------- */
-  .aura-glass-bar,
-  .aura-glass-bar *,
-  .aura-glass-menu,
-  .aura-glass-menu * {
-    text-shadow:
-      0 1px 2px rgba(0, 0, 0, 0.55),
-      0 0 1px rgba(0, 0, 0, 0.45);
-  }
-  /* Disable shadow on form controls (range/checkbox/etc.) so it
-     doesn't bleed across the thumb glyphs the browser renders. */
-  .aura-glass-bar input,
-  .aura-glass-menu input {
-    text-shadow: none;
-  }
+  /* The old .aura-glass-bar / .aura-glass-menu player recipes are gone:
+     every player surface is .aura-glass-player (GLASS SYSTEM below), whose
+     baked dark base and descendant text shadow (src/styles/glass-misc.css)
+     carry the same legibility guarantee over a bright frame. */
 
   /* ----------------------------------------------------------------
    * Player menu rows — hover/active treatment.
@@ -567,72 +530,6 @@ select,
     border-radius: 2px;
     background: var(--ln-accent, #5BA4FF);
     box-shadow: 0 0 8px rgb(var(--ln-accent-rgb) /0.65);
-  }
-
-  /* ----------------------------------------------------------------
-   * .hover-glow — tight clockwise-traveling accent glow on hover.
-   *
-   * Used by: episode rows, stream rows. The glow is intentionally
-   * tight to the element (small blur, low spread) and the highlight
-   * appears to wrap around the perimeter via 4 directional shadows
-   * whose intensities cycle through the keyframe. The result reads
-   * like a thin band of light walking around the card.
-   *
-   * Pure box-shadow — no pseudo-elements, no extra wrappers, no
-   * layout impact.
-   * ---------------------------------------------------------------- */
-  .hover-glow {
-    transition: box-shadow 240ms ease, border-color 200ms ease,
-                background-color 200ms ease;
-  }
-  .hover-glow:hover {
-    animation: hover-glow-rotate 2.6s linear infinite;
-  }
-  /* Each keyframe weighs the four cardinal directions differently so
-   * the bright edge "travels" clockwise: top → right → bottom → left.
-   * Inset spread is kept small (3-6 px) for a tight halo, plus a 1 px
-   * accent ring that stays bright the entire time. */
-  @keyframes hover-glow-rotate {
-    0% {
-      box-shadow:
-        0 0 0 1px rgb(var(--ln-accent-rgb) /0.45),
-        0 -6px 14px 0 rgb(var(--ln-accent-rgb) /0.55),
-         6px 0   14px 0 rgb(var(--ln-accent-rgb) /0.18),
-         0 6px  14px 0 rgb(var(--ln-accent-rgb) /0.10),
-        -6px 0   14px 0 rgb(var(--ln-accent-rgb) /0.18);
-    }
-    25% {
-      box-shadow:
-        0 0 0 1px rgb(var(--ln-accent-rgb) /0.45),
-         0 -6px 14px 0 rgb(var(--ln-accent-rgb) /0.18),
-         6px 0   14px 0 rgb(var(--ln-accent-rgb) /0.55),
-         0  6px 14px 0 rgb(var(--ln-accent-rgb) /0.18),
-        -6px 0   14px 0 rgb(var(--ln-accent-rgb) /0.10);
-    }
-    50% {
-      box-shadow:
-        0 0 0 1px rgb(var(--ln-accent-rgb) /0.45),
-         0 -6px 14px 0 rgb(var(--ln-accent-rgb) /0.10),
-         6px 0   14px 0 rgb(var(--ln-accent-rgb) /0.18),
-         0  6px 14px 0 rgb(var(--ln-accent-rgb) /0.55),
-        -6px 0   14px 0 rgb(var(--ln-accent-rgb) /0.18);
-    }
-    75% {
-      box-shadow:
-        0 0 0 1px rgb(var(--ln-accent-rgb) /0.45),
-         0 -6px 14px 0 rgb(var(--ln-accent-rgb) /0.18),
-         6px 0   14px 0 rgb(var(--ln-accent-rgb) /0.10),
-         0  6px 14px 0 rgb(var(--ln-accent-rgb) /0.18),
-        -6px 0   14px 0 rgb(var(--ln-accent-rgb) /0.55);
-    }
-    100% {
-      box-shadow:
-        0 0 0 1px rgb(var(--ln-accent-rgb) /0.45),
-         0 -6px 14px 0 rgb(var(--ln-accent-rgb) /0.55),
-         6px 0   14px 0 rgb(var(--ln-accent-rgb) /0.18),
-         0  6px 14px 0 rgb(var(--ln-accent-rgb) /0.10),
-        -6px 0   14px 0 rgb(var(--ln-accent-rgb) /0.18);
-    }
   }
 
   /* ----------------------------------------------------------------
@@ -716,7 +613,15 @@ select,
     );
     background-size: 200% 100%;
     background-repeat: repeat-x;
-    animation: aura-sweep-anim 20s linear infinite;
+    /* steps(600): 30 updates a second, not one per display frame. A
+       background-position loop repaints on the main thread, and this strip
+       sits where its damage made the compositor redraw about 20 backdrop
+       passes (the Home frost badges, the rail, the search bar) on EVERY
+       frame: measured on Home (2575 x 1038, 240 Hz), 23 passes and 5.4 ms
+       of GPU-process time per frame with it smooth, 7 and 1.7 ms stepped
+       (round 11). A step moves the sweep about 9 px of a 5000 px tile, under
+       a third of a level: it still reads as a smooth drift. */
+    animation: aura-sweep-anim 20s steps(600) infinite;
     mix-blend-mode: screen;  }
 
   /* ---------------------------------------------------------------- */
@@ -766,9 +671,17 @@ select,
     background-size: 100vw 100%;
     background-repeat: repeat-x;
     /* Compositor-thread sweep. Released automatically while the parent
-       is display:none during playback (the pseudo isn't rendered). */
+       is display:none during playback (the pseudo isn't rendered).
+       steps(1080): 30 moves a second, not one per display frame. Even on
+       the compositor a moving full-window layer damages the whole window,
+       so every backdrop pass in it (the Home frost badges, the rail, the
+       search bar) was redrawn on every frame of an idle page: measured on
+       Home (2575 x 1038, 240 Hz), 23 passes and 4.2 ms of GPU-process time
+       per frame smooth, about 2.5 passes stepped (round 11). A step moves
+       it under 4 px of a window-wide gradient of 0.06 to 0.10 alpha: no
+       visible change. */
     will-change: transform;
-    animation: aura-sweep-x 36s linear infinite;
+    animation: aura-sweep-x 36s steps(1080) infinite;
   }
 
   /* ---------------------------------------------------------------- */
@@ -794,10 +707,13 @@ select,
   /* OLED. The .aura-sweep title-bar strip is deliberately EXCLUDED:   */
   /* it's a 36 px-tall band where 8-bit stepping is imperceptible, so  */
   /* the dither there added visible grain without mitigating any real  */
-  /* banding (LandingView / OnboardingView reuse .aura-sweep and are   */
-  /* equally short, so they lose the noise too). Text-clipped          */
-  /* gradients (.aura-title, .aura-row-title etc.) are excluded for    */
-  /* the same reason — masked to glyphs, no large flat region.         */
+  /* banding. The landing screen and the onboarding wizard paint no    */
+  /* sweep of their own (both show .aura-ambient behind a static,      */
+  /* non-animated layer: a vignette on the wizard, an accent glow on   */
+  /* the landing screen), so the title bar is the only .aura-sweep.    */
+  /* Text-clipped                                                      */
+  /* gradients (.aura-title, .aura-hero-title etc.) are excluded      */
+  /* because they are masked to glyphs, with no large flat region.     */
   /* ---------------------------------------------------------------- */
   .aura-ambient::after {
     content: "";
@@ -854,7 +770,9 @@ select,
     /* Same loop period as the sweep so the gradient under the letters
        progresses in lockstep with the bar; the visual is the bar's
        spectrum animated through a glyph window. */
-    animation: aura-sweep-anim 20s linear infinite;    user-select: none;
+    /* Stepped like .aura-sweep (30 updates a second, same period, so the
+       two stay in lockstep): a step is a fraction of a pixel here. */
+    animation: aura-sweep-anim 20s steps(600) infinite;    user-select: none;
   }
 
   /* ---------------------------------------------------------------- */
@@ -890,22 +808,6 @@ select,
      storms that were causing scroll jank. */
   .card-contain {
     contain: layout paint style;
-  }
-
-  /* ---------------------------------------------------------------- */
-  /* Calendar "Today" cell — glow with the Aura spectrum               */
-  /* ---------------------------------------------------------------- */
-  .cal-today {
-    /* Accent-tinted fill + a bright, thick inset ring so the current day
-       reads at a glance instead of blending into the grid. The 2px inset
-       ring is the primary signal; the outer glow adds the Aura spectral
-       bloom. Paired with the filled accent day-number chip in CalendarView
-       for an unmistakable "today" marker. */
-    background: rgb(var(--ln-accent-rgb) /0.14);
-    box-shadow:
-      inset 0 0 0 2px rgb(var(--ln-accent-rgb) /0.95),
-      0 0 16px 2px rgb(var(--ln-accent-rgb) /0.45),
-      0 0 30px 8px rgba(180, 130, 255, 0.22);
   }
 
   /* ---------------------------------------------------------------- */
@@ -945,17 +847,21 @@ select,
   /*      (blue/violet/teal) so the "loading" state feels atmospheric. */
   /*   2. Heavy blur(28px) — kills any remaining banding plateaus and  */
   /*      softens the colour blobs into ambient light.                 */
-  /*   3. A slow drift keyframe (14 s, alternate) with per-blob offset */
-  /*      timings so the surface shifts like ambient light, not a wipe.*/
-  /*   4. The same SVG fractalNoise dither used on .aura-ambient::after */
+  /*   3. The same SVG fractalNoise dither used on .aura-ambient::after */
   /*      breaks the remaining quantised colour steps into per-pixel   */
   /*      noise so the panel's SDR renderer can't show hard edges.     */
+  /*                                                                   */
+  /* It is STATIC. It used to run a 14 s `background-position` drift   */
+  /* (0% 0% to 8% 4% / -6% 8% / 4% -6%), but every layer is sized       */
+  /* 100% x 100%, and a percentage position offsets an image by        */
+  /* (box - image) x p, which is 0 here: the drift moved nothing on     */
+  /* screen. It still changed the computed style every display frame,  */
+  /* so the full-viewport blur(28px) layer was repainted and re-blurred */
+  /* 240 times a second for the whole time it was uncovered (a detail  */
+  /* page still loading its art, or a title with no backdrop at all,   */
+  /* for as long as it stayed open). Same pixels, no loop. DetailView's */
+  /* `.is-covered` class is now inert.                                 */
   /* ---------------------------------------------------------------- */
-  @keyframes detail-backdrop-drift {
-    0%   { background-position: 0%  0%,  0%  0%,  0%  0%,  0 0; }
-    100% { background-position: 8%  4%, -6%  8%,  4% -6%,  0 0; }
-  }
-
   .detail-backdrop-skeleton {
     position: absolute;
     inset: 0;
@@ -966,18 +872,6 @@ select,
       rgb(8 10 14 / 1);
     background-size: 100% 100%;
     filter: blur(28px);
-    animation: detail-backdrop-drift 14s ease-in-out infinite alternate;
-  }
-
-  /* Freeze the drift once an opaque backdrop image covers the base
-   * (DetailView adds .is-covered). The drift animates background-position,
-   * so it REPAINTS a blurred full-viewport layer every display frame (239 Hz
-   * on a high-refresh monitor) even when nothing of it is visible: it was
-   * measured as most of the renderer's CPU on an idle detail page, focused,
-   * unfocused and in the tray alike. Paused rather than removed so a picker
-   * swap that uncovers it resumes from the same spot, with no jump. */
-  .detail-backdrop-skeleton.is-covered {
-    animation-play-state: paused;
   }
 
   /* Transparent stand-in for ImageLoader's built-in skeleton inside the
@@ -1046,60 +940,15 @@ select,
     50%        { filter: drop-shadow(0 4px 28px rgb(var(--ln-accent-rgb) /0.75)); }
   }
 
-  /* ---------------------------------------------------------------- */
-  /* .aura-glow — spectral-accent pill, the nav active-row indicator.  */
-  /*                                                                    */
-  /* Absolutely positioned inside each NavGroup's relative container,  */
-  /* sized ROW_H_PX tall × full width. Slides to the active row via    */
-  /* translateY driven by inline style from NavSidebar. The slight     */
-  /* spring overshoot (cubic-bezier 0.34 1.56 0.64 1) makes the pill  */
-  /* feel glassy and elastic.                                           */
-  /*                                                                    */
-  /* When the group doesn't own the active route, opacity collapses     */
-  /* to 0 via a quick 180 ms ease-out so it doesn't linger.            */
-  /*                                                                    */
-  /* aura-glow-pulse breathes the outer box-shadow gently (±15 % blur  */
-  /* and alpha) on a 3 s alternate loop so the pill reads as luminous  */
-  /* rather than static.                                                */
-  /* ---------------------------------------------------------------- */
-  .aura-glow {
-    position: absolute;
-    left: 0;
-    right: 0;
-    border-radius: 14px;
-    background:
-      linear-gradient(135deg,
-        rgb(var(--ln-accent-rgb) / 0.22) 0%,
-        rgb(var(--ln-accent-rgb) / 0.14) 60%,
-        rgb(var(--ln-accent-rgb) / 0.07) 100%);
-    border: 1px solid rgb(var(--ln-accent-rgb) /0.35);
-    box-shadow:
-      inset 0 0 0 1px rgb(255 255 255 / 0.04),
-      0 0 22px rgb(var(--ln-accent-rgb) /0.28),
-      0 0 60px rgb(var(--ln-accent-rgb) /0.10);
-    pointer-events: none;
-    transition:
-      transform 380ms cubic-bezier(0.34, 1.56, 0.64, 1),
-      opacity   180ms ease-out;
-    will-change: transform, opacity;
-    animation: aura-glow-pulse 3s ease-in-out infinite alternate;
-  }
-
-  @keyframes aura-glow-pulse {
-    from { box-shadow:
-      inset 0 0 0 1px rgb(255 255 255 / 0.04),
-      0 0 18px rgb(var(--ln-accent-rgb) /0.22),
-      0 0 50px rgb(var(--ln-accent-rgb) /0.08); }
-    to   { box-shadow:
-      inset 0 0 0 1px rgb(255 255 255 / 0.06),
-      0 0 26px rgb(var(--ln-accent-rgb) /0.32),
-      0 0 70px rgb(var(--ln-accent-rgb) /0.12); }
-  }
+  /* (.aura-glow, the old nav pill, is gone: the left rail's active pill is
+     .aura-rail-pill in styles/glass-rail.css.) */
 
   /* ---------------------------------------------------------------- */
-  /* nav-tap — sidebar/profile micro-interaction                       */
-  /* Hover scales subtly up; pressed scales down — a tactile click cue */
-  /* without any layout shift (transform-only, GPU-composited).        */
+  /* nav-tap: sidebar/profile micro-interaction                        */
+  /* Hover changes fill and colour only (a hover scale made the        */
+  /* compositor resample the label, which went soft until the layer    */
+  /* dropped); pressed scales down, a tactile click cue with no layout */
+  /* shift (transform-only, GPU-composited).                           */
   /* ---------------------------------------------------------------- */
   .nav-tap {
     transition:
@@ -1108,7 +957,7 @@ select,
       color 150ms ease,
       border-color 150ms ease;
   }
-  .nav-tap:hover  { transform: scale(1.05); }
+  .nav-tap:hover  { transform: none; }
   .nav-tap:active { transform: scale(0.95); }
 
   /* ---------------------------------------------------------------- */
@@ -1137,6 +986,12 @@ select,
   html.aura-cursor-hidden * {
     cursor: none !important;
   }
+  /* A tooltip open when the controls auto-hide (the back button's "Exit
+     playback  Esc", the bar buttons' tips) hides with them; the class goes
+     on the next mousemove / mousedown / keydown with the controls' wake. */
+  html.aura-cursor-hidden [role="tooltip"] {
+    opacity: 0 !important;
+  }
   /* When `.playing-video` is added to <html>/<body>/#root, force every
      ancestor of MPV's render target transparent. This keeps theme-based
      body backgrounds (especially Midnight's pure-black fill) from being
@@ -1161,8 +1016,8 @@ select,
   /* the user pauses playback.                                         */
   /* ---------------------------------------------------------------- */
   @keyframes aura-scrub-anim {
-    0%   { background-position: 0%   50%; }
-    100% { background-position: 200% 50%; }
+    0%   { transform: translateX(0); }
+    100% { transform: translateX(-50%); }
   }
 
   /* Next-Up card: the Play Next Episode key held toward a skip to canon.
@@ -1252,7 +1107,13 @@ select,
       inset 0 0 0 1px rgba(255, 255, 255, 0.06),
       inset 0 1px 3px rgba(0, 0, 0, 0.55),
       0 0 12px rgb(var(--ln-accent-rgb) /calc(var(--val-frac, 0.5) * 0.45));
-    animation: aura-slider-fill-anim 14s linear infinite;
+    /* steps(420): 30 updates a second, not one per display frame. The track
+       is a main-thread repaint per update, and a slider is often on screen
+       for minutes (Settings > Theme's three Cursor glow sliders, the
+       player's volume slider for the whole of playback), which kept an
+       otherwise idle page drawing a frame on every vsync. A step moves the
+       spectrum under 2 px on a 400 px track (under one 8-bit level). */
+    animation: aura-slider-fill-anim 14s steps(420) infinite;
   }
   @keyframes aura-slider-fill-anim {
     from { background-position: 0 0,    0%    50%; }
@@ -1301,7 +1162,7 @@ select,
     background-size: 200% 100%;
     background-repeat: repeat-x;
     box-shadow: 0 0 10px rgb(var(--ln-accent-rgb) /0.55);
-    animation: aura-slider-fill-anim 14s linear infinite;
+    animation: aura-slider-fill-anim 14s steps(420) infinite;
   }
   .aura-slider::-moz-range-thumb {
     width: 14px;
@@ -1316,6 +1177,25 @@ select,
   }
 
   .aura-scrub-fill {
+    /* The spectrum is a ::before strip that SLIDES (a transform the
+       compositor runs on its own), not a background-position loop: that
+       one repainted the fill on every display frame for the whole of
+       playback, even with the controls hidden. Same look: the strip is
+       4x the fill wide and repeats every half (2x the fill, the old
+       200% background-size), and sliding it by half over 6 s moves the
+       colours exactly as the old 0% -> 200% position did. The fill
+       clips it to its rounded shape; its own glow is outside the clip. */
+    overflow: hidden;
+    box-shadow: 0 0 14px rgb(var(--ln-accent-rgb) /0.55),
+                0 0 6px  rgba(180, 130, 255, 0.45);
+  }
+  .aura-scrub-fill::before {
+    content: "";
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    width: 400%;
     background: linear-gradient(
       90deg,
       rgba(91,  164, 255, 0.95)  0%,
@@ -1324,20 +1204,12 @@ select,
       rgba(180, 130, 255, 0.95) 75%,
       rgba(91,  164, 255, 0.95) 100%
     );
-    background-size: 200% 100%;
-    /* `repeat-x` is essential. The keyframes animate background-position
-       from 0% to 200%, sliding the gradient by 2× the container width
-       over each cycle — past the gradient's own bounds. With `no-repeat`
-       the bar visibly empties out toward the end of each loop and pops
-       back in when the keyframe restarts (the symptom: glow appears,
-       drifts off-screen leaving transparency behind, then reappears).
-       The gradient is symmetric (start colour == end colour) so tiling
-       joins seamlessly. */
+    /* The gradient is symmetric (start colour == end colour), so the
+       tiles join seamlessly. */
+    background-size: 50% 100%;
     background-repeat: repeat-x;
-    box-shadow: 0 0 14px rgb(var(--ln-accent-rgb) /0.55),
-                0 0 6px  rgba(180, 130, 255, 0.45);
     animation: aura-scrub-anim 6s linear infinite;
-    will-change: background-position, width;
+    will-change: transform;
   }
 
   /* ---------------------------------------------------------------- */
@@ -1370,7 +1242,12 @@ select,
     filter: drop-shadow(0 1px 0 rgba(0, 0, 0, 0.45))
             drop-shadow(0 0 14px rgb(var(--ln-accent-rgb) /0.20));
 
-    animation: aura-sweep-anim 18s linear infinite;    user-select: none;
+    /* steps(540): 30 updates a second (the .aura-title rule, round 11), not
+       one per display frame. A `background-position` loop is a main-thread
+       repaint of the glyphs and a re-run of both drop-shadows on every frame.
+       A step moves the 200% pastel gradient about 1.2 px on this 42 px title
+       (under half an 8-bit level), so the drift reads exactly as before. */
+    animation: aura-sweep-anim 18s steps(540) infinite;    user-select: none;
   }
 
   /* ---------------------------------------------------------------- */
@@ -1414,7 +1291,14 @@ select,
     filter: drop-shadow(0 1px 0 rgba(0, 0, 0, 0.45))
             drop-shadow(0 0 10px rgb(var(--ln-accent-rgb) /0.30));
 
-    animation: aura-sweep-anim 18s linear infinite;  }
+    /* steps(540): 30 updates a second, not one per display frame. This A is
+       the rail's User Panel icon whenever no one is signed in, so a smooth
+       loop repainted it (and re-ran its drop-shadows) on EVERY frame of
+       every page, damaging the rail: each damaged frame re-runs the rail's
+       backdrop pass and re-sends its lens maps (frontend-ui.md "Home
+       performance"). The sweep travels 2 x the box over 18 s, so on the
+       22 px rail icon a step is under 0.1 px: no visible change. */
+    animation: aura-sweep-anim 18s steps(540) infinite;  }
 
   /* ---------------------------------------------------------------- */
   /* aura-toast-pop — entry animation for the player's transient OSD  */
@@ -1616,61 +1500,29 @@ select,
     animation: aura-cast-fade-in 180ms ease-out;
   }
 
-  /* ---------------------------------------------------------------- */
-  /* Notification preview card — the redesigned popup that replaced  */
-  /* the older speech-bubble shape. Slides up from the bell with a    */
-  /* small overshoot, idle-breathes via a subtle accent glow, and    */
-  /* exits down + fade. Keyframes live here (not inline) for the     */
-  /* same React-19 hoisting reason the old orbit keyframes needed.    */
-  /* ---------------------------------------------------------------- */
-  @keyframes aura-popup-card-enter {
-    0%   { opacity: 0; transform: translateY(8px) scale(0.94); }
-    72%  { opacity: 1; transform: translateY(-2px) scale(1.02); }
-    100% { opacity: 1; transform: translateY(0)   scale(1); }
-  }
-  @keyframes aura-popup-card-exit {
-    0%   { opacity: 1; transform: translateY(0)   scale(1); }
-    100% { opacity: 0; transform: translateY(6px) scale(0.96); }
-  }
-  @keyframes aura-popup-card-breathe {
-    0%, 100% { box-shadow: 0 12px 36px -10px rgba(0,0,0,0.7), 0 0 22px -8px rgba(91,164,255,0.35); }
-    50%      { box-shadow: 0 12px 36px -10px rgba(0,0,0,0.7), 0 0 28px -6px rgba(91,164,255,0.55); }
-  }
-  @keyframes aura-popup-card-pulse {
-    0%, 100% { opacity: 0.7; transform: scale(0.92); }
-    50%      { opacity: 1;   transform: scale(1.18); }
-  }
-  .aura-popup-card-enter   { animation: aura-popup-card-enter  280ms cubic-bezier(0.34, 1.56, 0.64, 1) forwards; }
-  .aura-popup-card-exit    { animation: aura-popup-card-exit   200ms ease-in forwards; }
-  .aura-popup-card-breathe { animation: aura-popup-card-breathe 3.2s ease-in-out infinite; }
-  .aura-popup-card-pulse   { animation: aura-popup-card-pulse   1.6s ease-in-out infinite; }
-  /* Reduced-motion respect: skip the breathe + pulse loops; keep
-     the enter/exit transitions but make them instant + crossfade. */
-  html[data-reduced-motion="true"] .aura-popup-card-enter,
-  html[data-reduced-motion="true"] .aura-popup-card-exit,
-  html[data-reduced-motion="true"] .aura-popup-card-breathe,
-  html[data-reduced-motion="true"] .aura-popup-card-pulse {
-    animation: none;
-  }
+  /* The notification arrival bubble's motion lives in
+     styles/glass-notify.css (NotificationsBell.tsx). */
 
   /* ---------------------------------------------------------------- */
-  /* aura-buffering-pulse — wrapper used when the buffering overlay   */
-  /* has a real logo image. Slow opacity / scale breathe so the user  */
-  /* knows playback is alive while the network catches up.            */
+  /* aura-buffering-pulse: wrapper used when the buffering overlay     */
+  /* has a real logo image. Slow opacity breathe so the user knows     */
+  /* playback is alive while the network catches up. Opacity ONLY: a   */
+  /* scale resampled the filtered layer (soft title mid-pulse) and the */
+  /* old dark halo banded as the pulse re-quantized it.                */
   /* ---------------------------------------------------------------- */
   .aura-buffering-pulse {
     animation: aura-buffering-pulse 2.4s ease-in-out infinite;
-    will-change: opacity, transform;
+    will-change: opacity;
   }
 
   /* ---------------------------------------------------------------- */
-  /* aura-buffering-text — fade-pulsing gradient title shown over MPV  */
+  /* aura-buffering-text: fade-pulsing gradient title shown over MPV   */
   /* while it's paused-for-cache. Reuses the title-bar wordmark fill  */
   /* technique (background-clip: text + animated gradient).            */
   /* ---------------------------------------------------------------- */
   @keyframes aura-buffering-pulse {
-    0%, 100% { opacity: 0.55; transform: scale(0.985); }
-    50%      { opacity: 1.00; transform: scale(1.000); }
+    0%, 100% { opacity: 0.55; }
+    50%      { opacity: 1.00; }
   }
   .aura-buffering-text {
     background: linear-gradient(
@@ -1687,39 +1539,34 @@ select,
     background-clip: text;
     color: transparent;
     -webkit-text-fill-color: transparent;
-    filter: drop-shadow(0 1px 0 rgba(0, 0, 0, 0.65))
-            drop-shadow(0 0 16px rgb(var(--ln-accent-rgb) /0.32));
+    /* Size: text-5xl (48px) + ~30%, scaled down with the window height so a
+       small window never crowds the frame; a long title wraps, balanced,
+       inside 84vw instead of running off the edge. */
+    font-size: clamp(2.25rem, 10vh, 3.9rem);
+    line-height: 1.1;
+    text-align: center;
+    text-wrap: balance;
+    max-width: 84vw;
+    /* A tight dark EDGE only (see "BufferingOverlay legibility" below): a 1px
+       and a 1.5px outline and a 2.5px contact shadow (the same edge darkness
+       over a white frame as the old chain, reach 7 px). The old chain added a 10px dark halo
+       and a 14px accent glow; both followed the letter shapes and read as a
+       rounded blob around the word. */
+    filter: drop-shadow(0 0 1px rgb(0 0 0 / 0.9))
+            drop-shadow(0 0 1.5px rgb(0 0 0 / 0.55))
+            drop-shadow(0 1px 2.5px rgb(0 0 0 / 0.35));
+    /* The sweep is steps(480), 30 updates a second (the .aura-title rule):
+       each update repaints the title and re-runs its three drop-shadows. The
+       pastel gradient moves under half a level per step even at 84vw. The
+       pulse is opacity on its own layer (compositor), so it stays smooth. */
     animation:
-      aura-sweep-anim         16s linear infinite,
+      aura-sweep-anim         16s steps(480) infinite,
       aura-buffering-pulse     2.4s ease-in-out infinite;
-    will-change: background-position, opacity, transform;
+    will-change: opacity;
   }
 
-  /* ---------------------------------------------------------------- */
-  /* aura-row-title — gradient-filled catalog row headers              */
-  /* Same spectral palette the title bar wordmark uses, animated in    */
-  /* lockstep with the sweep so the text feels alive when paused.      */
-  /* ---------------------------------------------------------------- */
-  .aura-row-title {
-    /* Accent-reactive shimmer: the catalog/section headers sweep between the
-       theme accent and white, so they recolour with the active theme. */
-    background: linear-gradient(
-      90deg,
-      rgb(var(--ln-accent-rgb) / 0.95)  0%,
-      rgba(255, 255, 255, 0.95) 25%,
-      rgb(var(--ln-accent-rgb) / 0.92) 50%,
-      rgba(255, 255, 255, 0.95) 75%,
-      rgb(var(--ln-accent-rgb) / 0.95) 100%
-    );
-    background-size: 200% 100%;
-    background-repeat: repeat-x;
-    -webkit-background-clip: text;
-    background-clip: text;
-    color: transparent;
-    -webkit-text-fill-color: transparent;
-    filter: drop-shadow(0 1px 0 rgba(0, 0, 0, 0.35))
-            drop-shadow(0 0 6px rgb(var(--ln-accent-rgb) /0.16));
-    animation: aura-sweep-anim 20s linear infinite;  }
+  /* aura-row-title: see "Row and page titles" in the GLASS SYSTEM block
+     (round 11: the animated accent shimmer is gone). */
 
   /* ---------------------------------------------------------------- */
   /* aura-update-* — entrance for the centered "Update Available"     */
@@ -1784,14 +1631,6 @@ select,
     65%  { transform: scale(1.18); opacity: 1; }
     100% { transform: scale(1.00); opacity: 1; }
   }
-  @keyframes aura-bell-panel-in {
-    from { opacity: 0; transform: translateY(8px) scale(0.98); }
-    to   { opacity: 1; transform: translateY(0)   scale(1.00); }
-  }
-  @keyframes aura-bell-panel-out {
-    from { opacity: 1; transform: translateY(0)    scale(1.00); }
-    to   { opacity: 0; transform: translateY(10px) scale(0.96); }
-  }
   .aura-bell-hover:hover {
     animation: aura-bell-wiggle 0.6s ease-in-out;
   }
@@ -1804,70 +1643,6 @@ select,
     will-change: transform, opacity;
   }
 
-  /* ---------------------------------------------------------------- */
-  /* Recurring "you have unread mail" attention animation. Applied    */
-  /* whenever there's at least one DISMISSABLE unread notification    */
-  /* in the bell (ie. anything other than the always-pinned `update`  */
-  /* kind). The bell rings briefly every cycle and the count badge    */
-  /* bounces in lockstep — 5 s cycle gives a polite rhythm without    */
-  /* feeling like a slot machine.                                     */
-  /* ---------------------------------------------------------------- */
-  @keyframes aura-bell-ring {
-    /* Rest 0-70 % of the cycle; ring 70-90 %; settle 90-100 %.       */
-    0%, 70%, 100% { transform: rotate(0deg); }
-    73%           { transform: rotate(-14deg); }
-    76%           { transform: rotate( 12deg); }
-    79%           { transform: rotate( -8deg); }
-    82%           { transform: rotate(  5deg); }
-    85%           { transform: rotate( -3deg); }
-    88%           { transform: rotate(  0deg); }
-  }
-  @keyframes aura-bell-badge-bounce {
-    /* Bounce timed to the ring's peak (76-82 %) so badge + bell      */
-    /* read as one motion. */
-    0%, 70%, 100% { transform: scale(1); }
-    76%           { transform: scale(1.30); }
-    82%           { transform: scale(1.00); }
-  }
-  .aura-bell-ringing {
-    animation: aura-bell-ring 5s ease-in-out infinite;
-    transform-origin: 50% 18%;
-    will-change: transform;
-  }
-  .aura-bell-badge-bouncing {
-    animation: aura-bell-badge-bounce 5s ease-in-out infinite;
-    transform-origin: center;
-    will-change: transform;
-  }
-  .aura-bell-panel-in {
-    animation: aura-bell-panel-in 220ms cubic-bezier(0.16, 1, 0.3, 1) both;
-    transform-origin: bottom left;
-    will-change: opacity, transform;
-  }
-  .aura-bell-panel-out {
-    animation: aura-bell-panel-out 200ms cubic-bezier(0.4, 0.0, 1, 1) forwards;
-    transform-origin: bottom left;
-    will-change: opacity, transform;
-    pointer-events: none;
-  }
-
-  /* Latest-aired marker on Continue Watching cards — a small green caret  */
-  /* that bobs gently to point at the newest aired episode.                */
-  /* Bob LIFTS the caret up and back to its resting gap above the bar, so it
-     never dips into the episode line (its closest point is the resting pose). */
-  @keyframes aura-latest-aired-bob {
-    0%, 100% { transform: translateY(0); }
-    50%      { transform: translateY(-4px); }
-  }
-  .aura-latest-aired-caret {
-    animation: aura-latest-aired-bob 1.2s ease-in-out infinite;
-    transform-origin: center;
-    will-change: transform;
-  }
-
-  @media (prefers-reduced-motion: reduce) {
-    .aura-latest-aired-caret { animation: none; }
-  }
 
   /* ------------------------------------------------------------------ */
   /* One-shot enter transitions                                          */
@@ -1889,8 +1664,17 @@ select,
   /* `position: fixed` descendant inside the views, which silently       */
   /* re-anchors fixed overlays (cast bar, modals, toasts) to the wrapper */
   /* instead of the viewport. Do not add one.                            */
+  /* Fill BACKWARDS, never `both` / `forwards`: a finished opacity        */
+  /* animation that still fills keeps this wrapper a Backdrop Root for   */
+  /* good, so every glass surface in a view (the Home search bar, menus, */
+  /* popovers) sampled only the view's own pixels, without the opaque   */
+  /* page background behind them. Over a transparent backdrop the blur   */
+  /* comes out mostly transparent and the crisp page under it shows      */
+  /* through: poster TITLES (text on nothing) read sharp through the     */
+  /* search bar while the opaque posters blurred. The `to` frame is the  */
+  /* base style, so dropping the hold changes nothing visible.           */
   .aura-view-enter {
-    animation: aura-view-fade 150ms ease-out both;
+    animation: aura-view-fade 150ms ease-out backwards;
   }
   @keyframes aura-view-fade {
     from { opacity: 0; }
@@ -1940,11 +1724,13 @@ select,
   /* History header swapping between the page title and the selection  */
   /* toolbar. The small rise is what makes the mode change register:     */
   /* the old floating selection bar appeared in one frame and was easy   */
-  /* to miss. Ends on `transform: none`, not translateY(0): with fill    */
-  /* mode `both` the end value persists, and any residual transform      */
-  /* would make this row a containing block for fixed descendants.       */
+  /* to miss. Fills BACKWARDS, like .aura-view-enter (see there): a      */
+  /* finished opacity animation that still fills keeps the element a     */
+  /* Backdrop Root, and the Onboarding step scroller wears this class,   */
+  /* so any glass inside it sampled only the scroller. The `to` frame is */
+  /* the base style, so nothing visible changes.                         */
   .aura-header-swap {
-    animation: aura-header-swap 180ms cubic-bezier(0.22, 1, 0.36, 1) both;
+    animation: aura-header-swap 180ms cubic-bezier(0.22, 1, 0.36, 1) backwards;
   }
   @keyframes aura-header-swap {
     from { opacity: 0; transform: translateY(5px); }
@@ -2235,26 +2021,6 @@ select option:hover {
   }
 }
 
-/* ---------------------------------------------------------------------------
-   Queue click pulse — brief shrink-then-restore on every Queue click.
-   The active pill (.aura-glow) handles the persistent active state for
-   Queue same as every other row; this pulse is a one-shot "click
-   acknowledged" cue tuned for Queue specifically, since Queue is
-   visually smaller than the rest of the sidebar rows and a regular
-   pill slide-in on its own reads as muted.
-   --------------------------------------------------------------------------- */
-.aura-queue-click-pulse {
-  animation: aura-queue-click-pulse 280ms cubic-bezier(0.4, 0, 0.2, 1) forwards;
-  transform-origin: center;
-  will-change: transform;
-}
-
-@keyframes aura-queue-click-pulse {
-  0%   { transform: scale(1);    }
-  45%  { transform: scale(0.92); }
-  100% { transform: scale(1);    }
-}
-
 /* ---------------------------------------------------------------- */
 /* Settings search — fade + slight rise when a section enters the    */
 /* visible set, so the filter feels responsive rather than abrupt.   */
@@ -2311,26 +2077,19 @@ html[data-reduced-motion="true"] .aura-sweep::after,
 html[data-reduced-motion="true"] .aura-ambient,
 html[data-reduced-motion="true"] .aura-ambient::before,
 html[data-reduced-motion="true"] .aura-ambient::after,
-html[data-reduced-motion="true"] .detail-backdrop-skeleton,
-html[data-reduced-motion="true"] .aura-glow,
-html[data-reduced-motion="true"] .aura-bell-ringing,
-html[data-reduced-motion="true"] .aura-bell-badge-bouncing,
 html[data-reduced-motion="true"] .aura-popup-breathe,
 html[data-reduced-motion="true"] .aura-title,
-html[data-reduced-motion="true"] .aura-row-title,
 html[data-reduced-motion="true"] .aura-hero-title,
-html[data-reduced-motion="true"] .aura-logo-a,
-html[data-reduced-motion="true"] .aura-latest-aired-caret,
-html[data-reduced-motion="true"] .hover-glow:hover {
+html[data-reduced-motion="true"] .aura-logo-a {
   animation: none !important;
 }
 
-/* Reduced motion: collapse the accent-SHIMMER gradient-text fills (catalog row
-   headers + the home hero title) to ONE solid accent colour - they otherwise
-   freeze two-tone (accent + the white highlight). The title-bar branding
-   (.aura-title + .aura-logo-a) is deliberately EXCLUDED: it keeps its original
-   spectral gradient, simply frozen in place by the animation: none above. */
-html[data-reduced-motion="true"] .aura-row-title,
+/* Reduced motion: collapse the accent-SHIMMER gradient-text fill of the home
+   hero title to ONE solid accent colour - it otherwise freezes two-tone
+   (accent + the white highlight). The title-bar branding (.aura-title +
+   .aura-logo-a) is deliberately EXCLUDED: it keeps its original spectral
+   gradient, simply frozen in place by the animation: none above. Row titles
+   no longer shimmer (round 11). */
 html[data-reduced-motion="true"] .aura-hero-title {
   background: none !important;
   -webkit-text-fill-color: rgb(var(--ln-accent-rgb)) !important;
@@ -2392,11 +2151,14 @@ html[data-reduced-motion="true"] .aura-detail-title-slot {
   will-change: scroll-position;
 }
 
-/* Hover effects would otherwise start on every card a scroll carries under the pointer. */
-html[data-aura-scrolling] .card-grow {
+/* Hover effects would otherwise start on every card a scroll carries under the pointer. The
+   card already under it when the scroll starts (`data-hover-held`, src/scrollPause.ts) keeps
+   its look: dropping it to 0.94 snapped its edges 11 px on the first frame of every notch and
+   grew it back 160 ms after the page stopped, which read as the page jiggling. */
+html[data-aura-scrolling] .card-grow:not([data-hover-held]) {
   transition: none !important;
 }
-html[data-aura-scrolling] .card-grow:hover {
+html[data-aura-scrolling] .card-grow:not([data-hover-held]):hover {
   transform: scale(0.94);
   filter: none;
 }
@@ -2414,22 +2176,20 @@ html[data-aura-scrolling] .aura-ambient::before,
 html[data-aura-scrolling] .aura-title,
 html[data-aura-scrolling] .aura-hero-title,
 html[data-aura-scrolling] .aura-logo-a,
-html[data-aura-scrolling] .aura-row-title,
 html[data-aura-scrolling] .image-loader-skeleton,
-html[data-aura-scrolling] .detail-backdrop-skeleton,
-html[data-aura-scrolling] .aura-glow,
-html[data-aura-scrolling] .aura-bell-ringing,
-html[data-aura-scrolling] .aura-bell-badge-bouncing,
-html[data-aura-scrolling] .aura-latest-aired-caret,
-html[data-aura-scrolling] .aura-pill-alert,
 html[data-aura-scrolling] .aura-pill-live-dot,
 html[data-aura-scrolling] .aura-dl-alert,
 html[data-aura-scrolling] .aura-poster-retry-dot,
 html[data-aura-scrolling] .aura-popup-breathe,
-html[data-aura-scrolling] .aura-popup-card-breathe,
-html[data-aura-scrolling] .aura-popup-card-pulse,
-html[data-aura-scrolling] .hover-glow:hover,
 html[data-aura-scrolling] .aura-bar-btn:hover {
+  animation-play-state: paused !important;
+}
+
+/* An image skeleton whose tile is not in view yet (ImageLoader.tsx stamps
+   data-skeleton-parked until its observer fires) holds its shimmer still: a
+   tile below the fold, clipped by the page scroller, otherwise shimmered and
+   re-rastered on every frame of an idle page. */
+[data-skeleton-parked] {
   animation-play-state: paused !important;
 }
 
@@ -2439,19 +2199,10 @@ html[data-aura-idle="true"] .aura-ambient,
 html[data-aura-idle="true"] .aura-ambient::before,
 html[data-aura-idle="true"] .aura-ambient::after,
 html[data-aura-idle="true"] .aura-title,
-html[data-aura-idle="true"] .aura-row-title,
 html[data-aura-idle="true"] .aura-logo-a,
 html[data-aura-idle="true"] .aura-hero-title,
-html[data-aura-idle="true"] .aura-glow,
-html[data-aura-idle="true"] .aura-bell-ringing,
-html[data-aura-idle="true"] .aura-bell-badge-bouncing,
-html[data-aura-idle="true"] .hover-glow:hover,
-html[data-aura-idle="true"] .detail-backdrop-skeleton,
 html[data-aura-idle="true"] .aura-popup-breathe,
-html[data-aura-idle="true"] .aura-popup-card-breathe,
-html[data-aura-idle="true"] .aura-popup-card-pulse,
-html[data-aura-idle="true"] .aura-latest-aired-caret,
-html[data-aura-idle="true"] .aura-scrub-fill,
+html[data-aura-idle="true"] .aura-scrub-fill::before,
 html[data-aura-idle="true"] .aura-buffering-text,
 html[data-aura-idle="true"] .aura-buffering-pulse {
   animation-play-state: paused !important;
@@ -2482,6 +2233,88 @@ html[data-aura-idle="true"] .aura-slider::-webkit-slider-runnable-track {
 html[data-reduced-motion="true"] .aura-slider::-webkit-slider-runnable-track {
   animation: none !important;
 }
+/* And held still while anything scrolls, like every loop in the scrolling
+   list above (Settings scrolls with sliders on screen). Its own rule for the
+   same vendor-pseudo reason. */
+html[data-aura-scrolling] .aura-slider::-webkit-slider-runnable-track {
+  animation-play-state: paused !important;
+}
+
+/* BufferingOverlay legibility (PlayerOverlay.tsx). There is NO scrim: the
+   webview is composited over the mpv video at 8 bits with no dither, so any
+   large slow dark ramp bands over a dark frame (the old 720 x 385 px ellipse
+   at 0.5 made 1-code plateaus up to 50 px wide, read as contour rings), and a
+   grain to break it shows as speckle (the white grain lifted the rim above the
+   frame itself, a noisy outline). A dither cannot fix it from here either:
+   over video level v a black layer can only produce v * (1 - a), so smoothing
+   it needs alpha noise near 1/v, which is loud grain over a bright frame.
+   Instead every dark layer is an EDGE, a few px wide: a 1px + 1.5px outline
+   and a 2.5px contact shadow on the title (.aura-buffering-text), a 1px outline + 2px
+   contact shadow on the logo, a stacked 1px outline on the labels (their
+   fill is white 0.70 / 0.65 so they read over mid-grey frames without a
+   scrim), and a hairline + tight shadow on the progress track. Over a dark
+   frame the steps are a few px apart at most (old scrim: up to 50 px) and
+   over a bright one the edge carries the type.
+   NO glow (2026-11-19, user: the halo "follows the letter shapes and reads
+   like a rounded blob outline"): the old 10px / 6px dark halos and the
+   14px / 16px accent drop-shadows were shape-hugging by construction (a
+   drop-shadow IS the silhouette, blurred), and measured as a 19-29 px
+   coloured band around the word / logo. A shape-independent ambient light
+   would be a large slow gradient over video, which bands at 8 bits, so
+   there is none. Do not bring back a blur wider than ~3 px here.
+   Static shadows on the labels; the title and logo ones pulse with them
+   (opacity only, and a few-px ramp re-quantizing reads as nothing).
+   Unlayered so the content scan cannot drop them. No animation, so nothing
+   here is in a pause list. */
+.aura-buffering-logo {
+  filter: drop-shadow(0 0 1px rgb(0 0 0 / 0.6))
+          drop-shadow(0 1px 2px rgb(0 0 0 / 0.4));
+}
+.aura-buffering-label {
+  text-shadow: 0 0 1px rgb(0 0 0 / 0.95), 0 0 1px rgb(0 0 0 / 0.95), 0 1px 3px rgb(0 0 0 / 0.6);
+}
+.aura-buffering-track {
+  height: 4px;
+  box-shadow: 0 0 0 1px rgb(0 0 0 / 0.22), 0 1px 4px rgb(0 0 0 / 0.35);
+}
+/* BufferingOverlay size (2026-11-19: about 30% larger than the old
+   max-h-32 logo / text-5xl title / 12.5px labels, scaled by the window).
+   The logo box is sized from the logo's ASPECT RATIO, not its natural pixels
+   (the old `max-h-32 w-auto` only capped the height, so a logo served at
+   420 x 72 rendered 72 px tall): height = h0 * ar^-0.2, so a wide wordmark is
+   a little shorter and a square emblem a little taller, capped by a max
+   height and by the window width. PlayerOverlay.tsx sets --aura-logo-ar
+   (clamped 0.5..8) and --aura-logo-k (ar^-0.2). A 2.58 fanart wordmark is
+   169 px tall (was 128) from a 618 px tall window up and at least +25% at
+   the 600 px minimum window (every size here clears +25% there); a very wide one is
+   capped at 760 px / 72vw. */
+.aura-buffering-logo {
+  --aura-logo-h0: clamp(110px, 33vh, 204px);
+  --aura-logo-max-h: clamp(80px, 28vh, 190px);
+  --aura-logo-max-w: min(72vw, 760px);
+  height: min(
+    calc(var(--aura-logo-h0) * var(--aura-logo-k, 0.83)),
+    var(--aura-logo-max-h),
+    calc(var(--aura-logo-max-w) / var(--aura-logo-ar, 2.5))
+  );
+  aspect-ratio: var(--aura-logo-ar, 2.5);
+}
+.aura-buffering-status {
+  font-size: clamp(13px, 2.7vh, 16px);
+}
+.aura-buffering-pct {
+  font-size: clamp(13px, 2.75vh, 16.5px);
+}
+.aura-buffering-progress {
+  width: clamp(160px, 35vh, 208px);
+}
+/* The overlay stays mounted at opacity 0 for the whole of playback: stop its
+   loops (the 16s sweep repaints the title and re-runs its drop-shadow blur
+   every frame) and release their layers while hidden. */
+.aura-buffering-root:not([data-show="true"]) :is(.aura-buffering-text, .aura-buffering-pulse) {
+  animation-play-state: paused;
+  will-change: auto;
+}
 
 /* ---------------------------------------------------------------- */
 /* Focused user-idle decorative suspend                             */
@@ -2503,10 +2336,8 @@ html[data-aura-user-idle="true"] .aura-ambient,
 html[data-aura-user-idle="true"] .aura-ambient::before,
 html[data-aura-user-idle="true"] .aura-ambient::after,
 html[data-aura-user-idle="true"] .aura-title,
-html[data-aura-user-idle="true"] .aura-row-title,
 html[data-aura-user-idle="true"] .aura-logo-a,
-html[data-aura-user-idle="true"] .aura-hero-title,
-html[data-aura-user-idle="true"] .detail-backdrop-skeleton {
+html[data-aura-user-idle="true"] .aura-hero-title {
   animation-play-state: paused !important;
   /* Same compositor-layer release as the away tier. */
   will-change: auto !important;
@@ -2594,51 +2425,6 @@ html[data-reduced-motion="true"] .aura-vote-burst { display: none !important; }
 
 
 /* ------------------------------------------------------------------ */
-/* aura-hud-surface — the detail page's metadata panel.                */
-/*                                                                    */
-/* NOT .glass-panel-elevated. That class composites --ln-glass-3 over  */
-/* --ln-panel-solid, and --ln-glass-3 is TINTED PER THEME (the warm    */
-/* theme sets rgba(255,178,110,0.14)). Over a dark scrim, as in the    */
-/* changelog, that tint reads as a subtle warmth. Over full-bleed key  */
-/* art it becomes a large accent-coloured fill across the widest       */
-/* element on the page, which is the one place an accent should never  */
-/* go: accents mark things, they do not fill areas.                    */
-/*                                                                    */
-/* This follows the PLAYER surface reasoning instead (see the note     */
-/* above .aura-glass-menu): a baked-in dark gradient guarantees a      */
-/* legible, neutral base whatever is behind it, while the blur and     */
-/* saturate keep the refractive feel. Rim and text stay white-alpha,   */
-/* so the only accent in this region is the active tab.                */
-/* ------------------------------------------------------------------ */
-.aura-hud-surface {
-  background:
-    linear-gradient(rgba(10, 12, 16, 0.80), rgba(10, 12, 16, 0.80)),
-    linear-gradient(rgba(255, 255, 255, 0.05), rgba(255, 255, 255, 0.05));
-  border: 1px solid rgba(255, 255, 255, 0.10);
-  backdrop-filter: blur(var(--ln-blur-elev, 24px)) saturate(1.15);
-  -webkit-backdrop-filter: blur(var(--ln-blur-elev, 24px)) saturate(1.15);
-}
-/* Zero-blur themes have no blur to lean on, so go fully opaque rather
-   than leaving a translucent panel see-through over bright art. */
-html[data-theme="midnight"] .aura-hud-surface,
-html[data-theme="contrast"] .aura-hud-surface,
-html[data-theme="contrast-azure"] .aura-hud-surface {
-  background: var(--ln-panel-solid, #0b0d12);
-}
-
-/* Tab pills for the detail HUD. They sit directly on key art, which can be
-   any brightness, so an inactive pill built from white-alpha alone washed out
-   completely over a pale frame. Same answer as the panel beneath them: carry
-   a dark base of their own rather than borrowing whatever is behind. */
-.aura-hud-tab {
-  background: rgba(10, 12, 16, 0.62);
-  backdrop-filter: blur(10px) saturate(1.1);
-  -webkit-backdrop-filter: blur(10px) saturate(1.1);
-  text-shadow: 0 1px 4px rgba(0, 0, 0, 0.75);
-}
-.aura-hud-tab:hover { background: rgba(10, 12, 16, 0.78); }
-
-/* ------------------------------------------------------------------ */
 /* aura-synopsis-swap — the Overview synopsis changing source.        */
 /*                                                                    */
 /* Episodes are selected at the far RIGHT of the detail page and this  */
@@ -2687,41 +2473,1508 @@ html[data-reduced-motion="true"] .aura-poster-retry-dot {
 /* three 40px bubbles pinned to arbitrary offsets. They now float over */
 /* the catalog and refract it.                                        */
 /*                                                                    */
-/* Built on the .aura-hud-surface reasoning, NOT .glass-panel-elevated:*/
+/* Built on the old detail HUD reasoning, NOT .glass-panel-elevated:   */
 /* --ln-glass-3 is tinted per theme, and over a wide element sitting   */
 /* on bright key art that tint reads as an accent-coloured fill. A     */
 /* baked dark gradient guarantees a legible neutral base whatever is   */
 /* behind it, and the blur plus saturate supply the refraction.        */
 /* ------------------------------------------------------------------ */
 
-.aura-float-glass {
+/* ================================================================== */
+/* GLASS SYSTEM                                                         */
+/*                                                                    */
+/* Two materials, one set of classes. <html data-glass> picks the     */
+/* material (src/glassStyle.ts): "frosted" (default, the cleaned-up    */
+/* .aura-float-glass) or "liquid" (opt-in, the glass study's style B). */
+/* Liquid falls back to Frosted with hardware acceleration off.        */
+/*                                                                    */
+/* EVERY glass class paints from the same four declarations (the      */
+/* shared rule below): background, border, box-shadow, backdrop-filter.*/
+/* The materials and tiers only swap CUSTOM PROPERTIES:                */
+/*   --lg-face      the face gradients (bottom layers)                 */
+/*   --lg-border-c  the 1px border colour (Liquid: --lg-face-ring,     */
+/*                  transparent while bound)                           */
+/*   --lg-edge      inset shading (Frosted hairlines, Liquid meniscus) */
+/*   --lg-drop      outer shadow                                       */
+/*   --lg-backdrop  the whole backdrop-filter value                    */
+/*   --lg-base      background-color under the face (zero-blur themes) */
+/* and expose four hooks a surface may set (never the properties):     */
+/*   --lg-lift      0..0.1 white lift over the face (hover/selected)    */
+/*   --lg-ring      an extra box-shadow (state rings), first in list    */
+/*   --lg-deco      one extra background layer under the glint          */
+/*   --gx / --gy    the cursor glint position (src/glassGlint.ts only)  */
+/*   --gr --gnx --gny --lg-glint-a  its radius, pointer direction and  */
+/*                  fade (src/glassGlint.ts only; --lg-rimlight reads  */
+/*                  them, a box-shadow entry after --lg-ring)          */
+/* A consumer that sets background / border / box-shadow DIRECTLY on a */
+/* glass element overrides BOTH materials: set the hooks instead.      */
+/*                                                                    */
+/* Liquid floating glass is refracted by src/liquidGlass.ts: it gives  */
+/* each element a per-size SVG filter (`--lg-filter`, attribute        */
+/* data-lg-bound) that bakes the face, the meniscus and the caustic    */
+/* pickup into the backdrop pass. Unbound (first frame, oversized,     */
+/* tooltips, the zero-blur themes) the same face is drawn in CSS here. */
+/* ================================================================== */
+
+@property --lg-lift {
+  syntax: "<number>";
+  inherits: false;
+  initial-value: 0;
+}
+/* A glass switch's on amount (0 off, 1 on). Liquid's track tint and sheen
+   are scaled by it, so turning a switch on FADES the tint (a gradient layer
+   swap would snap while the knob springs). */
+@property --lg-toggle-on {
+  syntax: "<number>";
+  inherits: false;
+  initial-value: 0;
+}
+/* The glint position and gradient are written per frame on ONE element
+   (src/glassGlint.ts). Registered non-inheriting so that write invalidates
+   only that element's style, never its subtree (an unregistered custom
+   property inherits, so a hovered panel with hundreds of rows would restyle
+   every row each frame), and a nested glass button never sees its parent's
+   position. */
+@property --gx {
+  syntax: "<length>";
+  inherits: false;
+  initial-value: -999px;
+}
+@property --gy {
+  syntax: "<length>";
+  inherits: false;
+  initial-value: -999px;
+}
+@property --lg-glint {
+  syntax: "*";
+  inherits: false;
+}
+/* The light's reach (3 sigma, the fallback gradient's radius), its image
+   (a dithered SVG built by glassGlint.ts) and that image's half size, all
+   written when the pointer enters an element; the pointer's direction from
+   the centre (-1..1, for the rim catch-light), the light's intensity (0..1,
+   faded by glassGlint.ts's rAF loop as an inline write: never WAAPI or a CSS
+   transition, which a box-shadow transition's base style cannot see, so it
+   blanked the rim catch-light), and the per-element rim built from them.
+   Same reason: non-inheriting, so the per-frame writes and the fade restyle
+   the lit element alone. */
+@property --gr {
+  syntax: "<length>";
+  inherits: false;
+  initial-value: 320px;
+}
+@property --gw {
+  syntax: "<length>";
+  inherits: false;
+  initial-value: 0px;
+}
+@property --gh {
+  syntax: "<length>";
+  inherits: false;
+  initial-value: 0px;
+}
+/* <image> with a transparent initial value, so a lit element whose image is
+   not written yet paints nothing instead of voiding its whole background. */
+@property --lg-glint-img {
+  syntax: "<image>";
+  inherits: false;
+  initial-value: linear-gradient(transparent, transparent);
+}
+@property --gnx {
+  syntax: "<number>";
+  inherits: false;
+  initial-value: 0;
+}
+@property --gny {
+  syntax: "<number>";
+  inherits: false;
+  initial-value: 0;
+}
+@property --lg-glint-a {
+  syntax: "<number>";
+  inherits: false;
+  initial-value: 0;
+}
+@property --lg-rimlight {
+  syntax: "*";
+  inherits: false;
+}
+/* The rim light (round 9): the `aura-rim` paint worklet's layer (top of the
+   background list, border-box) and its per-surface idle strengths, all
+   non-inheriting like the glint. --lg-idle-k (the document-wide idle factor:
+   1 idle, 0.62 while the pointer is live, 0 on High Contrast) and --lg-disp
+   (chromatic dispersion, 0 with hardware acceleration off) are set on the
+   root and INHERIT; they change rarely (idle transitions only). */
+@property --lg-rim-layer {
+  syntax: "*";
+  inherits: false;
+}
+@property --lg-idle-tl {
+  syntax: "<number>";
+  inherits: false;
+  initial-value: 0;
+}
+@property --lg-idle-mid {
+  syntax: "<number>";
+  inherits: false;
+  initial-value: 0;
+}
+@property --lg-idle-br {
+  syntax: "<number>";
+  inherits: false;
+  initial-value: 0;
+}
+@property --lg-idle-k {
+  syntax: "<number>";
+  inherits: true;
+  initial-value: 1;
+}
+@property --lg-disp {
+  syntax: "<number>";
+  inherits: true;
+  initial-value: 1;
+}
+/* The hero bleed's face crop (styles/glass-hero.css, HeroBleed.tsx): one
+   background layer under the face of fixed glass marked [data-glass-bleed],
+   written per element (never on the root: an inherited write would restyle
+   the page on every scroll step). */
+@property --lg-bleed {
+  syntax: "*";
+  inherits: false;
+}
+/* The row titles' bleed tint (bleedTint.ts, round 11): the colour of the
+   hero bleed at the title and its strength 0..1, written per title (never
+   inherited, for the same reason) and TRANSITIONED by .aura-row-title, so a
+   slide change or a settled scroll eases over. */
+@property --lg-bleed-tint {
+  syntax: "<color>";
+  inherits: false;
+  initial-value: rgb(255 255 255);
+}
+@property --lg-bleed-tint-k {
+  syntax: "<number>";
+  inherits: false;
+  initial-value: 0;
+}
+
+:root {
+  --lg-spatial: cubic-bezier(0.34, 1.56, 0.64, 1);
+  --lg-cinematic: cubic-bezier(0.16, 1, 0.3, 1);
+  --lg-springy: linear(0, 0.2 7%, 0.52 17%, 0.84 29%, 1.035 43%, 1.025 55%, 0.997 70%, 1);
+
+  /* Spring tokens: real damped springs (mass 1, closed-form underdamped
+     response sampled to its settle time, max error 0.002). Pair each easing
+     with its -dur. Only on transforms / sizes, NEVER on opacity: the curves
+     go past 1 and an opacity clamp (or an undershoot below 0) would flicker,
+     so a pop fades on its own animation. Reduced motion collapses both. */
+  /* snappy k=600 c=38: zeta 0.776, overshoot 2.1% at 203ms, settles 322ms */
+  --aura-spring-snappy: linear(0, 0.0062 1.45%, 0.0255 3.05%, 0.0577 4.75%, 0.1031 6.6%, 0.1473 8.15%, 0.2035 9.95%, 0.4388 16.95%, 0.5428 20.2%, 0.6413 23.6%, 0.7238 26.85%, 0.7922 30%, 0.8492 33.15%, 0.8977 36.45%, 0.9367 39.85%, 0.9691 43.65%, 0.993 47.75%, 1.0092 52.25%, 1.0184 57.4%, 1.02 67.45%, 1);
+  --aura-spring-snappy-dur: 320ms;
+  /* bouncy k=420 c=24: zeta 0.586, overshoot 10.3% at 189ms, settles 479ms */
+  --aura-spring-bouncy: linear(0, 0.0077 1.3%, 0.0315 2.7%, 0.0717 4.2%, 0.1278 5.8%, 0.1831 7.15%, 0.2531 8.7%, 0.5363 14.5%, 0.6546 17.05%, 0.7654 19.7%, 0.8574 22.25%, 0.9324 24.75%, 0.9922 27.25%, 1.0383 29.8%, 1.0716 32.45%, 1.0874 34.35%, 1.0976 36.3%, 1.1027 38.4%, 1.1028 40.65%, 1.0979 43.1%, 1.0878 45.9%, 1.0198 60.35%, 1.0065 64.45%, 0.9971 68.65%, 0.9909 73.9%, 0.9894 79.95%, 1);
+  --aura-spring-bouncy-dur: 480ms;
+
+  /* Cursor light (round 9, the A direction; frontend-ui.md "The cursor
+     light"). glassGlint.ts reads these when the pointer goes live. Every
+     surface within --lg-rim-r of the pointer is lit:
+       - interior: a WHITE radial of radius --lg-rim-r, peak
+         --lg-light-peak-* (3.5%), 10.7% of it at 60% of the radius, 0 at
+         the edge, a dithered image (glassGlint.ts lightImage). It replaced
+         round 7's 60%-accent Gaussian "rolling hill" (the user's new pick).
+       - rim: the 1px ring of the aura-rim paint worklet (round 12): a crisp
+         cool specular glint, peak --lg-rim-peak, on the rim point nearest
+         the pointer, a soft tail around the pointer and a bounce on the
+         opposite edge, with chromatic dispersion (--lg-disp) on the glint.
+     Peaks are alphas 0..1, scaled by the element's --lg-glint-a fade. */
+  --lg-glint-c: #fff;
+  --lg-light-peak-ctl: 0.035;    /* interior light, controls */
+  --lg-light-peak-panel: 0.035;  /* interior light, panels and menus */
+  --lg-glint-dither: 0.014;      /* zero-mean noise summed before the one rounding */
+  --lg-rim-peak: 0.46;           /* the lit rim's glint at the rim point
+                                    nearest the pointer (round 11: 0.24
+                                    read too faint in the app; 0.36 until
+                                    2026-11-24, the user: toned down since
+                                    the hairline. Lit only: idle unchanged,
+                                    still two device px at most) */
+  --lg-rim-r: 300px;             /* light radius AND reach (a surface lights
+                                    while the pointer is this close to it) */
+  /* The user's "Cursor glow" tuning (Settings > Theme, AuraSettings
+     glassGlowTune): glassGlint.ts writes these three on <html> only when the
+     user moved a slider off its default (an inline write there restyles
+     the document once, never per frame). Edge highlights multiply the rim
+     ring and its halo (aura-glass-rim.js), Surface glow the interior light
+     (glassGlint.ts bakes it into the light image) and the text light, and
+     Glow size replaces --lg-rim-r above. Round 12 defaults (the user's
+     pick, auraSettings.ts DEFAULT_GLASS_GLOW_TUNE, keep them equal): Edge
+     highlights 125%, Surface glow 25% (a cool, dark interior: the rim
+     carries the light, not a spotlight on the face), Glow size 300 px. */
+  --lg-glow-edge-k: 1.25;
+  --lg-glow-surface-k: 0.25;
+  /* The idle rim (corner-anchored radials on surfaces that set
+     --lg-idle-*), dimmed while the pointer is live. */
+  --lg-idle-k: 1;
+
+  /* Liquid tunables. The numeric ones are ALSO read by liquidGlass.ts when it
+     builds a filter (face, pickup, bend), so after editing them live run
+     window.__auraLiquidRetune() in the DevConsole to rebuild the filters. */
+  /* Control tier (rail, search bar, pills, hero arrows, detail floating
+     buttons, HUD tabs): the A "Obsidian" face the user dialed in round 9.
+     A neutral 0.30 tint, an EVEN 0.02 white lift (no milky vertical sheen),
+     blur 20 / saturate 130%, no brightness cut, no dark bottom pool
+     (--lg-ctl-meniscus-k 0) and no dark outer hairline
+     (--lg-ctl-hairline-k 0): the edge is the idle rim (aura-rim worklet).
+     Overrides round 5/6 (blur 10 / sat 1.6 / bright 0.9, sheen 0.125 to
+     0.06 over tint 0.10 to 0.26, the deep meniscus and --lg-spec on
+     floating controls). Old values: blur 10px, sat 1.6, bright 0.9, sheen
+     0.125 / 0.06, tint 14 16 24 at 0.10 / 0.26, pickup 7px. */
+  --lg-ctl-blur: 20px;
+  --lg-ctl-sat: 1.3;
+  --lg-ctl-bright: 1;
+  --lg-ctl-sheen-top: 0.02;      /* even white lift, top to bottom */
+  --lg-ctl-sheen-bottom: 0.02;
+  --lg-ctl-tint-rgb: 14 16 22;   /* neutral tint under the lift */
+  --lg-ctl-tint-top: 0.30;
+  --lg-ctl-tint-bottom: 0.30;
+  --lg-ctl-meniscus-k: 0;
+  --lg-ctl-hairline-k: 0;
+  /* The lensed rim band (the caustic pickup) on this tier: NONE since round
+     16 (was 0.3, round 9's A pick; 0.55 pooled low in round 5). A raw,
+     saturated, lifted sample of the backdrop in a band 3 to 29 px in, it
+     read as a lighter band inside the hairline on every Clear control, the
+     worse the lighter the page (rail +13 levels at 10 px in over a light
+     page, search bar +12, hero arrows +6 and a saturated ring); ablated it
+     was the whole band (refraction, the bleed cut-out, the inner glow and
+     the idle rim each moved it under 1 level). 0 drops the branch from the
+     filter, so bound and unbound match (as the menu tier, --lg-menu-rim).
+     The +1 level step the inner glow left (under round 16's 2-level metric)
+     went in round 17 (the zero-alpha --lg-edge, "Floating controls"). */
+  --lg-ctl-rim: 0;
+  --lg-ctl-rim-pool: 0;
+  --lg-menu-blur: 22px;          /* menu tier: menus, panels, popovers, tips */
+  /* The menu body: ONE uniform material from edge to centre. It used to be
+     a dark body (about 0.26 x backdrop + 5) under a caustic pickup of the
+     raw backdrop along the sides and bottom, so a panel read as a dark slab
+     inside a lighter, more translucent band (Notifications over the Home
+     posters: bottom band +19 and sides +3 over the interior; +20 / +6 over a
+     cream block). The pickup is gone (--lg-menu-rim 0) and the body itself
+     is now the translucent look: saturate, then a tone map on LUMINANCE that
+     keeps the hue (--lg-menu-tone `<slope> <cap>`, glassStyle.ts
+     readToneTable / glassToneNodes, the --lg-menu-tone-step of the CSS face,
+     baked at the same point in the lens). It gains up to 1.6x over dark and
+     mid backdrops, so their colour shows through as it once did only in the
+     edge band (mid lavender page 31 to 41), and caps bright ones, so white
+     0.55 text keeps 4.5:1 over a white poster (cream block 68 to 56: 3.97 to
+     4.77). The tint stays dense (0.58, the old mid value) because over the
+     mpv video the base is transparent and the tint is the whole veil
+     (measured unchanged there). A flat face and a light meniscus keep every
+     edge band within 1 level of the interior over a uniform backdrop.
+     Darker variant (the old body, made uniform; same text contrast over a
+     white poster, darker over dark and mid backdrops): set
+       --lg-menu-sat: 1.4; --lg-menu-bright: 0.62; --lg-menu-tone: none;
+       --lg-menu-tint-top: 0.62; --lg-menu-tint-bottom: 0.62;
+     Tips and toasts pin their own values (.aura-glass-tip). */
+  --lg-menu-sat: 1.5;
+  --lg-menu-bright: 1;
+  --lg-menu-tone: 1.6 0.48;
+  --lg-menu-tone-step: url(#aura-glass-menu-tone);
+  --lg-menu-sheen-top: 0.015;
+  --lg-menu-sheen-bottom: 0.015;
+  --lg-menu-tint-rgb: 8 10 15;
+  --lg-menu-tint-top: 0.58;
+  --lg-menu-tint-bottom: 0.58;
+  --lg-menu-meniscus-k: 0.35;
+  /* Bound elements, per tier: the CSS blur a bound element's chain starts
+     with. The caustic pickup reads it, and the filter blurs the body on to
+     the tier blur (keep each at or below its tier blur). */
+  --lg-ctl-pickup-blur: 20px;    /* = the tier blur: with no pickup
+                                    (--lg-ctl-rim 0, round 16) the whole blur
+                                    runs in the CSS chain and the filter adds
+                                    no blur pass (12 px, 0.6 x the tier blur,
+                                    while the lensed rim band sampled it) */
+  --lg-menu-pickup-blur: 22px;   /* = the tier blur: with no pickup
+                                    (--lg-menu-rim 0) the whole blur runs in
+                                    the CSS chain and the filter adds no
+                                    blur pass (10 px while it had a pickup) */
+  --lg-refract: 2;               /* displacement = bezel width x this */
+  --lg-rim: 0.55;                /* caustic pickup opacity fallback for a tier
+                                    with no --lg-<tier>-rim (both set 0) */
+  --lg-menu-rim: 0;              /* the menu tier's pickup opacity: none.
+                                    Any pickup is a raw backdrop sample along
+                                    the edge, which reads as a brighter, more
+                                    translucent band around a darker body
+                                    (0.55: bottom band 124 vs 67; 0.28 still
+                                    72 vs 27 over the Home posters). 0 also
+                                    drops the branch from the filter. */
+  --lg-rim-lift: 1.25;           /* caustic pickup brightness */
+  --lg-meniscus-k: 1;            /* baked meniscus strength (filter only) */
+  --lg-meniscus:
+    inset 0 8px 12px -10px rgb(255 255 255 / 0.06),
+    inset 0 10px 14px -12px rgb(0 0 0 / 0.40),
+    inset 0 -12px 18px -10px rgb(0 0 0 / 0.60),
+    inset 0 0 0 0.5px rgb(0 0 0 / 0.30);
+  /* The same four insets at zero alpha: a BOUND element's --lg-edge (the
+     filter bakes the meniscus), so the box-shadow list keeps one shape bound
+     and unbound (a list whose inset entries change is not interpolable). The
+     swap itself is SNAPPED, never faded: the filter's meniscus comes and goes
+     in one frame, so liquidGlass.ts snapEdge finishes the box-shadow
+     transition a bind or unbind starts (a fade showed a flat, too bright
+     face on unbind and a doubled, too dark one on rebind). */
+  --lg-meniscus-clear:
+    inset 0 8px 12px -10px rgb(255 255 255 / 0),
+    inset 0 10px 14px -12px rgb(0 0 0 / 0),
+    inset 0 -12px 18px -10px rgb(0 0 0 / 0),
+    inset 0 0 0 0.5px rgb(0 0 0 / 0);
+  /* The meniscus for a face that has the --lg-face-ring border (the Liquid
+     float / control tiers and flat controls): the same four insets with the
+     0.5px hairline at zero alpha. The ring already stands in for the
+     filter's one outer hairline pixel, and an inset shadow paints INSIDE the
+     border, so the hairline drew a second dark line one pixel in: about 20
+     levels darker than the bound face on the top row (and the row above the
+     bottom ring), a crisp line that snapped away at every rebind, the search
+     bar's "sudden change at the top half" after its shrink. Same list shape
+     as the other two, so state changes still interpolate. */
+  --lg-meniscus-ringed:
+    inset 0 8px 12px -10px rgb(255 255 255 / 0.06),
+    inset 0 10px 14px -12px rgb(0 0 0 / 0.40),
+    inset 0 -12px 18px -10px rgb(0 0 0 / 0.60),
+    inset 0 0 0 0.5px rgb(0 0 0 / 0);
+  --lg-drop-liquid:
+    0 1px 1px rgb(0 0 0 / 0.45),
+    0 4px 10px -2px rgb(0 0 0 / 0.40),
+    0 16px 34px -12px rgb(0 0 0 / 0.55);
+  --lg-lift-hover: 0.035;
+  --lg-lift-selected: 0.07;
+
+  /* The solid base under the blur of Liquid glass that page content can
+     move under (the url(#aura-glass-base) step in the Liquid menu-tier
+     chain and the [data-glass-base] control chain below, and the same two
+     floods inside those liquidGlass.ts filters; never Frosted, never the
+     sidebar / title-bar chrome): this window backdrop estimate, then
+     --ln-bg over it, then the
+     blurred backdrop on top, so the backdrop pass is OPAQUE. The window is
+     transparent and Chromium draws a backdrop-filter's result OVER the
+     unfiltered page, so over Mica (--ln-bg transparent) and Haze (alpha
+     0.45) a see-through blur let the crisp poster titles show through the
+     Home search bar while the opaque posters blurred (crisp-edge energy 130
+     on Mica, 29 on Haze; about 17 over an opaque page). A background cannot
+     do it: it paints ABOVE the filter output and would hide the blurred
+     posters as well. The cost, accepted: the wallpaper / Mica tint no
+     longer shows inside those surfaces. The estimate is dark Mica's tint
+     colour (lib.rs applies dark Mica on every theme, and dark Mica's
+     luminosity layer pins its brightness near #202020 whatever the
+     wallpaper; only the hue varies), and it only shows on Mica and Haze:
+     every other theme's --ln-bg is opaque and covers it (measured pixel
+     identical with and without it). A theme with a see-through --ln-bg over
+     a different backdrop sets its own. glassStyle.ts installs the filter.
+     The floods read the two
+     --lg-base-* tokens, never these directly, so one rule can switch the
+     base off. */
+  --lg-window-est: #202020;
+  --lg-base-under: var(--lg-window-est);
+  --lg-base-page: var(--ln-bg);
+}
+/* While a stream plays, the page is gone and every glass surface left
+   (toasts, tooltips, menus) floats over the mpv video, which shows through
+   the transparent webview: the base would turn each into a grey slab over
+   the picture. Both floods go transparent, so the chain is the plain
+   see-through blur again (bound and unbound alike: the filters read the
+   same tokens, and Chromium repaints them when the tokens change). */
+html.playing-video {
+  --lg-base-under: transparent;
+  --lg-base-page: transparent;
+}
+/* Liquid root tokens. (The round 7 blurred catch-light, --lg-rim-peak 0.09
+   here, is gone: round 9's rim light is one ring in both materials.) */
+html[data-glass="liquid"] {
+  /* The CSS face's 1px border ring (top, right, bottom, left), shaded to
+     match the filter's outermost pixel. Inset box-shadows paint only inside
+     the padding box, so a transparent ring showed the bare face there: a
+     crisp bright line along the bottom (about +100 levels over the bound
+     edge on a light page) that popped in on every unbind and stayed on the
+     never-bound flat pills. Measured against the bound edge within 5 levels
+     on light, mid and dark backdrops. Bound elements keep it transparent
+     (the filter draws its own hairline). Floating glass only: flat in-page
+     controls never bind, so they take the lit --lg-spec-ring below. */
+  --lg-face-ring: rgb(0 0 0 / 0.10) rgb(0 0 0 / 0.30) rgb(0 0 0 / 0.55) rgb(0 0 0 / 0.30);
+  /* The specular rim (iOS 26 Liquid Glass): light catching the lens edge.
+     Two thin inset bands offset in opposite diagonals, so the light is
+     brightest on the top-left and bottom-right arcs, carried along the top
+     and (fainter) the bottom, dimmer on the sides, and fades to nothing on
+     the top-right and bottom-left arcs (a band offset (dx, dy) is
+     dx*|cos| + dy*|sin| thick around a curve). Element-level box-shadow
+     entries, so a bound control and its CSS face draw the same rim and the
+     bind / unbind match is untouched. Always two entries: lists that hold
+     it keep one shape in every state. */
+  --lg-spec:
+    inset 0.6px 1.1px 0.5px -0.25px rgb(255 255 255 / 0.36),
+    inset -0.6px -1px 0.5px -0.25px rgb(255 255 255 / 0.20);
+  /* The flat controls' 1px border under that rim: a faint lit ring (top,
+     right, bottom, left), a touch dark at the bottom, where the border box
+     shows the face's top row repeated. Replaces --lg-face-ring there (that
+     dark ring only stands in for the refraction filter's outer pixel, and
+     flat glass is never refracted); it read as a dark outline around a dark
+     slab. */
+  --lg-spec-ring: rgb(255 255 255 / 0.06) rgb(255 255 255 / 0.03) rgb(0 0 0 / 0.06) rgb(255 255 255 / 0.03);
+  /* The flat controls' milky sheen (top, bottom), over the tint below it in
+     .aura-glass-flat and a checked .aura-glass-choice. Round 13, the user:
+     "darken the grays used for elements like these slightly, they're just
+     slightly too light" (the Theme dropdown and the accent chip). Was 0.125
+     to 0.105: measured on the Theme sheet the dropdown face went L* 19.6 to
+     15.5 on Haze (-21%, luma 47 to 39), 24.7 to 21.0 on Mica (-15%), 18.2 to
+     13.9 on Ember (-24%), the accent chip the same; hover still lifts it about
+     2.3 L* and white 0.55 text keeps 5.0:1 or more (5.6 Haze, 5.0 Mica).
+     Matte (Frosted) is unchanged. */
+  --lg-flat-sheen-top: 0.083;
+  --lg-flat-sheen-bottom: 0.069;
+}
+/* linear() needs Chromium 113+ (WebView2 is evergreen; --lg-springy relies on
+   it too). Without it, a cubic-bezier with a similar overshoot. */
+@supports not (transition-timing-function: linear(0, 1)) {
+  :root {
+    --aura-spring-snappy: cubic-bezier(0.25, 1.1, 0.4, 1);
+    --aura-spring-bouncy: cubic-bezier(0.34, 1.4, 0.64, 1);
+  }
+}
+/* High Contrast: no glint (read by glassStyle.ts, no theme id in JS). */
+:root[data-theme="contrast"],
+:root[data-theme="contrast-azure"] {
+  --lg-glint-off: 1;
+}
+/* The idle rim is dimmed under a live pointer (glassGlint.ts stamps
+   data-glass-light-live), and off on High Contrast (its own 0.35 edge is the
+   floor there). Dispersion needs the GPU. */
+:root[data-glass-light-live] { --lg-idle-k: 0.62; }
+:root[data-theme="contrast"],
+:root[data-theme="contrast-azure"] { --lg-idle-k: 0; }
+:root[data-glass-gpu="off"] { --lg-disp: 0; }
+
+/* Per-element resets, zero specificity so any class beats them.
+   --lg-rimlight is the old box-shadow catch-light's slot, kept as one
+   zero-alpha inset so every glass box-shadow list (and every keyframe that
+   names it) keeps its shape; round 9's rim light is the aura-rim ring layer
+   (--lg-rim-layer) instead. `:not(html)`: <html> must never match. An unlit
+   element's face light and ring are empty layers: the light exists only
+   while data-glint-lit is set, the ring only there or where an idle rim is
+   declared (below). */
+:where(.aura-float-glass, .aura-glass-control, .aura-glass-flat, .aura-glass-field,
+       .aura-glass-player, .aura-glow, [data-glass-glint]:not(html), [data-glass-light]:not(html)) {
+  --lg-ring: 0 0 #0000;
+  --lg-deco: linear-gradient(transparent, transparent);
+  --lg-base: transparent;
+  --lg-glint: linear-gradient(transparent, transparent);
+  --lg-rimlight: inset 0 0 0 0 transparent;
+  --lg-rim-layer: linear-gradient(transparent, transparent);
+  --lg-bleed: linear-gradient(transparent, transparent);
+}
+/* The rim ring (public/aura-glass-rim.js): on every lit surface in both
+   materials, and always on a surface with an idle rim (Liquid floating glass
+   except tips, the hero bezel, any [data-glass-light] surface). Behind
+   @supports: an unknown image function would void the whole background. */
+@supports (background-image: paint(aura-rim)) {
+  :where(.aura-float-glass, .aura-glass-control, .aura-glass-flat, .aura-glass-field,
+         .aura-glass-player, [data-glass-glint]:not(html), [data-glass-light]:not(html))[data-glint-lit],
+  html[data-glass="liquid"] :where(.aura-float-glass:not(.aura-glass-tip)),
+  :where([data-glass-light]:not(html)) {
+    --lg-rim-layer: paint(aura-rim) border-box;
+  }
+}
+/* The A idle rim on Liquid floating glass (menus, panels, controls; not
+   tips): top-left white 0.18 fading to 0.03, bottom-right 0.11 fading to 0,
+   each over --rc (0.9 x the short side, 24 to 96 px). It is the A face's
+   only edge (no dark ring, no meniscus) and stays with Cursor glow off:
+   static edge definition, not cursor light. Frosted keeps its own lit
+   hairline and has none. Flat in-page controls keep --lg-spec instead.
+   The mid term (--lg-idle-mid, the faint ring along every side beyond the
+   two corner radials) is scaled by --lg-idle-mid-k, the theme's darkness
+   (round 13, below). */
+html[data-glass="liquid"] :where(.aura-float-glass:not(.aura-glass-tip)) {
+  --lg-idle-tl: 0.18;
+  --lg-idle-mid: calc(0.03 * var(--lg-idle-mid-k, 1));
+  --lg-idle-br: 0.11;
+}
+/* Round 13, the user: "On the darker themes like haze when using the Glass
+   style, I notice a thin lighter band of color around the edges of most
+   panels." Measured (harness, transparent window over a #202020 Mica
+   stand-in, Cursor glow off and on with the pointer far, 100 / 125 / 150%):
+   the band is this idle rim's MID term, a (then 1.5 px, round 14 a hairline)
+   white 0.03 ring round the whole outline. It added +6 to +10 levels on every side of a sheet, menu,
+   Detail panel or control whose face is 15 to 22 (Haze sheet: face 20, ring
+   30; 0 to +1 with --lg-idle-k 0); the base flood, the inner glow and the
+   lens edge each moved the edge by under 1 level. On Mica the same ring
+   sits on a face of about 32 (dL* 3.6 against 5.3 on Haze), and it is the
+   only thing that separates a sheet's sides from the page there (face 32,
+   page 32), so Mica keeps it. The darker themes (a page of luma 0 to 17:
+   Haze, Midnight and every tinted theme) take a third: +3 on a face of 20,
+   the top-left and bottom-right corner glints and the cursor light
+   untouched. High Contrast has no idle rim (--lg-idle-k 0). */
+:root[data-theme]:not([data-theme="mica"]) {
+  --lg-idle-mid-k: 0.34;
+}
+/* A rim-only surface that is not glass (a Home card overlay, a badge): its
+   background IS the ring. Zero specificity, so its own rules win. */
+:where([data-glass-light]:not(html, .aura-float-glass, .aura-glass-control, .aura-glass-flat,
+       .aura-glass-field, .aura-glass-player)) {
+  background: var(--lg-rim-layer);
+}
+/* The interior light while lit (and fading), round 9: a white radial of
+   radius R (--lg-rim-r) at the pointer, 3.5% peak, 10.7% of it at 0.6 R, 0 at
+   R; the pointer may be OUTSIDE the element (nearby reach), so the light
+   spills in from the near edge. The webview composites at 8 bits with no
+   dither, so a CSS gradient of a 3.5% light is a staircase of 1-code rings,
+   and a grain drawn as a SEPARATE layer cannot fix that (each layer rounds on
+   its own). So the light is an IMAGE (glassGlint.ts lightImage): a
+   full-range profile scaled by the peak and a zero-mean noise
+   (--lg-glint-dither) summed in ONE feComposite, so the only rounding happens
+   with the noise in it. ONE 2R x 2R image serves every surface; it is
+   rasterised once and then only moved; -webkit-cross-fade fades it. Behind
+   @supports (an unparsable image would void the whole background); without
+   it, the same profile as a CSS gradient, banded. */
+:where(.aura-float-glass, .aura-glass-control, .aura-glass-flat, .aura-glass-field,
+       .aura-glass-player, [data-glass-glint]:not(html))[data-glint-lit] {
+  --lg-glint: radial-gradient(circle var(--gr) at var(--gx) var(--gy),
+    color-mix(in srgb, var(--lg-glint-c) calc(var(--lg-light-peak-ctl) * var(--lg-glow-surface-k, 1) * var(--lg-glint-a) * 100%), transparent) 0%,
+    color-mix(in srgb, var(--lg-glint-c) calc(var(--lg-light-peak-ctl) * var(--lg-glow-surface-k, 1) * var(--lg-glint-a) * 10.7%), transparent) 60%,
+    transparent 100%);
+}
+@supports (background-image: -webkit-cross-fade(linear-gradient(#000, #000), linear-gradient(#000, #000), 50%)) {
+  :where(.aura-float-glass, .aura-glass-control, .aura-glass-flat, .aura-glass-field,
+         .aura-glass-player, [data-glass-glint]:not(html))[data-glint-lit] {
+    --lg-glint: -webkit-cross-fade(linear-gradient(transparent, transparent), var(--lg-glint-img),
+        calc(var(--lg-glint-a) * 100%))
+      calc(var(--gx) - var(--gw)) calc(var(--gy) - var(--gh))
+      / calc(var(--gw) * 2) calc(var(--gh) * 2) no-repeat;
+  }
+}
+/* A rim-only glass surface (data-glass-light="rim"): the ring, no interior. */
+[data-glass-light="rim"][data-glint-lit] {
+  --lg-glint: linear-gradient(transparent, transparent);
+}
+
+/* Row and page titles (.aura-row-title, round 11; the user: titles should
+   "react to the bleeding colour around them and the cursor glow primarily",
+   the animated accent shimmer "should probably go"). Unlayered on purpose:
+   the zero-specificity light-surface rule above is unlayered too and would
+   beat a layered background.
+     - FILL: one static colour, the near-white base mixed (oklab) with the
+       hero bleed's colour at the title (--lg-bleed-tint, up to 42% at
+       --lg-bleed-tint-k 1; bleedTint.ts writes both on Home row titles
+       only). With no bleed (other pages, another slide's art unreadable,
+       rows far down) it is the plain base. No accent anywhere: the second
+       word of "Continue Watching" is no longer a separate accent colour.
+     - LIGHT (Home row titles carry data-glass-light="text"): while lit, a
+       white radial of 0.62 x --lg-rim-r at the pointer (glassGlint.ts
+       writes --gx / --gy / --lg-glint-a on the title alone) over the fill,
+       clipped to the glyphs: letters near the pointer brighten to white,
+       scaled by the user's Surface glow. Glyph-masked, so no large flat
+       area to band (no dither needed). Nothing runs while the pointer rests.
+     - The base is a touch below white while Cursor glow is on, so the light
+       has room to read (222 / 225 / 232: about 13:1 on dark Mica), white
+       otherwise. A soft glow in the bleed colour replaces the accent halo.
+     - High Contrast: plain white, no tint (the !important beats the inline
+       write), no light (glint off there). */
+.aura-row-title {
+  --lg-title-base: rgb(238 240 244);
+  --lg-title-c: color-mix(in oklab, var(--lg-bleed-tint) calc(var(--lg-bleed-tint-k) * 42%), var(--lg-title-base));
+  /* Longhands only (here and lit): a `background` shorthand resets the clip. */
+  background-color: transparent;
+  background-image: linear-gradient(var(--lg-title-c), var(--lg-title-c));
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  -webkit-text-fill-color: transparent;
+  filter: drop-shadow(0 1px 0 rgb(0 0 0 / 0.35))
+          drop-shadow(0 0 8px color-mix(in srgb, var(--lg-bleed-tint) calc(var(--lg-bleed-tint-k) * 20%), transparent));
+  transition: --lg-bleed-tint 900ms ease, --lg-bleed-tint-k 700ms ease;
+}
+html[data-glass-glint-mode="on"] .aura-row-title[data-glass-light="text"] {
+  --lg-title-base: rgb(222 225 232);
+}
+/* The text light's strength (round 12 review): Surface glow x 4, capped at
+   1. The round 12 default (25%) is the round 11 look (+41 levels under the
+   pointer, the user's "react to ... the cursor glow primarily"); scaled by
+   the raw 0.25 it read a quarter as strong. 0% still turns it off. */
+.aura-row-title[data-glint-lit] {
+  --lg-title-light-k: min(1, var(--lg-glow-surface-k, 0.25) * 4);
+  background-image:
+    radial-gradient(circle calc(var(--lg-rim-r, 300px) * 0.62) at var(--gx) var(--gy),
+      rgb(255 255 255 / calc(var(--lg-glint-a) * var(--lg-title-light-k))) 0%,
+      rgb(255 255 255 / calc(var(--lg-glint-a) * var(--lg-title-light-k) * 0.5)) 38%,
+      rgb(255 255 255 / calc(var(--lg-glint-a) * var(--lg-title-light-k) * 0.14)) 70%,
+      rgb(255 255 255 / 0) 100%),
+    linear-gradient(var(--lg-title-c), var(--lg-title-c));
+}
+:root[data-theme="contrast"] .aura-row-title,
+:root[data-theme="contrast-azure"] .aura-row-title {
+  --lg-title-base: rgb(255 255 255);
+  --lg-bleed-tint-k: 0 !important;
+}
+html[data-reduced-motion="true"] .aura-row-title {
+  transition: none;
+}
+
+/* The shared paint rule. Sits outside @layer components, like the old
+   .aura-float-glass, so it beats same-specificity Tailwind utilities. */
+.aura-float-glass,
+.aura-glass-control,
+.aura-glass-flat,
+.aura-glass-field,
+.aura-glass-player {
   background:
+    var(--lg-rim-layer),
+    var(--lg-glint),
+    var(--lg-deco),
+    linear-gradient(rgb(255 255 255 / var(--lg-lift)), rgb(255 255 255 / calc(var(--lg-lift) * 0.5))),
+    var(--lg-bleed),
+    var(--lg-face);
+  background-color: var(--lg-base);
+  /* Longhands, not the `border` shorthand: Liquid's --lg-border-c is a
+     four-side colour list (--lg-face-ring), which the shorthand rejects. */
+  border-width: 1px;
+  border-style: solid;
+  border-color: var(--lg-border-c);
+  box-shadow: var(--lg-ring), var(--lg-rimlight), var(--lg-edge), var(--lg-drop);
+  -webkit-backdrop-filter: var(--lg-backdrop);
+  backdrop-filter: var(--lg-backdrop);
+}
+
+/* ---- Frosted (style A) ---------------------------------------------- */
+/* Floating glass: menus, panels, popovers, tooltips (.aura-float-glass)
+   and floating controls (.aura-glass-control: pills, search bars, hero
+   arrows, detail buttons). Identical in Frosted; Liquid splits the tiers.
+   A BAKED DARK GRADIENT plus blur and saturate, never --ln-glass-3 (tinted
+   per theme): see .claude/rules/frontend-ui.md. The lit top hairline is
+   what reads as refraction rather than a flat tint.
+   Round 14 (the user: "a faint, thick translucent light band" inside the
+   top edge instead of a crisp 1px highlight): the lit top is the BORDER's
+   top side (white 0.20, the sides 0.12), one pixel. It used to be a 0.12
+   border plus an `inset 0 1px 0` white 0.14 row right under it, two equal
+   lit rows (Haze sheet: +27 +30 over the face, 63 66 on 36; now 80 then
+   the face). The inset entry stays at zero alpha so the list keeps its
+   two-entry shape for every transition that names it. */
+.aura-float-glass,
+.aura-glass-control {
+  --lg-face:
     linear-gradient(rgba(10, 12, 16, 0.62), rgba(10, 12, 16, 0.72)),
     linear-gradient(rgba(255, 255, 255, 0.06), rgba(255, 255, 255, 0.03));
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  backdrop-filter: blur(var(--ln-blur-elev, 24px)) saturate(1.6);
-  -webkit-backdrop-filter: blur(var(--ln-blur-elev, 24px)) saturate(1.6);
-  /* The lit top edge is what sells refraction rather than a flat tint: a
-     bright inset hairline along the top, a dark one along the bottom, and
-     a soft drop shadow so the element reads as sitting ABOVE the art. */
-  box-shadow:
-    inset 0 1px 0 0 rgba(255, 255, 255, 0.14),
-    inset 0 -1px 0 0 rgba(0, 0, 0, 0.35),
-    0 10px 34px -12px rgba(0, 0, 0, 0.72);
+  --lg-border-c: rgba(255, 255, 255, 0.20) rgba(255, 255, 255, 0.12) rgba(255, 255, 255, 0.12) rgba(255, 255, 255, 0.12);
+  --lg-edge: inset 0 1px 0 0 rgba(255, 255, 255, 0), inset 0 -1px 0 0 rgba(0, 0, 0, 0.35);
+  --lg-drop: 0 10px 34px -12px rgba(0, 0, 0, 0.72);
+  --lg-backdrop: blur(var(--ln-blur-elev, 24px)) saturate(1.6);
 }
-/* Zero-blur themes have nothing to refract with, so they go opaque rather
-   than leaving a translucent bar see-through over bright art. */
-html[data-theme="midnight"] .aura-float-glass,
-html[data-theme="contrast"] .aura-float-glass,
-html[data-theme="contrast-azure"] .aura-float-glass {
-  background: var(--ln-panel-solid, #0b0d12);
+/* Tooltips and toasts (.aura-glass-tip): a lighter, greyer face than menus.
+   The menu face kept about a third of the backdrop plus almost no lift, so
+   over the dark page a toast read near black. This keeps a quarter of the
+   backdrop and adds a constant grey lift (the white layer under the dark
+   one): face = 0.25 x backdrop + 45. Text (white 0.9) stays at 4.5:1 or
+   better even over a pure white backdrop (measured), and over the page the
+   face sits a little ABOVE the surroundings instead of below them. */
+.aura-float-glass.aura-glass-tip {
+  --lg-face:
+    linear-gradient(rgba(10, 12, 16, 0.57), rgba(10, 12, 16, 0.65)),
+    linear-gradient(rgba(255, 255, 255, 0.34), rgba(255, 255, 255, 0.28));
+}
+/* In-page controls (Settings buttons, selects, choice rows): flat fills,
+   no blur (small controls on a scrolling page take no backdrop pass). */
+.aura-glass-flat {
+  --lg-face: linear-gradient(rgba(255, 255, 255, 0.05), rgba(255, 255, 255, 0.05));
+  --lg-border-c: rgba(255, 255, 255, 0.12);
+  --lg-edge: 0 0 #0000;
+  --lg-drop: 0 0 #0000;
+  --lg-backdrop: none;
+  transition: --lg-lift 160ms ease, border-color 160ms ease, box-shadow 200ms ease, color 160ms ease;
+}
+.aura-glass-flat:hover:where(:not(:disabled):not([aria-disabled="true"])) {
+  --lg-lift: 0.03;
+  --lg-border-c: rgba(255, 255, 255, 0.20);
+}
+.aura-glass-flat:focus-visible { --lg-border-c: rgba(255, 255, 255, 0.28); }
+/* A text field (the <input> itself, or a wrapper holding a bare input). */
+.aura-glass-field {
+  --lg-face: linear-gradient(rgba(255, 255, 255, 0.05), rgba(255, 255, 255, 0.05));
+  --lg-border-c: rgba(255, 255, 255, 0.10);
+  --lg-edge: 0 0 #0000;
+  --lg-drop: 0 0 #0000;
+  --lg-backdrop: none;
+  transition: border-color 160ms ease, box-shadow 200ms ease;
+}
+.aura-glass-field:is(:focus, :focus-within) { --lg-border-c: rgba(255, 255, 255, 0.25); }
+.aura-glass-field.is-valid { --lg-border-c: rgb(52 211 153 / 0.4); }
+.aura-glass-field.is-valid:is(:focus, :focus-within) { --lg-border-c: rgb(52 211 153 / 0.6); }
+.aura-glass-field.is-invalid { --lg-border-c: rgb(248 113 113 / 0.4); }
+.aura-glass-field.is-invalid:is(:focus, :focus-within) { --lg-border-c: rgb(248 113 113 / 0.6); }
+/* Player surfaces: material only. The video is a native mpv window under
+   the webview, so a backdrop pass would sample nothing; the baked dark base
+   is the whole legibility guarantee. */
+.aura-glass-player {
+  --lg-face: linear-gradient(180deg, rgba(0, 0, 0, 0.42), rgba(0, 0, 0, 0.58));
+  --lg-border-c: rgba(255, 255, 255, 0.18);
+  --lg-edge: inset 0 1px 0 rgba(255, 255, 255, 0.10);
+  --lg-drop: 0 20px 50px rgba(0, 0, 0, 0.6);
+  --lg-backdrop: none;
+}
+/* Button accents on flat controls. */
+.aura-glass-flat.is-primary {
+  --lg-face: linear-gradient(rgb(var(--ln-accent-rgb) / 0.15), rgb(var(--ln-accent-rgb) / 0.15));
+  --lg-border-c: rgb(var(--ln-accent-rgb) / 0.4);
+  color: color-mix(in oklab, var(--ln-accent-mark) 78%, white);
+}
+.aura-glass-flat.is-danger {
+  --lg-face: linear-gradient(rgb(244 63 94 / 0.10), rgb(244 63 94 / 0.10));
+  --lg-border-c: rgb(251 113 133 / 0.35);
+  color: rgb(253 164 175);
+}
+/* A selected floating control (side pill open, a pressed toggle button). */
+.aura-glass-control:is(.is-active, .is-selected, [aria-pressed="true"]) {
+  --lg-border-c: rgb(var(--ln-accent-rgb) / 0.5);
+  --lg-ring: 0 0 0 1px rgb(var(--ln-accent-rgb) / 0.5);
+}
+/* A selected choice row (ChoiceList). */
+.aura-glass-choice[aria-checked="true"] {
+  --lg-face: linear-gradient(rgb(var(--ln-accent-rgb) / 0.10), rgb(var(--ln-accent-rgb) / 0.10));
+  --lg-border-c: rgb(var(--ln-accent-rgb) / 0.40);
+}
+/* A native <select> styled as a flat control: the chevron is a background
+   layer, so it must ride --lg-deco (an inline backgroundImage would erase
+   the glass layers). */
+.aura-glass-select {
+  --lg-deco: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='rgba(255,255,255,0.3)'%3E%3Cpath d='M7 10l5 5 5-5z'/%3E%3C/svg%3E") right 14px center / 12px 12px no-repeat;
+  padding-right: 36px;
+}
+.aura-glass-select:focus { --lg-border-c: rgba(255, 255, 255, 0.25); }
+
+/* ---- Items, rows, selection ----------------------------------------- */
+/* .aura-glass-item: tabs, chips, nav-like buttons (no glass of their own).
+   .aura-glass-row: rows inside menus / listboxes / recents.
+   Selected = aria-selected / aria-current / aria-pressed / aria-checked
+   true, or .is-selected. */
+.aura-glass-item,
+.aura-glass-row {
+  transition: background-color 150ms ease, box-shadow 200ms ease, color 150ms ease;
+}
+.aura-glass-item:hover,
+.aura-glass-row:hover { background-color: rgba(255, 255, 255, 0.08); }
+.aura-glass-item:is([aria-selected="true"], [aria-current="page"], [aria-current="true"],
+                    [aria-pressed="true"], [aria-checked="true"], .is-selected) {
+  background-color: rgb(var(--ln-accent-rgb) / 0.16);
+  box-shadow: inset 0 0 0 1px rgb(var(--ln-accent-rgb) / 0.30);
+  color: var(--ln-accent-mark);
+}
+.aura-glass-row:is([aria-selected="true"], [aria-current="page"], [aria-current="true"],
+                   [aria-pressed="true"], [aria-checked="true"], .is-selected) {
+  color: #fff;
+  font-weight: 600;
+}
+/* A hover droplet (one per list, moved with liquidGlass.animateSpan):
+   Liquid only. Frosted rows keep their own hover fill. */
+.aura-glass-hl {
+  position: absolute;
+  left: 0;
+  top: 0;
+  pointer-events: none;
+  visibility: hidden;
+  opacity: 0;
+  border-radius: 12px;
+  transition: opacity 120ms ease-out;
+}
+
+/* ---- Content (not glass) -------------------------------------------- */
+/* Lists, tables and forms on a page are CONTENT, not the glass layer: no
+   backdrop, no meniscus, no drop, no glint, identical in both materials.
+   .aura-content-group: a grouped section (one fill, hairline edge).
+   .aura-content-row: a row inside it; no fill of its own, an inset hairline
+   above it, a quiet fill on hover only when it is interactive. NOT a glass
+   class: keep it out of the glass reset, the paint rule, GLINT_SELECTOR and
+   liquidGlass discovery. A control INSIDE a content row stays glass. */
+.aura-content-group {
+  display: flex;
+  flex-direction: column;
+  padding: 4px;
+  border-radius: 14px;
+  background: var(--ln-glass-1, rgb(255 255 255 / 0.04));
+  box-shadow: inset 0 0 0 1px var(--ln-rim-subtle, rgb(255 255 255 / 0.06));
+}
+.aura-content-row {
+  position: relative;
+  border-radius: 10px;
+  transition: background-color 150ms ease, box-shadow 200ms ease, color 150ms ease;
+}
+.aura-content-group > * + .aura-content-row::before {
+  content: "";
+  position: absolute;
+  left: 12px;
+  right: 12px;
+  top: 0;
+  height: 1px;
+  background: var(--ln-rim-subtle, rgb(255 255 255 / 0.06));
+  pointer-events: none;
+  transition: opacity 150ms ease;
+}
+.aura-content-group > .aura-content-row:is(:hover, :focus-visible, .is-dragging, .is-capturing, .aura-keybind-lost)::before,
+.aura-content-group > .aura-content-row:is(:hover, :focus-visible, .is-dragging, .is-capturing, .aura-keybind-lost) + .aura-content-row::before { opacity: 0; }
+:where(button, a, [role="button"], [role="radio"], [role="switch"]).aura-content-row:not(:disabled):not([aria-disabled="true"]):not(.is-capturing, .is-dragging, .aura-keybind-lost):hover {
+  background-color: rgb(255 255 255 / 0.05);
+}
+.aura-content-row:focus-visible { outline: 1px solid rgb(255 255 255 / 0.32); outline-offset: -1px; }
+.aura-content-row[aria-checked="true"] .aura-glass-choice-label { color: var(--ln-accent-mark); }
+.aura-content-row.is-capturing { background-color: rgb(255 255 255 / 0.07); }
+html:not([data-glass="liquid"]) .aura-content-row.is-capturing { box-shadow: inset 0 0 0 1px rgb(var(--ln-accent-rgb) / 0.35); }
+/* A row being dragged (dnd-kit moves it in place, no overlay): dense enough
+   that the rows it passes under do not show through. */
+.aura-content-row.is-dragging {
+  z-index: 30;
+  background: linear-gradient(rgb(255 255 255 / 0.06), rgb(255 255 255 / 0.06)), rgb(16 18 24 / 0.94);
+  box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.10), 0 12px 28px -10px rgb(0 0 0 / 0.6);
+}
+html:not([data-glass="liquid"]) .aura-content-row.is-dragging {
+  box-shadow: inset 0 0 0 1px rgb(var(--ln-accent-rgb) / 0.40), 0 12px 28px -10px rgb(0 0 0 / 0.6);
+}
+
+/* ---- Segmented control (round 12) ------------------------------------ */
+/* SegmentedControl (settingsControls.tsx): a field-tier TRACK
+   (.aura-glass-seg) holding ONE raised THUMB (.aura-glass-seg-ind) that
+   slides under the selected option. Concentric A radii come from the markup
+   (track 12 / padding 3 / thumb 9, sm 10 / 2 / 8) through --seg-pad and
+   --seg-thumb-r (the defaults, a pill 2 px in, are a fallback only: every
+   copy is SegmentedControl now, AuraSkip's player one included). Track and
+   thumb are cursor-light RIM surfaces (data-glass-light="rim"), so the ring
+   layer comes FIRST in their background. --lg-rim-layer is registered with
+   no initial value (defined only on a light surface), so every use here
+   carries a transparent fallback, or the whole background would drop if a
+   copy ever lost the attribute. Not paint-rule elements: own box-shadow lists, never
+   --lg-rimlight. Frosted: a faint white track with a hairline and the rail
+   pill's accent wash on the thumb. Liquid (below): a sunken well and a
+   neutral raised thumb with a faint accent-mark rim (the only accent). */
+.aura-glass-seg {
+  position: relative;
+  isolation: isolate;
+  background: var(--lg-rim-layer, linear-gradient(transparent, transparent)), rgb(255 255 255 / 0.05);
+  box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.10);
+}
+.aura-glass-seg-ind {
+  position: absolute;
+  left: 0;
+  top: var(--seg-pad, 2px);
+  bottom: var(--seg-pad, 2px);
+  width: 0;
+  z-index: 0;
+  border-radius: var(--seg-thumb-r, 9999px);
+  pointer-events: none;
+  background:
+    var(--lg-rim-layer, linear-gradient(transparent, transparent)),
+    linear-gradient(135deg, rgb(var(--ln-accent-rgb) / 0.22), rgb(var(--ln-accent-rgb) / 0.10)),
+    rgb(255 255 255 / 0.05);
+  box-shadow: inset 0 0 0 1px rgb(var(--ln-accent-rgb) / 0.32), 0 1px 3px rgb(0 0 0 / 0.30);
+  /* A fallback: SegmentedControl's thumb (.aura-seg-thumb, every copy)
+     takes --lg-springy below in both materials. */
+  transition:
+    translate var(--aura-spring-snappy-dur) var(--aura-spring-snappy),
+    width var(--aura-spring-snappy-dur) var(--aura-spring-snappy),
+    opacity 150ms ease;
+}
+.aura-glass-seg-btn {
+  position: relative;
+  z-index: 1;
+  color: rgb(255 255 255 / 0.62);
+  transition: color 150ms ease;
+}
+.aura-glass-seg-btn:hover:not(:disabled) { color: rgb(255 255 255 / 0.88); }
+.aura-glass-seg-btn:is([aria-pressed="true"], [aria-checked="true"], [aria-selected="true"]) { color: #fff; }
+/* Keyboard focus: an inset outline in the accent MARK (a dark custom accent
+   still shows), inside the track so the track's padding never clips it. */
+.aura-glass-seg-btn:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--ln-accent-mark) 75%, transparent);
+  outline-offset: -2px;
+}
+
+/* ---- Toggle switch (round 12) ----------------------------------------- */
+/* ONE component draws every switch: ToggleSwitch (settingsControls.tsx),
+   a button, or a decorative aria-hidden span (.aura-toggle-deco) inside a
+   row or pill that carries role="switch" (the filter menu, Library, Queue,
+   Detail, the player menus). The track is a cursor-light RIM surface
+   (data-glass-light="rim" on every copy, over the video too); the ring layer
+   keeps a transparent fallback all the same, as above. Frosted: a white
+   0.15 well with a faint hairline; on, the accent fill. */
+.aura-glass-toggle {
+  background: var(--lg-rim-layer, linear-gradient(transparent, transparent)), rgb(255 255 255 / 0.15);
+  box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.06);
+  transition: background-color 150ms ease, box-shadow 200ms ease;
+}
+.aura-glass-toggle[aria-checked="true"] {
+  background: var(--lg-rim-layer, linear-gradient(transparent, transparent)), rgb(var(--ln-accent-rgb) / 0.8);
+}
+.aura-glass-knob {
+  background: #fff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4), 0 2px 6px -2px rgba(0, 0, 0, 0.3);
+  transition: translate var(--aura-spring-snappy-dur) var(--aura-spring-snappy);
+}
+.aura-glass-toggle[aria-checked="true"] .aura-glass-knob { translate: 16px 0; }
+/* A very light CUSTOM accent (<html data-accent-light>, themeAccent.ts, WCAG
+   luminance 0.6 and up): on Matte the white knob of a switch that is on all
+   but vanished into the accent track (1.6 to 2:1; the lightest built-in,
+   Ocean, is 2.65:1), so it takes a thin dark edge, the High Contrast idea at a
+   lighter weight. Never set for a theme's own accent, so built-ins are
+   untouched; the High Contrast rule below (same specificity, later) keeps its
+   stronger edge. Liquid needs none: its on-track is a dim tint over a dark
+   well, so the knob stays at 4:1 or more there. */
+html[data-accent-light]:not([data-glass="liquid"]) .aura-glass-toggle[aria-checked="true"] .aura-glass-knob {
+  box-shadow: inset 0 0 0 1px rgb(0 0 0 / 0.65), 0 1px 3px rgba(0, 0, 0, 0.4), 0 2px 6px -2px rgba(0, 0, 0, 0.3);
+}
+/* Keyboard focus: an outline, because the Liquid track and the High
+   Contrast floor set box-shadow above a focus-visible:ring utility. */
+.aura-glass-toggle:focus-visible,
+[role="switch"]:focus-visible > .aura-toggle-deco {
+  outline: 2px solid color-mix(in srgb, var(--ln-accent-mark) 75%, transparent);
+  outline-offset: 2px;
+}
+/* A row or pill that carries role="switch" around a decorative switch
+   (.aura-toggle-deco): keyboard focus rings the SWITCH, as on a Settings
+   switch, so the owner drops its own outline and ring (the Liquid row
+   outline, the player row's ring utility, the browser default). :root makes
+   it outrank the Liquid row rule (0,3,1). */
+:root [role="switch"]:has(> .aura-toggle-deco):focus-visible {
+  outline: none;
+  --tw-ring-shadow: 0 0 #0000;
+}
+
+/* ---- Press feedback (opt-in) ---------------------------------------- */
+/* Individual transform properties, so an element positioned with
+   transform (Tailwind translate utilities) keeps its position. Press only:
+   NO hover scale or translate, in either material. A hover transform runs
+   on the compositor, which resamples one raster of the label every frame
+   of the spring (small text went soft, then snapped crisp when the layer
+   dropped). Hover feedback is --lg-lift and the glint. */
+.aura-glass-press {
+  transition: scale var(--aura-spring-bouncy-dur) var(--aura-spring-bouncy), translate 200ms ease, --lg-lift 180ms ease;
+}
+.aura-glass-press:active { scale: 0.97; transition-duration: 90ms; }
+
+/* ---- Morphs (opt-in classes) ---------------------------------------- */
+/* .aura-glass-pop-in on open, .aura-glass-pop-out while closing (unmount
+   on animationend, or after 160 ms). Set --lg-origin (or style
+   transform-origin) to the trigger side so Liquid grows FROM the trigger.
+   Fill mode is `backwards`, so an element that positions itself with
+   transform gets it back when the animation ends; prefer a wrapper.
+   A pop is TWO animations: a short fade, and the shape on a spring token
+   (the spring overshoots past 1, which a transform extrapolates as a real
+   overshoot; on opacity it would clamp, hence the separate fade). The Liquid
+   shape peaks near scale(1.010, 1.031) and settles.
+   --lg-pop-dy is the opening lift (default -4px Frosted, -8px Liquid). A
+   surface anchored AT THE POINTER (the context menu and its submenu) sets it
+   to 0px: a lift slides the menu up over the stationary pointer for the
+   first ~70 ms, Chromium's layout-driven hover re-test then unhovers the
+   card under it and lights the menu's first row, and both flip back as the
+   spring settles (the card "shrinks" and the row "expands"). */
+@keyframes aura-glass-pop-fade {
+  from { opacity: 0; }
+}
+@keyframes aura-glass-pop-frost-shape {
+  from { transform: translateY(var(--lg-pop-dy, -4px)) scale(0.97); }
+  to   { transform: none; }
+}
+@keyframes aura-glass-pop-shape {
+  from { transform: translateY(var(--lg-pop-dy, -8px)) scale(0.9, 0.7); }
+  to   { transform: none; }
+}
+@keyframes aura-glass-pop-out {
+  to { opacity: 0; transform: translateY(-4px) scale(0.97, 0.9); }
+}
+.aura-glass-pop-in {
+  transform-origin: var(--lg-origin, top left);
+  animation:
+    aura-glass-pop-fade 120ms ease-out backwards,
+    aura-glass-pop-frost-shape var(--aura-spring-snappy-dur) var(--aura-spring-snappy) backwards;
+}
+.aura-glass-pop-out {
+  transform-origin: var(--lg-origin, top left);
+  animation: aura-glass-pop-out 140ms ease-in forwards;
+  pointer-events: none;
+}
+/* Width morph for search bars that widen on focus (pair with
+   liquidGlass.holdLensForMorph). A bound element with this class takes the
+   sliced, width-independent lens (liquidGlass.ts MORPH_SELECTOR), so it stays
+   bound while it moves: no CSS-face hold, no rebind at rest. */
+.aura-glass-morph-w { transition: width 240ms var(--lg-cinematic); }
+
+/* ---- Liquid (style B) ----------------------------------------------- */
+/* Control tier: milky face a little lighter than what it covers, deep
+   inner meniscus, no white rim, colour pooled low (the filter's pickup). */
+html[data-glass="liquid"] :is(.aura-float-glass, .aura-glass-control) {
+  --lg-face:
+    linear-gradient(rgb(255 255 255 / var(--lg-ctl-sheen-top)), rgb(255 255 255 / var(--lg-ctl-sheen-bottom))),
+    linear-gradient(rgb(var(--lg-ctl-tint-rgb) / var(--lg-ctl-tint-top)), rgb(var(--lg-ctl-tint-rgb) / var(--lg-ctl-tint-bottom)));
+  --lg-border-c: var(--lg-face-ring);
+  --lg-edge: var(--lg-meniscus-ringed);
+  --lg-drop: var(--lg-drop-liquid);
+  /* No solid base by default: a control on the sidebar / title-bar chrome
+     or on static art never has page text moving under it, and the base
+     there only replaced the real Mica with the darker estimate. */
+  --lg-backdrop: blur(var(--lg-ctl-blur)) saturate(var(--lg-ctl-sat)) brightness(var(--lg-ctl-bright));
+}
+/* A control that page content scrolls under (the Home search bar, the
+   detail page's floating Back / Close, a fixed restore pill) opts into the
+   solid base with [data-glass-base]. The base (url(#aura-glass-base), see
+   --lg-window-est) sits right after the tier blur, where liquidGlass.ts
+   makeFilter stacks it (BASE_SELECTOR), so the bound lens and this CSS face
+   match. Before the [data-lg-bound] rule, which must win while bound. */
+html[data-glass="liquid"] .aura-glass-control[data-glass-base] {
+  --lg-backdrop: blur(var(--lg-ctl-blur)) url(#aura-glass-base) saturate(var(--lg-ctl-sat)) brightness(var(--lg-ctl-bright));
+}
+/* Floating controls, round 9 (the A "Obsidian" face): no specular rim
+   (--lg-spec), no meniscus, no dark face ring, no inner glow, and the A drop
+   (0 1px 2px black 0.3, 0 18px 48px black 0.55; a zero third entry keeps the
+   three-entry shape of --lg-drop-liquid). The edge is the idle rim (aura-rim
+   worklet). The same list bound and unbound (the filter bakes no meniscus or
+   hairline on this tier any more: --lg-ctl-meniscus-k / --lg-ctl-hairline-k
+   0), so a bind or unbind changes no edge. Overrides round 6's six-entry spec
+   + meniscus edge and its softer drop. Menus keep their own meniscus and ring.
+   Round 17 (the user, Clear: "I still notice the clear light band ...
+   primarily the menu bar, settings panels, and the search bar"): the A inner
+   glow (inset 0 0 22px white 0.012, round 9) WAS that band. It lifts the face
+   by 0.006 x (255 - face) at the hairline and fades over about 20 px, which
+   the 8-bit composite turns into a +1 level step (+2 at the corners, where
+   two sides add) about 10 CSS px inside the edge, all channels, on every
+   control and sheet (headless D3D11 harness, uniform page, pointer out, in
+   the window or near: rail, sheets, search bar, hero arrows 1.0 to 1.6
+   levels over 10 to 15 device px; after, flat from the first pixel inside
+   the hairline). Its alpha is 0 now; the entry stays so every list and
+   keyframe that holds --lg-edge keeps its shape. Nothing else in the face
+   depends on the distance to the edge on a uniform page (measured:
+   refraction, the blur's edge, saturate, the drop and the base each move
+   the interior under 0.5). Over the Home hero bleed a ROUNDED surface's
+   ends still lifted +1 to +1.5 levels (+2.5 to +4 in blue) over about
+   20 px: the bleed's hole was rounded like the element, but the backdrop
+   blur reads the rectangular border box. Round 18: the hole is the box and
+   the element paints the bleed back in its corners (glass-hero.css, the
+   corner patch); see frontend-ui.md "Banding under fixed glass". */
+html[data-glass="liquid"] .aura-glass-control {
+  --lg-face-ring: transparent;
+  --lg-edge: inset 0 0 22px rgb(255 255 255 / 0);
+  --lg-drop:
+    0 1px 2px rgb(0 0 0 / 0.30),
+    0 18px 48px rgb(0 0 0 / 0.55),
+    0 0 0 rgb(0 0 0 / 0);
+}
+/* Menu tier (every .aura-float-glass that is not a control): the densest
+   glass, swallows the art behind it completely. Tooltips add
+   .aura-glass-tip: same tier, never refracted (the binder skips them). */
+html[data-glass="liquid"] .aura-float-glass:not(.aura-glass-control) {
+  --lg-face:
+    linear-gradient(rgb(255 255 255 / var(--lg-menu-sheen-top)), rgb(255 255 255 / var(--lg-menu-sheen-bottom))),
+    linear-gradient(rgb(var(--lg-menu-tint-rgb) / var(--lg-menu-tint-top)), rgb(var(--lg-menu-tint-rgb) / var(--lg-menu-tint-bottom)));
+  --lg-backdrop: blur(var(--lg-menu-blur)) url(#aura-glass-base) saturate(var(--lg-menu-sat)) brightness(var(--lg-menu-bright)) var(--lg-menu-tone-step);
+  --lg-edge:
+    inset 0 8px 12px -10px rgb(255 255 255 / calc(0.06 * var(--lg-menu-meniscus-k))),
+    inset 0 10px 14px -12px rgb(0 0 0 / calc(0.40 * var(--lg-menu-meniscus-k))),
+    inset 0 -12px 18px -10px rgb(0 0 0 / calc(0.60 * var(--lg-menu-meniscus-k))),
+    inset 0 0 0 0.5px rgb(0 0 0 / 0);
+}
+/* The menu tier's CSS face ring, matched to the lens's outer pixel with the
+   lighter menu meniscus (--lg-menu-meniscus-k 0.35; measured bound vs
+   unbound per side over cream and a mid lavender page). The shared ring's
+   0.55 bottom was 18 levels darker than the bound edge. Tips keep the
+   shared ring (they never bind). */
+html[data-glass="liquid"] .aura-float-glass:not(.aura-glass-control, .aura-glass-tip) {
+  --lg-face-ring: rgb(0 0 0 / 0.15) rgb(0 0 0 / 0.16) rgb(0 0 0 / 0.24) rgb(0 0 0 / 0.16);
+}
+/* Tips and toasts: the menu chain and face, retuned lighter through the
+   tier's own tokens (resolved on the tip itself; liquidGlass.ts never binds
+   a tip, so its filters still read the :root values). A milkier sheen and a
+   gentler darkening: face = about 0.25 x backdrop + 43 (the menu tier is
+   about 0.26 x backdrop + 5, near black over the dark page). Text stays at
+   4.5:1 or better over a pure white backdrop (measured). Tokens, not
+   --lg-face / --lg-backdrop, so the zero-blur themes' opaque rule still
+   wins. */
+html[data-glass="liquid"] .aura-glass-tip {
+  /* Pinned to the look tips had before the menu body went uniform (the menu
+     tier's tone step, saturation and lighter meniscus are not theirs). */
+  --lg-menu-tone-step: brightness(1);
+  --lg-menu-sat: 1.4;
+  --lg-menu-meniscus-k: 1;
+  --lg-menu-bright: 0.74;
+  --lg-menu-sheen-top: 0.16;
+  --lg-menu-sheen-bottom: 0.10;
+  --lg-menu-tint-top: 0.56;
+  --lg-menu-tint-bottom: 0.64;
+  --lg-drop: 0 1px 1px rgb(0 0 0 / 0.40), 0 6px 16px -6px rgb(0 0 0 / 0.55);
+}
+/* Bound by liquidGlass.ts: the face, meniscus and pickup are inside the
+   filter, so the element's own layers carry only the glint and the lift.
+   The chain is ONLY the pickup blur: the rest of the tier blur, saturate and
+   brightness run inside the filter on the body branch, so a caustic pickup
+   would sample the raw backdrop (as the mockup's separate .gr layer did),
+   not a body already darkened and covered by the face. Both tiers' pickup
+   blur is their tier blur today (no pickup), so the filter adds no blur. */
+html[data-glass="liquid"] :is(.aura-float-glass, .aura-glass-control, .aura-glow)[data-lg-bound] {
+  --lg-face: linear-gradient(transparent, transparent);
+  --lg-edge: var(--lg-meniscus-clear);
+  --lg-backdrop: blur(var(--lg-ctl-pickup-blur)) var(--lg-filter, saturate(1));
+}
+/* The menu tier's pickup blur (its filter was built against this one). */
+html[data-glass="liquid"] .aura-float-glass:not(.aura-glass-control)[data-lg-bound] {
+  --lg-backdrop: blur(var(--lg-menu-pickup-blur)) var(--lg-filter, saturate(1));
+}
+/* A bound control keeps the same A edge as its CSS face (the filter bakes
+   no meniscus on this tier): the zero-alpha inner glow since round 17.
+   After the bound rule above (same specificity, order decides). */
+html[data-glass="liquid"] .aura-glass-control[data-lg-bound] {
+  --lg-edge: inset 0 0 22px rgb(255 255 255 / 0);
+}
+/* Flat controls in Liquid (in-page buttons, selects, chips, pill
+   dropdowns; no backdrop pass: they sit on scrolling pages), drawn as iOS 26
+   clear glass rather than a dark rubber slab: a LUMINOUS face (a near-even
+   milky sheen over a light tint, so it sits above a dark page and level
+   with a light one), the specular rim (--lg-spec) on a faint lit border, a
+   soft inner glow just inside the rim, a faint low pool for volume, and a
+   soft, wide, low drop. Measured on a Settings card (Haze, select): face 40
+   to 47 against a card of 22, top rim 41 to 94 (the old bottom edge was a
+   dark outline, 19); over a light stand-in page (about 71) the face is 78
+   where it was 69, so it no longer reads as a slab there. The edge keeps
+   four entries (two rim, glow, pool) like the meniscus it replaces.
+   Round 13: the sheen is the --lg-flat-sheen-* tokens (html[data-glass=
+   "liquid"] above), a touch darker than this round 6 measurement. */
+html[data-glass="liquid"] .aura-glass-flat {
+  --lg-face:
+    linear-gradient(rgb(255 255 255 / var(--lg-flat-sheen-top)), rgb(255 255 255 / var(--lg-flat-sheen-bottom))),
+    linear-gradient(rgb(var(--lg-ctl-tint-rgb) / 0.26), rgb(var(--lg-ctl-tint-rgb) / 0.34));
+  --lg-border-c: var(--lg-spec-ring);
+  --lg-edge:
+    var(--lg-spec),
+    inset 0 0 8px -2px rgb(255 255 255 / 0.07),
+    inset 0 -10px 14px -12px rgb(0 0 0 / 0.10);
+  --lg-drop: 0 1px 2px rgb(0 0 0 / 0.16), 0 6px 18px -6px rgb(0 0 0 / 0.30);
+}
+html[data-glass="liquid"] .aura-glass-flat:hover:where(:not(:disabled):not([aria-disabled="true"])) {
+  --lg-lift: var(--lg-lift-hover);
+  --lg-border-c: var(--lg-spec-ring);
+}
+html[data-glass="liquid"] .aura-glass-flat:focus-visible { --lg-lift: var(--lg-lift-hover); }
+/* Tinted variants: an even wash with a faint low pool, and a label lifted
+   toward white (iOS tinted glass keeps bright labels; the lighter face
+   would otherwise drop an accent label's contrast on a light page). */
+html[data-glass="liquid"] .aura-glass-flat.is-primary {
+  --lg-deco: linear-gradient(rgb(var(--ln-accent-rgb) / 0.08), rgb(var(--ln-accent-rgb) / 0.14));
+  --lg-ring: inset 0 -8px 12px -9px rgb(var(--ln-accent-rgb) / 0.30), inset 0 0 0 1px rgb(var(--ln-accent-rgb) / 0.16);
+  color: color-mix(in oklab, rgb(var(--ln-accent-rgb)) 60%, white);
+}
+html[data-glass="liquid"] .aura-glass-flat.is-danger {
+  --lg-deco: linear-gradient(rgb(244 63 94 / 0.05), rgb(244 63 94 / 0.11));
+  --lg-ring: inset 0 -8px 12px -9px rgb(251 113 133 / 0.30), inset 0 0 0 1px rgb(251 113 133 / 0.14);
+  color: rgb(254 194 201);
+}
+/* Sunken well for text fields: shallower and lighter than before, with the
+   bottom-right half of the specular rim catching its lower lip. */
+html[data-glass="liquid"] .aura-glass-field {
+  --lg-face: linear-gradient(rgb(0 0 0 / 0.18), rgb(0 0 0 / 0.12));
+  --lg-border-c: transparent;
+  /* Rest ring: the focus hairline at zero alpha. Inset like the focus one, so
+     the box-shadow transition fades it (inset vs outer does not interpolate). */
+  --lg-ring: inset 0 0 0 1px rgb(255 255 255 / 0);
+  --lg-edge: inset 0 2px 5px rgb(0 0 0 / 0.30), inset -0.6px -1px 0.5px -0.25px rgb(255 255 255 / 0.14), inset 0 0 0 0.5px rgb(255 255 255 / 0.05);
+}
+html[data-glass="liquid"] .aura-glass-field:is(:focus, :focus-within) {
+  --lg-face: linear-gradient(rgb(0 0 0 / 0.12), rgb(0 0 0 / 0.08));
+  --lg-ring: inset 0 0 0 1px rgb(255 255 255 / 0.09);
+}
+html[data-glass="liquid"] .aura-glass-field.is-valid { --lg-ring: inset 0 0 0 1px rgb(52 211 153 / 0.35); }
+html[data-glass="liquid"] .aura-glass-field.is-invalid { --lg-ring: inset 0 0 0 1px rgb(248 113 113 / 0.35); }
+/* Player material, Liquid: the bar recipe, baked, no backdrop. */
+html[data-glass="liquid"] .aura-glass-player {
+  --lg-face:
+    linear-gradient(rgb(255 255 255 / 0.06), rgb(255 255 255 / 0.025)),
+    linear-gradient(rgb(8 10 14 / 0.70), rgb(8 10 14 / 0.82));
+  --lg-border-c: transparent;
+  --lg-edge:
+    inset 0 8px 12px -10px rgb(255 255 255 / 0.05),
+    inset 0 10px 14px -12px rgb(0 0 0 / 0.45),
+    inset 0 -12px 18px -10px rgb(0 0 0 / 0.6),
+    inset 0 0 0 0.5px rgb(0 0 0 / 0.35);
+  --lg-drop: var(--lg-drop-liquid);
+}
+/* Hover and press: a soft lift, and the droplet squash. */
+html[data-glass="liquid"] .aura-glass-control:hover { --lg-lift: var(--lg-lift-hover); }
+/* No hover scale: it resampled the label for the whole spring (see
+   .aura-glass-press). Hover is the lift above plus the glint. */
+html[data-glass="liquid"] .aura-glass-press:active { scale: 1.04 0.94; transition-duration: 90ms; }
+
+/* SELECTION in Liquid: never an underglow, an accent ring, an outer glow or
+   a pulse. A slightly brighter, raised glass face (the hover material, a
+   touch stronger) and the accent on the icon and label only. */
+html[data-glass="liquid"] .aura-glass-control:is(.is-active, .is-selected, [aria-pressed="true"]) {
+  --lg-lift: var(--lg-lift-selected);
+  --lg-border-c: var(--lg-face-ring);
+  --lg-ring: 0 0 #0000;
+  color: var(--ln-accent-mark);
+}
+/* A checked choice (a flat control, the onboarding cards): the flat
+   material's luminous face and lit ring (it must restate them over the
+   Frosted accent face), raised by the selected lift. */
+html[data-glass="liquid"] .aura-glass-choice[aria-checked="true"] {
+  --lg-face:
+    linear-gradient(rgb(255 255 255 / var(--lg-flat-sheen-top)), rgb(255 255 255 / var(--lg-flat-sheen-bottom))),
+    linear-gradient(rgb(var(--lg-ctl-tint-rgb) / 0.26), rgb(var(--lg-ctl-tint-rgb) / 0.34));
+  --lg-lift: var(--lg-lift-selected);
+  --lg-border-c: var(--lg-spec-ring);
+  --lg-drop: 0 1px 2px rgb(0 0 0 / 0.22), 0 6px 18px -6px rgb(0 0 0 / 0.36);
+}
+/* A bound element's ring stays transparent in every state: the filter draws
+   its own outer hairline, so the face ring would double it. After the
+   selected and choice rules above (same specificity, order decides). */
+html[data-glass="liquid"] :is(.aura-float-glass, .aura-glass-control)[data-lg-bound] {
+  --lg-border-c: transparent;
+}
+html[data-glass="liquid"] .aura-glass-choice[aria-checked="true"] .aura-glass-choice-label {
+  color: var(--ln-accent-mark);
+}
+html[data-glass="liquid"] :is(.aura-glass-item, .aura-glass-row):hover {
+  background: linear-gradient(rgb(255 255 255 / 0.075), rgb(255 255 255 / 0.035));
+  box-shadow: inset 0 6px 10px -8px rgb(255 255 255 / 0.07), inset 0 -8px 12px -9px rgb(0 0 0 / 0.35);
+}
+html[data-glass="liquid"] :is(.aura-glass-item, .aura-glass-row):is([aria-selected="true"], [aria-current="page"],
+    [aria-current="true"], [aria-pressed="true"], [aria-checked="true"], .is-selected) {
+  background: linear-gradient(rgb(255 255 255 / 0.12), rgb(255 255 255 / 0.055));
+  box-shadow:
+    inset 0 6px 10px -8px rgb(255 255 255 / 0.12),
+    inset 0 -10px 14px -10px rgb(0 0 0 / 0.45),
+    0 1px 2px rgb(0 0 0 / 0.35),
+    0 4px 10px -4px rgb(0 0 0 / 0.30);
+  color: var(--ln-accent-mark);
+  font-weight: inherit;
+}
+/* Keyboard focus on a Liquid row or item: an OUTLINE, because the hover and
+   selection faces above set box-shadow at a specificity that beats a
+   focus-visible:ring utility, which then vanished on exactly those rows. */
+html[data-glass="liquid"] :is(.aura-glass-item, .aura-glass-row):focus-visible {
+  outline: 1px solid rgb(255 255 255 / 0.32);
+  outline-offset: -1px;
+}
+/* A list with a hover droplet: its rows paint no hover of their own. */
+html[data-glass="liquid"] [data-glass-droplet] :is(.aura-glass-item, .aura-glass-row, .aura-nav-row):hover:not(:is(
+    [aria-selected="true"], [aria-current="page"], [aria-current="true"], [aria-pressed="true"], [aria-checked="true"], .is-selected)) {
+  background: transparent;
+  box-shadow: none;
+}
+html[data-glass="liquid"] .aura-glass-hl {
+  visibility: visible;
+  background: linear-gradient(rgb(255 255 255 / 0.075), rgb(255 255 255 / 0.035));
+  box-shadow:
+    inset 0 6px 10px -8px rgb(255 255 255 / 0.08),
+    inset 0 -8px 12px -9px rgb(0 0 0 / 0.35),
+    0 1px 2px rgb(0 0 0 / 0.25);
+  /* It grows into place on the bouncy spring as it shows (animateSpan writes
+     `translate`, so this scale is about the droplet's own centre). */
+  scale: 0.94 0.8;
+  transition: opacity 120ms ease-out, scale var(--aura-spring-bouncy-dur) var(--aura-spring-bouncy);
+}
+html[data-glass="liquid"] .aura-glass-hl.is-on { opacity: 1; scale: 1; }
+
+/* Nav rows in Liquid: the hover droplet replaces the per-row fill (no hover
+   scale in either material); a press squashes the row like a droplet. */
+html[data-glass="liquid"] .aura-nav-row.nav-tap {
+  transition: transform var(--aura-spring-bouncy-dur) var(--aura-spring-bouncy), color 200ms ease;
+}
+html[data-glass="liquid"] .aura-nav-row.nav-tap:hover { transform: none; }
+html[data-glass="liquid"] .aura-nav-row.nav-tap:active { transform: scale(1.03, 0.93); transition-duration: 90ms; }
+
+/* Segmented control and toggle in Liquid (round 12). */
+/* The track: the field tier's sunken well (.aura-glass-field: black 0.18 to
+   0.12, the inner top shade and the lit lower lip of the specular rim) with
+   a soft idle rim, lower-right heavy like a lit lip. The cursor light rings
+   its edge like any glass. */
+html[data-glass="liquid"] .aura-glass-seg {
+  background: var(--lg-rim-layer, linear-gradient(transparent, transparent)), linear-gradient(rgb(0 0 0 / 0.20), rgb(0 0 0 / 0.13));
+  box-shadow:
+    inset 0 2px 5px rgb(0 0 0 / 0.32),
+    inset -0.6px -1px 0.5px -0.25px rgb(255 255 255 / 0.14),
+    inset 0 0 0 0.5px rgb(255 255 255 / 0.05);
+  --lg-idle-tl: 0.08;
+  --lg-idle-mid: 0.02;
+  --lg-idle-br: 0.14;
+}
+/* The thumb: a raised droplet, the rail pill's face a touch brighter (it
+   sits in a well), its idle rim, a soft drop, and a faint accent-MARK rim as
+   the only accent (the label stays white). */
+html[data-glass="liquid"] .aura-glass-seg-ind {
+  /* The thumb's translate / width spring is the .aura-seg-thumb rule below. */
+  transition: opacity 150ms ease;
+  background:
+    var(--lg-rim-layer, linear-gradient(transparent, transparent)),
+    linear-gradient(rgb(255 255 255 / 0.13), rgb(255 255 255 / 0.095));
+  --lg-idle-tl: 0.30;
+  --lg-idle-mid: 0.04;
+  --lg-idle-br: 0.16;
+  box-shadow:
+    inset 0 0 0 1px color-mix(in srgb, var(--ln-accent-mark) 22%, transparent),
+    inset 0 0 10px rgb(255 255 255 / 0.02),
+    0 1px 2px rgb(0 0 0 / 0.36),
+    0 3px 8px -2px rgb(0 0 0 / 0.30);
+}
+html[data-glass="liquid"] .aura-glass-seg-btn:is([aria-pressed="true"], [aria-checked="true"], [aria-selected="true"]) {
+  color: #fff;
+}
+/* SegmentedControl's thumb, both materials: CSS-sprung on --lg-springy (the
+   search bar's spring), translate and width only (never opacity: the curve
+   passes 1). Reduced motion collapses it (the list below). Liquid adds a
+   squash-and-settle (`.is-stretching`, restarted per move). */
+html[data-glass] .aura-glass-seg-ind.aura-seg-thumb {
+  transition:
+    translate 380ms var(--lg-springy),
+    width 380ms var(--lg-springy),
+    opacity 150ms ease;
+}
+@keyframes aura-seg-thumb-squash {
+  0%   { scale: 1 1; }
+  34%  { scale: 1.05 0.84; }
+  100% { scale: 1 1; }
+}
+html[data-glass="liquid"] .aura-seg-thumb.is-stretching { animation: aura-seg-thumb-squash 380ms ease-out; }
+/* Liquid switch: one background for both states, scaled by --lg-toggle-on.
+   Off is a dark sunken well. On is a theme-accent tint (near even, NOT a
+   bottom pool or an underglow) under a faint sheen, with an accent hairline:
+   the knob position carries the state, the tint makes it readable at a
+   glance (a neutral raised well read as grey vs grey). Round 12: the ring
+   layer first (the cursor light catches the rim) and the well's idle rim.
+   Not a paint-rule element: its box-shadow is its own three-inset list in
+   both states (same shape, so it interpolates); never name --lg-rimlight
+   here (invalid outside the glass reset). */
+html[data-glass="liquid"] .aura-glass-toggle {
+  background:
+    var(--lg-rim-layer, linear-gradient(transparent, transparent)),
+    linear-gradient(rgb(255 255 255 / calc(var(--lg-toggle-on) * 0.12)), rgb(255 255 255 / calc(var(--lg-toggle-on) * 0.04))),
+    linear-gradient(rgb(var(--ln-accent-rgb) / calc(var(--lg-toggle-on) * 0.34)), rgb(var(--ln-accent-rgb) / calc(var(--lg-toggle-on) * 0.44))),
+    rgb(0 0 0 / calc(0.32 - var(--lg-toggle-on) * 0.10));
+  box-shadow: inset 0 2px 4px rgb(0 0 0 / 0.5), inset 0 -1px 0 rgb(255 255 255 / 0.05), inset 0 0 0 0.5px rgb(0 0 0 / 0.4);
+  --lg-idle-tl: 0.08;
+  --lg-idle-mid: 0.02;
+  --lg-idle-br: 0.14;
+  transition: --lg-toggle-on 200ms ease, box-shadow 200ms ease;
+}
+html[data-glass="liquid"] .aura-glass-toggle[aria-checked="true"] {
+  --lg-toggle-on: 1;
+  box-shadow:
+    inset 0 6px 10px -8px rgb(255 255 255 / 0.16),
+    inset 0 -6px 10px -8px rgb(0 0 0 / 0.40),
+    inset 0 0 0 0.5px rgb(var(--ln-accent-rgb) / 0.40);
+}
+/* The knob: a glass bead. A small specular highlight up and left over a
+   milky body, a soft lower shade for volume and a crisp 0.5 px edge. On, the
+   lower shade takes the accent (light through the tinted track) and the body
+   a touch more solid; the track carries the accent, an accent knob on an
+   accent track would lose contrast. Four entries in both states. */
+html[data-glass="liquid"] .aura-glass-knob {
+  background:
+    radial-gradient(60% 48% at 36% 24%, rgb(255 255 255 / 0.95), rgb(255 255 255 / 0) 72%),
+    radial-gradient(90% 70% at 50% 20%, rgb(250 251 254 / 0.90), rgb(228 233 242 / 0.72));
+  box-shadow:
+    inset 0 -3px 5px -2px rgb(0 0 0 / 0.22),
+    inset 0 0 0 0.5px rgb(0 0 0 / 0.2),
+    0 1px 2px rgb(0 0 0 / 0.45),
+    0 3px 8px -2px rgb(0 0 0 / 0.4);
+  transition: translate var(--aura-spring-bouncy-dur) var(--aura-spring-bouncy), box-shadow 200ms ease;
+}
+html[data-glass="liquid"] .aura-glass-toggle[aria-checked="true"] .aura-glass-knob {
+  background:
+    radial-gradient(60% 48% at 36% 24%, rgb(255 255 255 / 1), rgb(255 255 255 / 0) 72%),
+    radial-gradient(90% 70% at 50% 20%, rgb(255 255 255 / 0.98), rgb(240 243 249 / 0.90));
+  box-shadow:
+    inset 0 -3px 5px -2px rgb(var(--ln-accent-rgb) / 0.34),
+    inset 0 0 0 0.5px rgb(0 0 0 / 0.2),
+    0 1px 2px rgb(0 0 0 / 0.45),
+    0 3px 8px -2px rgb(0 0 0 / 0.4);
+}
+@keyframes aura-glass-knob-stretch {
+  0%   { scale: 1 1; }
+  38%  { scale: 1.42 0.86; }
+  100% { scale: 1 1; }
+}
+html[data-glass="liquid"] .aura-glass-knob.is-stretching { animation: aura-glass-knob-stretch 320ms ease-out; }
+html[data-glass="liquid"] .aura-glass-pop-in {
+  animation:
+    aura-glass-pop-fade 140ms ease-out backwards,
+    aura-glass-pop-shape var(--aura-spring-bouncy-dur) var(--aura-spring-bouncy) backwards;
+}
+html[data-glass="liquid"] .aura-glass-morph-w { transition: width 360ms var(--lg-springy); }
+
+/* ---- Zero-blur themes (--ln-blur-elev: 0px) ------------------------- */
+/* Nothing behind to blur or bend, so floating glass goes OPAQUE on
+   --ln-panel-solid, as before. Frosted is just the solid fill; Liquid keeps
+   its face and meniscus shading over it. The binder stands down here. */
+html:not([data-glass="liquid"]):is([data-theme="midnight"], [data-theme="contrast"], [data-theme="contrast-azure"])
+    :is(.aura-float-glass, .aura-glass-control) {
+  --lg-backdrop: none;
+  --lg-base: var(--ln-panel-solid, #0b0d12);
+  --lg-face: linear-gradient(transparent, transparent);
+}
+html[data-glass="liquid"]:is([data-theme="midnight"], [data-theme="contrast"], [data-theme="contrast-azure"])
+    :is(.aura-float-glass, .aura-glass-control, .aura-glow) {
+  --lg-backdrop: none;
+  --lg-base: var(--ln-panel-solid, #0b0d12);
+}
+/* High Contrast: every glass edge clearly delineated, in both materials and
+   in every state. !important because state rules (hover, open, focus) in the
+   group sheets loaded after App.css reach this specificity and used to drop
+   the edge on exactly those states; an accessibility floor, not a look. */
+html[data-glass]:is([data-theme="contrast"], [data-theme="contrast-azure"])
+    :is(.aura-float-glass, .aura-glass-control, .aura-glass-flat, .aura-glass-field) {
+  --lg-border-c: rgba(255, 255, 255, 0.35) !important;
+}
+/* The checked toggle is listed on its own so the floor matches the Liquid
+   checked rule's specificity (0,3,1) and wins on order: a switch keeps its
+   edge when it is turned on. */
+html:is([data-theme="contrast"], [data-theme="contrast-azure"]) :is(.aura-glass-seg, .aura-glass-toggle),
+html:is([data-theme="contrast"], [data-theme="contrast-azure"]) .aura-glass-toggle[aria-checked="true"] {
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.35);
+}
+/* The Frosted (Matte) knob of a switch that is on: a white knob on the bright
+   accent track (yellow, cyan) is about 1.5 to 2:1, so it takes a dark 1.5 px
+   edge (the 3:1 non-text floor). Liquid's on-track is a dim tint and its knob
+   keeps its own four-entry list (a shape change would snap its transition). */
+html:not([data-glass="liquid"]):is([data-theme="contrast"], [data-theme="contrast-azure"])
+    .aura-glass-toggle[aria-checked="true"] .aura-glass-knob {
+  box-shadow: inset 0 0 0 1.5px rgb(0 0 0 / 0.75), 0 1px 3px rgba(0, 0, 0, 0.4), 0 2px 6px -2px rgba(0, 0, 0, 0.3);
+}
+/* The segmented thumb: a brighter edge than its track (both materials), and
+   white focus outlines on both controls. */
+html:is([data-theme="contrast"], [data-theme="contrast-azure"]) .aura-glass-seg-ind {
+  box-shadow: inset 0 0 0 1.5px rgba(255, 255, 255, 0.7);
+}
+html:is([data-theme="contrast"], [data-theme="contrast-azure"]) :is(.aura-glass-seg-btn, .aura-glass-toggle):focus-visible,
+html:is([data-theme="contrast"], [data-theme="contrast-azure"]) [role="switch"]:focus-visible > .aura-toggle-deco {
+  outline-color: #fff;
+}
+
+/* ---- Reduced motion -------------------------------------------------- */
+/* Morphs collapse: pops become the plain fade, the knob does not stretch,
+   presses do not scale, the springs snap (liquidGlass.ts reads the same
+   attribute). Hover lifts and fades stay: they carry state. The spring
+   tokens collapse to a 1 ms linear step, so every spring-driven transform
+   or size lands at once while the separate fades keep their durations. */
+html[data-reduced-motion="true"] {
+  --aura-spring-snappy: linear(0, 1);
+  --aura-spring-bouncy: linear(0, 1);
+  --aura-spring-snappy-dur: 1ms;
+  --aura-spring-bouncy-dur: 1ms;
+}
+html[data-reduced-motion="true"] .aura-glass-hl { scale: none !important; }
+html[data-reduced-motion="true"] .aura-glass-pop-in { animation: aura-view-fade 160ms ease-out backwards !important; }
+html[data-reduced-motion="true"] .aura-glass-pop-out { animation: aura-view-fade 120ms ease-in reverse forwards !important; }
+html[data-reduced-motion="true"] :is(.aura-glass-knob, .aura-glass-seg-ind, .aura-glow, .aura-glass-morph-w) {
+  transition-duration: 1ms !important;
+  animation: none !important;
+}
+html[data-reduced-motion="true"] .aura-glass-press,
+html[data-reduced-motion="true"] .aura-glass-press:is(:hover, :active),
+html[data-reduced-motion="true"][data-glass="liquid"] .aura-nav-row.nav-tap:is(:hover, :active) {
+  scale: none !important;
+  translate: none !important;
+  transform: none !important;
 }
 
 /* The Performance Monitor. Darker than the shared glass because thin coloured
    lines have to read over a bright video frame, and no blur: it would re-run on
    every canvas draw, inflating the very figures the window shows, and the video
-   is not in the webview, so nothing behind it could refract anyway. The zero-blur
-   themes' opaque fill above still wins on specificity. */
+   is not in the webview, so nothing behind it could refract anyway. It sets
+   background and backdrop-filter directly (not the --lg-* hooks), so it keeps
+   this look in both glass materials and on every theme. */
 .aura-float-glass.aura-perf-monitor {
   background: linear-gradient(rgba(10, 12, 16, 0.86), rgba(10, 12, 16, 0.92));
   backdrop-filter: none;
@@ -2750,162 +4003,44 @@ html[data-reduced-motion="true"] .aura-perf-bar {
   text-shadow: 0 1px 3px rgba(0, 0, 0, 0.6);
 }
 
-/* Nav rail, short-window reflow. See the note on the <aside> in
-   NavSidebar.tsx: the two top side pills are `fixed z-30` directly over this
-   rail's x-range, so on a short window the vertically-centred nav rows drift
-   up underneath them and the Watch Party pill swallows the Home row's clicks.
-
-   Below the threshold the rail stretches and centres inside the band the pills
-   leave free instead of inside the whole body: 130px reserved at the top (the
-   pill stack's bottom edge, 44 + 2*40 + 6) and 52px at the bottom (the
-   Notifications pill, bottom-3 + 40). Deliberately a max-height query rather
-   than an unconditional padding change, so at normal window heights the rail
-   sits exactly where it always has.
-
-   Threshold: the overlap begins at roughly `nav content height + 260`, which
-   measures out near 776px; 800px leaves a little slack. */
-@media (max-height: 800px) {
-  .aura-nav-rail {
-    align-self: stretch;
-    justify-content: center;
-    padding-top: 130px;
-    padding-bottom: 52px;
-  }
-}
-
 /* ------------------------------------------------------------------ */
-/* Side pills. These replace the round bubbles and are sized to the nav */
-/* column so the top group, the menu and the bottom pill share one      */
-/* left edge and one width.                                            */
-/*                                                                    */
-/* No .aura-bell-hover here: that rotates the whole control by up to 10 */
-/* degrees, which reads as playful on a 40px circle and as broken on a  */
-/* 164px labelled pill. The replacement is a lift plus a brightening    */
-/* rim, which is the same language the nav rows already use.            */
+/* Left rail row states (NavSidebar.tsx; the rail itself, its rows and   */
+/* its pill are in styles/glass-rail.css). The rows are list rows on the */
+/* rail's one glass surface, so these never touch box-shadow or the      */
+/* glass hooks: the old side pills' breathing rim glow is gone with the  */
+/* pills.                                                               */
 /* ------------------------------------------------------------------ */
-.aura-side-pill {
-  transition:
-    transform 160ms cubic-bezier(0.2, 0.8, 0.2, 1),
-    background-color 160ms ease,
-    border-color 160ms ease,
-    box-shadow 160ms ease;
-}
-.aura-side-pill:hover {
-  transform: translateY(-1px);
-  border-color: rgba(255, 255, 255, 0.22);
-  box-shadow:
-    inset 0 1px 0 0 rgba(255, 255, 255, 0.16),
-    0 12px 30px -14px rgba(0, 0, 0, 0.8);
-}
-.aura-side-pill:active { transform: translateY(0) scale(0.985); }
-/* ACTIVE (panel open / in a party). This lives here rather than as a
-   `ring-1 ring-ln-accent/50` utility on the button, and the reason is the
-   documented .aura-float-glass shorthand trap: Tailwind's ring emits into
-   `box-shadow` at one-class specificity, and .aura-float-glass sets box-shadow
-   at the same specificity but LATER in the sheet, so it won and the ring never
-   rendered at all. Every side pill looked identical open and closed.
+/* The Notifications row's arrival sweep, its static unread cue and the
+   badge pop live in styles/glass-notify.css (round 10): nothing on that row
+   loops any more. */
 
-   Composed with the glass shadow instead of replacing it, so the lit top edge
-   and the drop shadow survive. Declared after :hover (equal specificity, so
-   order decides) and the :hover pairing is spelled out explicitly, otherwise
-   hovering an open pill drops the accent ring again. */
-.aura-side-pill.is-active,
-.aura-side-pill.is-active:hover {
-  border-color: rgb(var(--ln-accent-rgb) / 0.5);
-  box-shadow:
-    inset 0 1px 0 0 rgba(255, 255, 255, 0.16),
-    inset 0 -1px 0 0 rgba(0, 0, 0, 0.35),
-    0 0 0 1px rgb(var(--ln-accent-rgb) / 0.5),
-    0 10px 34px -12px rgba(0, 0, 0, 0.72);
-}
-.aura-side-pill.is-active:hover { transform: translateY(-1px); }
-
-/* Unread notifications: the pill breathes a soft accent GLOW.
- *
- * The first cut used `box-shadow: 0 0 0 4px`, which is spread with no blur, so
- * it drew a hard-edged ring that snapped in and out and read as a selection
- * outline rather than as an alert. This is the same idea done as light: a wide
- * blur with almost no spread, so the accent bleeds off the pill's edge and
- * fades rather than terminating. Slower too, because a glow that pulses at a
- * ring's tempo just looks like a ring again.
- *
- * Only box-shadow and (below) a static overlay, so this still composites
- * without layout or paint work on the pill's contents. */
-@keyframes aura-pill-alert {
-  0%, 100% {
-    box-shadow:
-      inset 0 1px 0 0 rgba(255, 255, 255, 0.10),
-      0 0 10px 0 rgb(var(--ln-accent-rgb) / 0.16),
-      0 0 22px 2px rgb(var(--ln-accent-rgb) / 0.07),
-      0 8px 26px -14px rgba(0, 0, 0, 0.75);
-  }
-  50% {
-    box-shadow:
-      inset 0 1px 0 0 rgba(255, 255, 255, 0.16),
-      0 0 18px 1px rgb(var(--ln-accent-rgb) / 0.34),
-      0 0 40px 6px rgb(var(--ln-accent-rgb) / 0.16),
-      0 8px 26px -14px rgba(0, 0, 0, 0.75);
-  }
-}
-.aura-pill-alert {
-  animation: aura-pill-alert 3.6s ease-in-out infinite;
-  position: relative;
-}
-/* A faint grain over the pill while it is glowing. A pure gradient glow on a
- * flat surface bands visibly on a dark UI; the noise breaks the banding up and
- * gives the light something to sit in. Static, not animated: the movement is
- * the glow's job. Same fractalNoise + overlay recipe the detail-page backdrop
- * skeleton uses, so this is the app's existing texture rather than a new one. */
-.aura-pill-alert::after {
-  content: "";
-  position: absolute;
-  inset: 0;
-  border-radius: inherit;
-  pointer-events: none;
-  opacity: 0.07;
-  mix-blend-mode: overlay;
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='120' height='120' filter='url(%23n)'/%3E%3C/svg%3E");
-}
-
-/* A brand-new arrival: one short pop, twice, then it settles into the
-   breathing rim above. Distinct from the steady alert so "something just
-   landed" and "something is still unread" do not look the same. */
-@keyframes aura-pill-arrive {
-  0%   { transform: translateY(0)    scale(1); }
-  35%  { transform: translateY(-2px) scale(1.02); }
-  100% { transform: translateY(0)    scale(1); }
-}
-.aura-pill-arrive { animation: aura-pill-arrive 720ms cubic-bezier(0.34, 1.56, 0.64, 1) 2; }
-
-/* Connected watch party: a slow accent sweep along the pill's own rim,
-   which is the calmest way to say "this is live" on a persistent control. */
+/* Watch party connected / connecting: the status dot breathes. The ease
+   in and out is drawn by the keyframes (a cosine at every 10%), and each
+   0.22 s stretch is stepped 7 times: about 30 changes a second, not one per
+   display frame (every frame the dot changes redraws the rail's backdrop
+   pass under it). A step is under 0.03 opacity on a 7 px dot. */
 @keyframes aura-pill-live {
-  0%, 100% { opacity: 0.35; }
-  50%      { opacity: 0.9; }
+    0% { opacity: 0.350; }
+   10% { opacity: 0.403; }
+   20% { opacity: 0.540; }
+   30% { opacity: 0.710; }
+   40% { opacity: 0.847; }
+   50% { opacity: 0.900; }
+   60% { opacity: 0.847; }
+   70% { opacity: 0.710; }
+   80% { opacity: 0.540; }
+   90% { opacity: 0.403; }
+  100% { opacity: 0.350; }
 }
-.aura-pill-live-dot { animation: aura-pill-live 2.2s ease-in-out infinite; }
+.aura-pill-live-dot { animation: aura-pill-live 2.2s steps(7) infinite; }
 
 /* Both global suppression gates. Every decorative loop must be listed in
    BOTH: reduced-motion is an accessibility contract, and the idle gate
    exists because Chromium does not throttle a merely-unfocused transparent
    window, so an unlisted loop burns GPU behind other apps. */
-html[data-reduced-motion="true"] .aura-pill-alert,
-html[data-reduced-motion="true"] .aura-pill-arrive,
 html[data-reduced-motion="true"] .aura-pill-live-dot {
   animation: none;
 }
-/* Keep the SIGNAL, drop the MOTION: a held mid-cycle glow, so an unread pill
-   still reads as unread without breathing. Same shape as the poster-retry
-   dot's reduced-motion rule, which settles at a static opacity rather than
-   vanishing. */
-html[data-reduced-motion="true"] .aura-pill-alert {
-  box-shadow:
-    inset 0 1px 0 0 rgba(255, 255, 255, 0.14),
-    0 0 16px 1px rgb(var(--ln-accent-rgb) / 0.26),
-    0 8px 26px -14px rgba(0, 0, 0, 0.75);
-}
-html[data-aura-idle="true"] .aura-pill-alert,
-html[data-aura-idle="true"] .aura-pill-arrive,
 html[data-aura-idle="true"] .aura-pill-live-dot {
   animation-play-state: paused !important;
   will-change: auto !important;
@@ -2927,12 +4062,14 @@ html[data-aura-idle="true"] .aura-pill-live-dot {
     box-shadow 180ms ease,
     color 150ms ease;
 }
-.aura-nav-back:hover  { transform: translateX(-2px); border-color: rgba(255, 255, 255, 0.24); }
+/* Back: only the glyph slides (the button's "Back" label would be resampled
+   by a moving composited layer, see .aura-glass-press). */
+.aura-nav-back:hover  { --lg-border-c: rgba(255, 255, 255, 0.24); }
 .aura-nav-back:active { transform: translateX(-1px) scale(0.97); }
 .aura-nav-back:hover .aura-nav-back-glyph { transform: translateX(-2px); }
 .aura-nav-back-glyph  { transition: transform 180ms cubic-bezier(0.2, 0.8, 0.2, 1); }
 
-.aura-nav-close:hover  { transform: scale(1.06); border-color: rgba(255, 255, 255, 0.24); }
+.aura-nav-close:hover  { transform: scale(1.06); --lg-border-c: rgba(255, 255, 255, 0.24); }
 .aura-nav-close:active { transform: scale(0.94); }
 .aura-nav-close:hover .aura-nav-close-glyph { transform: rotate(90deg); }
 .aura-nav-close-glyph  { transition: transform 220ms cubic-bezier(0.34, 1.56, 0.64, 1); }
@@ -2966,22 +4103,16 @@ html[data-reduced-motion="true"] .aura-canon-fade {
 /* The player's top-left stack (src/playerStack.ts): the skip prompt,  */
 /* the Next-Up card under it, and the card's tail pill.                */
 /*                                                                    */
-/* One surface for all three so they read as a group. It is the skip  */
-/* prompt's own recipe, moved here from its utilities unchanged: near- */
-/* opaque black, so the prompt's large type stays legible over any     */
-/* frame, which is also why it is not .aura-float-glass.               */
+/* One surface for all three so they read as a group. Since round 11   */
+/* each one is `.aura-glass-player.aura-stack-surface`: the player's A */
+/* face at a denser 0.9 tint (styles/glass-player.css), so the old     */
+/* black 0.9 fill, white border, luminous ring and 40 px backdrop blur */
+/* (which sampled nothing over the video) are gone from here.          */
 /* Enter is the prompt's pop; exit is the short fade NextUpCta's       */
 /* StackPresence holds the card on screen for (EXIT_MS, 200 ms). The   */
 /* exit keyframe has no `from`, so a card faded with the controls      */
 /* leaves from where it is instead of flashing back in.                */
 /* ------------------------------------------------------------------ */
-.aura-stack-surface {
-  background: rgb(0 0 0 / 0.9);
-  border: 1px solid rgb(255 255 255 / 0.3);
-  -webkit-backdrop-filter: blur(40px);
-  backdrop-filter: blur(40px);
-  box-shadow: 0 0 0 1px var(--ln-rim-luminous), 0 16px 48px rgba(0, 0, 0, 0.8);
-}
 .aura-stack-enter { animation: aura-skip-toast-pop 220ms cubic-bezier(0.34, 1.56, 0.64, 1); }
 .aura-stack-exit  { animation: aura-stack-out 200ms cubic-bezier(0.4, 0, 1, 1) forwards; }
 @keyframes aura-stack-out {
@@ -3146,8 +4277,8 @@ html[data-reduced-motion="true"] .aura-cast-stage { animation: none; }
    when the text changes from "3 downloads" to "12 downloads" with no JS
    measurement. If grid-template-columns interpolation is ever unavailable
    the two end states are still right, so it snaps rather than breaking.
-   Curve is the app's `cinematic` bezier, shared with .aura-bell-panel-in
-   and .settings-section-enter. */
+   Curve is the app's `cinematic` bezier, shared with
+   .settings-section-enter. */
 .aura-dl-label {
   display: grid;
   grid-template-columns: 0fr;

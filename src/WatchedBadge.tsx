@@ -18,8 +18,8 @@ import { useLibraryProgress } from "./LibraryContext";
 //   1. Manual mark "watched"      → green check
 //   2. Library progress ≥ 90 %    → green check (movies + episode rows only —
 //                                     see series caveat below)
-//   3. Manual mark "in-progress"  → yellow dot
-//   4. Library progress > 0       → yellow dot (auto-in-progress)
+//   3. Manual mark "in-progress"  → amber half-filled ring
+//   4. Library progress > 0       → amber half-filled ring (auto-in-progress)
 //   5. otherwise                  → no badge
 //
 // SERIES CAVEAT: Stremio's library record for a series stores the LAST
@@ -41,7 +41,7 @@ import { useLibraryProgress } from "./LibraryContext";
 type Variant = "watched" | "skipped" | "in-progress" | "planned" | null;
 
 /** Inline visual badge. Caller decides where to position it (typically
- *  `absolute top-1.5 left-1.5` on the poster wrapper). Returns null
+ *  `absolute top-2 left-2` on the poster wrapper). Returns null
  *  when neither manual nor derived state warrants a badge.
  *
  *  Pass `mediaType` so the badge can apply the series-watched demotion
@@ -52,14 +52,76 @@ export default function WatchedBadge({
   metaId,
   mediaType,
   className,
+  material,
 }: {
   metaId: string;
   mediaType?: string;
   className?: string;
+  /** "frost": the Home cards' real-frost mark (round 9). Default: solid. */
+  material?: "solid" | "frost";
 }) {
   const variant = useWatchedVariant(metaId, mediaType);
   if (!variant) return null;
-  return <WatchedBadgeStatic variant={variant} className={className} />;
+  return <WatchedBadgeStatic variant={variant} className={className} material={material} />;
+}
+
+const VARIANT_LABEL: Record<NonNullable<Variant>, string> = {
+  watched: "Watched",
+  skipped: "Skipped",
+  planned: "Planned",
+  "in-progress": "In progress",
+};
+
+/** The state glyph, one set for both materials so every state draws at the
+ *  SAME size (round 12: the in-progress mark was a bare 8 px dot in a 22 px
+ *  disc on the art and a 14 px disc beside the CW title, while the other
+ *  three were glyphs in 22 px discs). In progress is a half-filled ring: a
+ *  glyph of the check's size that still reads "partly done" by shape, so the
+ *  four states read apart without colour. */
+function MarkGlyph({ variant, size }: { variant: NonNullable<Variant>; size: number }) {
+  if (variant === "in-progress") {
+    return (
+      <svg width={size} height={size} viewBox="0 0 24 24" aria-hidden>
+        <circle cx="12" cy="12" r="8.2" fill="none" stroke="currentColor" strokeWidth="2.6" />
+        <path d="M12 3.8A8.2 8.2 0 0 1 12 20.2Z" fill="currentColor" />
+      </svg>
+    );
+  }
+  // A hairline stroke in the fill colour thickens the thin check and the
+  // bookmark's edges by about half a pixel, so they hold up on bright art.
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="currentColor"
+         stroke="currentColor" strokeWidth={1} strokeLinejoin="round" aria-hidden>
+      <path d={
+        variant === "watched" ? "M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"
+          // Fast-forward glyph: "moved past this" rather than "completed it".
+          : variant === "skipped" ? "M4 18l8.5-6L4 6v12zm9-12v12l8.5-6L13 6z"
+            // Bookmark: planned (the Queue).
+            : "M17 3H7c-1.1 0-2 .9-2 2v16l7-3 7 3V5c0-1.1-.9-2-2-2z"
+      } />
+    </svg>
+  );
+}
+
+/** The frost mark on the art (round 9, the A direction's `.wb`; round 12
+ *  size): a 26 px frost disc (glass-cards.css `.aura-frost.aura-watch-mark`, a
+ *  rim-only light surface) holding the state's 15 px glyph in its colour, the
+ *  disc washed with that colour so the mark keeps the mass the old solid disc
+ *  had. Same glyphs and labels as the solid badge. Callers place it 8 px in
+ *  (`top-2 left-2`) on every poster and card. */
+function FrostMark({ variant, className }: { variant: NonNullable<Variant>; className?: string }) {
+  const label = VARIANT_LABEL[variant];
+  return (
+    <span
+      aria-label={label}
+      title={label}
+      data-glass-light="rim"
+      className={`aura-frost aura-watch-mark is-${variant} inline-flex items-center justify-center
+                  w-[26px] h-[26px] rounded-full ${className ?? ""}`}
+    >
+      <MarkGlyph variant={variant} size={15} />
+    </span>
+  );
 }
 
 /** Stateless variant — caller passes the variant in directly. Used by
@@ -68,80 +130,43 @@ export default function WatchedBadge({
 export function WatchedBadgeStatic({
   variant,
   className,
+  material,
 }: {
   variant: NonNullable<Variant>;
   className?: string;
+  material?: "solid" | "frost";
 }) {
-  if (variant === "watched") {
-    return (
-      <span
-        aria-label="Watched"
-        title="Watched"
-        className={`inline-flex items-center justify-center w-[22px] h-[22px] rounded-full
-                    bg-emerald-500/85 text-white
-                    border border-emerald-200/30 shadow-[0_2px_8px_rgba(0,0,0,0.45)]
-                    ${className ?? ""}`}
-      >
-        <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
-          <path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z" />
-        </svg>
-      </span>
-    );
-  }
-  if (variant === "skipped") {
-    // Purple, and a distinct glyph rather than a recoloured check: the three
-    // marks must read apart without relying on colour alone, which is also
-    // what the watched/planned pair already does.
-    return (
-      <span
-        aria-label="Skipped"
-        title="Skipped"
-        className={`inline-flex items-center justify-center w-[22px] h-[22px] rounded-full
-                    bg-purple-500/85 text-white
-                    border border-purple-200/30 shadow-[0_2px_8px_rgba(0,0,0,0.45)]
-                    ${className ?? ""}`}
-      >
-        {/* Fast-forward glyph: "moved past this" rather than "completed it". */}
-        <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
-          <path d="M4 18l8.5-6L4 6v12zm9-12v12l8.5-6L13 6z" />
-        </svg>
-      </span>
-    );
-  }
-  if (variant === "planned") {
-    // Bookmark glyph in Aura's signature blue. Distinct shape from
-    // the watched check + in-progress dot so the three states read
-    // at a glance without colour-only differentiation.
-    return (
-      <span
-        aria-label="Planned"
-        title="Planned"
-        className={`inline-flex items-center justify-center w-[22px] h-[22px] rounded-full
-                    bg-ln-accent/85 text-white
-                    border border-blue-200/30 shadow-[0_2px_8px_rgba(0,0,0,0.45)]
-                    ${className ?? ""}`}
-      >
-        <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
-          <path d="M17 3H7c-1.1 0-2 .9-2 2v16l7-3 7 3V5c0-1.1-.9-2-2-2z" />
-        </svg>
-      </span>
-    );
-  }
-  // in-progress. Explicit rather than a trailing fallthrough: this used to be
-  // the unguarded default, so ANY unhandled variant rendered an amber
-  // "In progress" dot with no error and no log.
-  if (variant !== "in-progress") return null;
+  // Explicit lookup rather than a trailing fallthrough: the in-progress dot
+  // used to be the unguarded default, so ANY unhandled variant rendered an
+  // amber "In progress" mark with no error and no log.
+  const fill = SOLID_FILL[variant];
+  if (!fill) return null;
+  if (material === "frost") return <FrostMark variant={variant} className={className} />;
+  // The solid disc (episode rows, the CW title suffix): every state one 22 px
+  // disc with a 13 px glyph (round 12; in progress was a 14 px bare dot). The
+  // glyphs read apart by shape, never by colour alone.
+  const label = VARIANT_LABEL[variant];
   return (
     <span
-      aria-label="In progress"
-      title="In progress"
-      className={`inline-flex items-center justify-center w-[14px] h-[14px] rounded-full
-                  bg-amber-400/85 border border-amber-200/40
-                  shadow-[0_2px_8px_rgba(0,0,0,0.45)]
-                  ${className ?? ""}`}
-    />
+      aria-label={label}
+      title={label}
+      className={`inline-flex items-center justify-center w-[22px] h-[22px] rounded-full
+                  ${fill} shadow-[0_2px_8px_rgba(0,0,0,0.45)] ${className ?? ""}`}
+    >
+      <MarkGlyph variant={variant} size={13} />
+    </span>
   );
 }
+
+/** The solid disc per state. Planned's glyph is in the accent INK (a custom
+ *  accent can be light: white on it vanished); in progress puts a dark glyph
+ *  on amber, which white does not clear. */
+const SOLID_FILL: Record<NonNullable<Variant>, string> = {
+  watched: "bg-emerald-500/85 text-white border border-emerald-200/30",
+  skipped: "bg-purple-500/85 text-white border border-purple-200/30",
+  planned: "bg-ln-accent/85 text-ln-accent-ink border border-white/25",
+  "in-progress": "bg-amber-400/90 text-[rgb(28_20_4)] border border-amber-200/40",
+};
 
 /** Resolve the variant for `metaId` — combines manual marks with
  *  library-derived progress. Subscribes to manualWatched changes so

@@ -33,8 +33,9 @@ interface UseCastSessionArgs {
   streamUrl: string | null;
   /** Display title for the receiver ("Frieren — S01E05"). */
   title: string | null;
-  /** Live local playback clock (seconds). */
-  currentTime: number;
+  /** Reads the live local playback clock (seconds). Read when a cast starts,
+   *  never rendered, so the caller does not re-render per tick for it. */
+  getCurrentTime: () => number;
   /** Local MPV pause state — drives the pause-on-cast handoff. */
   paused: boolean;
 }
@@ -69,7 +70,7 @@ function clock(sec: number): string {
 }
 
 export function useCastSession({
-  streamUrl, title, currentTime, paused,
+  streamUrl, title, getCurrentTime, paused,
 }: UseCastSessionArgs): CastSession {
   const [menuOpen, setMenuOpen] = useState(false);
   const [devices, setDevices] = useState<CastDeviceInfo[]>([]);
@@ -82,8 +83,8 @@ export function useCastSession({
 
   // Refs so event handlers / intervals read live values without
   // re-subscribing on every clock tick.
-  const timeRef = useRef(currentTime);
-  timeRef.current = currentTime;
+  const getTimeRef = useRef(getCurrentTime);
+  getTimeRef.current = getCurrentTime;
   const pausedRef = useRef(paused);
   pausedRef.current = paused;
   const urlRef = useRef(streamUrl);
@@ -145,7 +146,8 @@ export function useCastSession({
     // second or two, and a user toggling local playback meanwhile must
     // not make the post-load handoff re-toggle the wrong way.
     const pausedAtPick = pausedRef.current;
-    const startSeconds = timeRef.current > 1 ? timeRef.current : 0;
+    const now = getTimeRef.current();
+    const startSeconds = now > 1 ? now : 0;
     setConnectingId(device.id);
     setConnectingStage("connecting");
     setError(null);

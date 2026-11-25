@@ -318,7 +318,7 @@ export function leaveRoom(): void {
 function connect(code: string, intent: "join" | "create", isReconnect = false): boolean {
   const base = getRelayUrl();
   if (!base) {
-    setError("Set a relay URL in Settings → Watch Together first.");
+    setError("Set a relay URL in the Watch Party panel first.");
     return false;
   }
   teardown();
@@ -397,7 +397,7 @@ function connect(code: string, intent: "join" | "create", isReconnect = false): 
       reconnectTimer = setTimeout(() => connect(ui.roomCode as string, reIntent, true), 1500 * reconnectAttempts);
     } else {
       ui.status = "error";
-      ui.error = ui.error ?? "Lost the watch-together connection.";
+      ui.error = ui.error ?? "Lost the watch party connection.";
       emit();
     }
   };

@@ -217,10 +217,18 @@ export default function ImageLoader({
           : { position: "relative" as const }),
       }}
     >
-      {/* Skeleton — visible until the image fires onLoad */}
+      {/* Skeleton: visible until the image fires onLoad. Its shimmer is
+          held still (data-skeleton-parked, App.css) until the observer above
+          says the tile is in view: a tile further down never enters view
+          until it is scrolled to (the page scroller clips it, so the
+          rootMargin does not reach it), and every row below the fold
+          shimmered forever, repainting and re-rastering on every frame of an
+          otherwise idle Home (measured round 11: about 3 ms of GPU-process
+          time per frame with two rows parked below the fold). */}
       {!loaded && !errored && (
         <span
           aria-hidden
+          data-skeleton-parked={inView ? undefined : ""}
           className={`absolute inset-0 ${skeletonClassName ?? "image-loader-skeleton"}`}
         />
       )}

@@ -24,7 +24,7 @@ fn http() -> &'static reqwest::Client {
     HTTP.get_or_init(|| {
         reqwest::Client::builder()
             .timeout(Duration::from_secs(6))
-            .user_agent("Aura/1.0 UPnP/1.0")
+            .user_agent(concat!("Aura/", env!("CARGO_PKG_VERSION"), " UPnP/1.0"))
             // Device descriptions + control URLs are plain-HTTP LAN
             // endpoints (TVs don't carry public certs) — the crate-wide
             // https_only posture doesn't apply to this client.

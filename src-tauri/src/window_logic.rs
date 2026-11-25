@@ -375,9 +375,8 @@ pub fn party_keep_alive() -> bool {
 /// `set_party_keep_alive`'s `in_room`.
 static PARTY_IN_ROOM: AtomicBool = AtomicBool::new(false);
 
-/// A file is loaded in mpv: set by `load_video` and the debug panel's
-/// `debug_load_test_pattern`, cleared by `stop_video`, the debug panel's
-/// `debug_stop_playback` and the page-reload teardown. Errs toward true (a
+/// A file is loaded in mpv: set by `load_video`, cleared by `stop_video` and
+/// the page-reload teardown. Errs toward true (a
 /// failed load leaves it set until the player is exited), which only ever
 /// means "do not park".
 static MEDIA_LOADED: AtomicBool = AtomicBool::new(false);
@@ -587,7 +586,7 @@ impl Drop for EvTimer {
 // Deliberately routed back through CloseRequested rather than calling
 // `app.exit(0)` directly. That path owns the whole shutdown discipline -
 // synchronous MPV teardown so WASAPI is released (landmine #9), the scrobble
-// flush that stops Trakt sitting on "Currently watching", cast teardown, and
+// flush that records a finished episode on AniList / Simkl, cast teardown, and
 // the window-state save. `app.exit(0)` skips every one of them.
 static FORCE_QUIT: AtomicBool = AtomicBool::new(false);
 
@@ -657,7 +656,9 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) {
         // how much of that is ours. See win_probe.rs.
         #[cfg(all(target_os = "windows", debug_assertions))]
         let _ev_timer = EvTimer::new(event);
-        let cfg = settings::snapshot();
+        // No settings snapshot here: this runs inside the main wndproc for
+        // EVERY window event (Moved / Resized storms during a drag), and only
+        // CloseRequested reads a setting, so it clones the settings there.
         match event {
             // Focus REGAIN backstop. After an alt-tab cycle (especially
             // following an enter/exit fullscreen sequence) libmpv's vo
@@ -810,7 +811,7 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) {
             WindowEvent::CloseRequested { api, .. } => {
                 // A bulk History scrobble is mid-flight and this close would END THE
                 // PROCESS. Tearing down now would abandon the run partway, leaving
-                // Trakt/AniList half-updated with nothing to say where it stopped —
+                // AniList/Simkl half-updated with nothing to say where it stopped,
                 // so hand the decision to the user rather than guessing. The
                 // frontend answers by finishing the run, cancelling it, or
                 // dismissing; each path clears the flag and re-issues the close, and
@@ -830,6 +831,7 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) {
                 // this one close. Everything below branches on THIS, not on the
                 // setting, so the force-quit path gets the identical shutdown
                 // discipline an ordinary close gets.
+                let cfg = settings::snapshot();
                 let exiting =
                     FORCE_QUIT.load(Ordering::SeqCst) || !cfg.minimize_to_tray_on_close;
 
@@ -934,15 +936,15 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) {
                     // park it later (repark_if_tray_hidden).
                     TRAY_HIDDEN.store(true, Ordering::Release);
                     park_main_webview(&handle);
-                    // Window is now hidden to the tray — surface the tray icon,
-                    // which is its only route back. Hidden again on restore
+                    // Window is now hidden to the tray: create the tray icon,
+                    // which is its only route back. Removed again on restore
                     // (tray::show_main_window).
                     crate::tray::set_tray_visible(&handle, true);
                 } else {
                     // Clean-shutdown path — tear down MPV synchronously so
                     // libmpv releases its WASAPI device, then EXPLICITLY exit
-                    // the process. The tray icon (always installed) would
-                    // otherwise keep the app alive in a zombie state where the
+                    // the process. A tray icon (present while hidden to the
+                    // tray) would otherwise keep the app alive in a zombie state where the
                     // window has closed AND MPV has been destroyed — every
                     // subsequent load_video would error "instance not found".
                     //
@@ -957,10 +959,10 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) {
                     // Windows self-update file-lock window (the NSIS updater
                     // can't overwrite aura.exe until this process is gone).
                     //
-                    // FLUSH SCROBBLE so Trakt / AniList see a clean stop on a
-                    // hard window-close (the JS useScrobble cleanup never runs
-                    // when the process exits via app.exit, which left Trakt
-                    // stuck "Currently watching" for hours). Capped 2 s.
+                    // FLUSH SCROBBLE so AniList / Simkl still record a finished
+                    // episode on a hard window-close (the JS useScrobble
+                    // cleanup never runs when the process exits via app.exit).
+                    // Capped 2 s.
                     let sc = handle.clone();
                     #[allow(unused_mut)]
                     let mut bg = vec![

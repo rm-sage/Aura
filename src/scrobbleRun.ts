@@ -76,25 +76,24 @@ export interface ScrobbleWorkItem {
    *  save") -- each still costing a GraphQL round trip against a ~90/min limit.
    *  Sending only the highest episode of the season sets exactly the same final
    *  state, backdates `completedAt` to the same play, and collapses the whole
-   *  season into one call. Trakt is NOT collapsed: it records each play
-   *  separately, keyed on watched_at, so every row there is a real write. */
+   *  season into one call. Simkl is NOT collapsed: it records each play
+   *  separately, so every row there is a real write. */
   covers?: Array<{ id: string; playedAt: string }>;
 }
 
-/** Base spacing between per-row pushes. Trakt's budget is roughly 1000 calls / 5 min.
+/** Base spacing between per-row pushes.
  *
- *  AniList's is far tighter (~90/min) AND one "push" there is not one call: the
+ *  AniList's budget is tight (~90/min) AND one "push" there is not one call: the
  *  resolve query, then the save mutation, and on a cold cache a search + a SEQUEL
  *  walk on top. Pacing at AniList's nominal one-per-670ms therefore still
- *  overruns it by 2x or worse, which is how a long run rate-limited itself even
- *  after the Trakt refresh storm was fixed. 1200 ms leaves real headroom, and
+ *  overruns it by 2x or worse, which is how a long run rate-limited itself.
+ *  1200 ms leaves real headroom, and
  *  since the AniList side is now collapsed to one push per season (see
  *  ScrobbleWorkItem.covers) there are far fewer of them to pace anyway.
  *
  *  These are the FLOOR: `throttle` only ever widens them. Simkl has no entry
  *  because it is not paced here: its one batched call is paced in Rust. */
 const BASE_DELAY_MS: Record<RowHistoryService, number> = {
-  trakt: 350,
   anilist: 1200,
 };
 
@@ -143,8 +142,8 @@ export function cancelScrobbleRun(): void {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-/** Rust's marker for a verdict about the ITEM that no retry can change (Trakt has
- *  no catalog entry for it, no IMDb id, AniList cannot resolve it). Kept as an
+/** Rust's marker for a verdict about the ITEM that no retry can change (AniList
+ *  cannot resolve it, or has no entry for it). Kept as an
  *  explicit sentinel rather than pattern-matching English error prose, which would
  *  break silently the moment a message was reworded. Mirrors
  *  `scrobble::PERMANENT_PREFIX`. */
@@ -180,9 +179,8 @@ function isRateLimit(message: string): boolean {
  * is the hard guarantee that two jobs can never overlap.
  *
  * Duplicate protection is unchanged and lives BELOW this layer: these are the
- * same commands the single-row buttons call, and Trakt (idempotent on
- * `watched_at`), AniList (`AlreadyAhead`) and Simkl (a re-sent row is a no-op)
- * are the real gates.
+ * same commands the single-row buttons call, and AniList (`AlreadyAhead`) and
+ * Simkl (a re-sent row is a no-op) are the real gates.
  */
 export async function startScrobbleRun(
   scope: string,
@@ -254,9 +252,6 @@ export async function startScrobbleRun(
               // Without it, split-cour anime resolve to the wrong entry.
               anilistId:      entry.anilist_id ?? null,
               anilistEpisode: entry.anilist_episode ?? null,
-              // Trakt's title + air-date fallback; the other commands ignore them.
-              episodeTitle:    entry.episode_title ?? null,
-              episodeReleased: entry.episode_released ?? null,
             },
           );
           // Only a resolved command marks the row; a failure stays un-marked and
@@ -357,7 +352,7 @@ export async function startScrobbleRun(
 
 // A run is bound to the account scope it was started with. If the user signs out
 // or switches accounts mid-run, every remaining push would go to the WRONG
-// account's Trakt/AniList (the scope is captured in the work loop, and the tokens
+// account's AniList / Simkl (the scope is captured in the work loop, and the tokens
 // it names may no longer be the active ones). Stop rather than mis-file someone
 // else's watch history.
 if (typeof window !== "undefined") {

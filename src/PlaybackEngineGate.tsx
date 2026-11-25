@@ -14,7 +14,7 @@
 // (no Windows libmpv to fetch). See runtimeDeps.ts + src-tauri/src/lib.rs.
 // ---------------------------------------------------------------------------
 
-import { useEffect, useState } from "react";
+import { memo, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { ensureRuntimeDep, type RuntimeDepProgress } from "./runtimeDeps";
 
@@ -22,7 +22,7 @@ type Phase = "checking" | "downloading" | "starting" | "ready" | "error";
 
 const mb = (bytes: number) => `${(bytes / (1024 * 1024)).toFixed(0)} MB`;
 
-export default function PlaybackEngineGate() {
+function PlaybackEngineGate() {
   const [phase, setPhase] = useState<Phase>("checking");
   const [progress, setProgress] = useState<RuntimeDepProgress | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -68,8 +68,12 @@ export default function PlaybackEngineGate() {
       : null;
 
   return (
-    <div className="fixed inset-0 z-[10600] flex items-center justify-center bg-black/85 backdrop-blur-md animate-[fade-in_140ms_ease-out]">
-      <div className="aura-glass-menu rounded-2xl max-w-[440px] w-[92%] p-7 text-white text-center">
+    <div className="fixed inset-0 z-[10600] flex items-center justify-center">
+      {/* The dim + blur is a SIBLING layer, not the wrapper: a backdrop-filter
+          (or a fading opacity) on an ancestor would blind the card's own glass. */}
+      <div aria-hidden className="aura-modal-backdrop-in absolute inset-0 bg-black/85 backdrop-blur-md" />
+      <div className="aura-float-glass aura-glass-pop-in relative rounded-2xl max-w-[440px] w-[92%] p-7 text-white text-center"
+        style={{ "--lg-origin": "50% 50%" } as React.CSSProperties}>
         <h2 className="text-[17px] font-semibold tracking-tight mb-2">Setting up Aura</h2>
         <p className="text-white/70 text-[13px] leading-relaxed mb-5">
           {phase === "error"
@@ -111,14 +115,14 @@ export default function PlaybackEngineGate() {
               <button
                 type="button"
                 onClick={() => void setup()}
-                className="px-5 py-2 rounded-lg text-[13px] font-medium tracking-wide text-ln-accent bg-ln-accent/15 border border-ln-accent/35 hover:bg-ln-accent/25 hover:border-ln-accent/55 transition-colors"
+                className="aura-glass-flat is-primary px-5 py-2 rounded-lg text-[13px] font-medium tracking-wide"
               >
                 Retry
               </button>
               <button
                 type="button"
                 onClick={() => setHidden(true)}
-                className="px-5 py-2 rounded-lg text-[13px] font-medium tracking-wide text-white/85 bg-white/[0.06] border border-white/10 hover:bg-white/[0.10] hover:text-white transition-colors"
+                className="aura-glass-flat px-5 py-2 rounded-lg text-[13px] font-medium tracking-wide text-white/85 hover:text-white"
               >
                 Continue browsing
               </button>
@@ -129,3 +133,6 @@ export default function PlaybackEngineGate() {
     </div>
   );
 }
+
+// Memoized: App renders it on every playback tick, and its props rarely change.
+export default memo(PlaybackEngineGate);

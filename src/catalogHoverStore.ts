@@ -274,6 +274,12 @@ export function refreshHoverAnchor(): void {
       closeHoverNow();
       return;
     }
+    // A scroll that did not move the card (the listener is capture-phase on
+    // the window, so ANY scroller fires it) changes nothing: re-emitting a
+    // new target object re-rendered the panel and re-armed every host effect
+    // keyed on the target, the anchor watchdog's interval included.
+    const a = cur.rect;
+    if (r.left === a.left && r.top === a.top && r.width === a.width && r.height === a.height) return;
     active = { ...cur, rect: r };
     emit();
   });

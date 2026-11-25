@@ -5,7 +5,7 @@
 // partyAnchor — shared positioning helper for the Watch-Together surfaces that
 // spawn FROM the party affordance: the PartyToast stack and the
 // WatchTogetherPanel. Both anchor to whichever party button is currently on
-// screen — the home/browse PartyButton (top-left) or the in-player presence
+// screen: the rail's Watch Party row (left) or the in-player presence
 // cluster (top-right). Both carry `data-party-anchor`; exactly one is laid out
 // at a time (the other goes display:none under the playback `hidden` class).
 //
@@ -13,6 +13,8 @@
 // on where "the party" lives, so the panel grows out of the same icon the
 // toasts emerge from.
 // ---------------------------------------------------------------------------
+
+import { RAIL_SELECTOR, railAnchorFor } from "./railLayout";
 
 export type PartyAnchor =
   | { side: "left"; top: number; left: number }
@@ -34,15 +36,27 @@ export function anchorFromRect(r: DOMRect): PartyAnchor {
   return { side: "right", top, right: Math.round(window.innerWidth - r.right) };
 }
 
+/** Like `anchorFromRect`, but a trigger that is a ROW of the left rail opens
+ *  BESIDE the rail (level with the row's top), not under the row: hanging
+ *  below it would cover the rail's own nav. Used by the party surfaces and the
+ *  User Panel popover. */
+export function anchorFromElement(el: Element): PartyAnchor {
+  if (el.closest(RAIL_SELECTOR)) {
+    const a = railAnchorFor(el);
+    return { side: "left", top: a.top, left: a.left };
+  }
+  return anchorFromRect(el.getBoundingClientRect());
+}
+
 /** Locate the visible party affordance and derive where + which way to spawn.
- *  Multiple `[data-party-anchor]` nodes can exist (the PartyButton stays in the
- *  DOM but goes display:none during playback) — pick the first with a real box;
- *  fall back to the top-right corner if none is laid out yet. */
+ *  Multiple `[data-party-anchor]` nodes can exist (the rail's Watch Party row
+ *  stays in the DOM but goes display:none during playback) - pick the first
+ *  with a real box; fall back to the top-right corner if none is laid out yet. */
 export function readPartyAnchor(): PartyAnchor {
   const els = Array.from(document.querySelectorAll<HTMLElement>("[data-party-anchor]"));
   for (const el of els) {
     const r = el.getBoundingClientRect();
-    if (r.width > 0 && r.height > 0) return anchorFromRect(r);
+    if (r.width > 0 && r.height > 0) return anchorFromElement(el);
   }
   return { side: "right", top: 70, right: 16 };
 }

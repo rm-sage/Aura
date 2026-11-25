@@ -61,9 +61,10 @@ import {
   type HistoryLayout, type IndexedEntry, type LayoutMetrics,
 } from "../historyIndex";
 import HistoryDateJump from "../HistoryDateJump";
+import { sheet } from "../glassSheet";
 
 // Which scrobble services are connected for the active account. Drives
-// whether each History row offers the "Scrobble to Trakt / AniList"
+// whether each History row offers the "Scrobble to AniList / Simkl"
 // actions. We never render an action for a service the user hasn't
 // linked. Sourced from the same `get_scrobble_auth_status` command the
 // Settings + notification surfaces use, so there is one source of truth
@@ -71,7 +72,7 @@ import HistoryDateJump from "../HistoryDateJump";
 type ScrobbleConnState = Pick<ScrobbleConn, "scope" | ScrobbleService>;
 
 // ---------------------------------------------------------------------------
-// HistoryView — Trakt-style detailed feed of completions.
+// HistoryView: detailed feed of completions.
 //
 // Source: historyStore (a Rust-owned file per scope, hydrated at startup), written from two places:
 // exit-playback when the user actually watched (>= 80 % of duration AND
@@ -84,10 +85,10 @@ type ScrobbleConnState = Pick<ScrobbleConn, "scope" | ScrobbleService>;
 // a running total runtime per day in the header and one row per entry.
 //
 // SCROBBLING: three ways in, all funnelling through the SAME Tauri commands
-// (`scrobble_history_trakt` / `scrobble_history_anilist` per row,
+// (`scrobble_history_anilist` per row,
 // `scrobble_history_simkl` as one batch) so every path inherits their gates
 // identically:
-//   1. per-row Trakt / AniList / Simkl buttons (hover),
+//   1. per-row AniList / Simkl buttons (hover),
 //   2. a multi-selection (per-row checkbox, or a whole day via the day header),
 //   3. "Scrobble All" over the entire history.
 // See `runScrobble` for how duplicates are prevented.
@@ -146,13 +147,11 @@ const MONTH_FMT = new Intl.DateTimeFormat(undefined, { month: "long", year: "num
  *  uses — we do not invent a new signal here. The series root id is used when
  *  present so an episode id resolves against the show.
  *
- *  Simkl takes movies, series and anime alike, so it supplements both: an
- *  anime row is offered to AniList AND Simkl, a movie or series row to Trakt
- *  AND Simkl. Its gate is only "is there an id Simkl can key on", the same
+ *  Simkl takes movies, series and anime alike: an anime row is offered to
+ *  AniList AND Simkl, a movie or series row to Simkl. Its gate is only "is there an id Simkl can key on", the same
  *  test its Rust command applies (see scrobbleSimkl.ts). */
 function servicesFor(entry: HistoryEntry, conn: ScrobbleConnState): ScrobbleService[] {
   const out: ScrobbleService[] = [];
-  if (conn.trakt) out.push("trakt");
   const isAnime = isAnimeMeta({
     media_type: entry.media_type,
     id: entry.parent_id ?? entry.id,
@@ -227,10 +226,9 @@ function HistoryViewBody({ onSelectMeta }: Props) {
   const sharedConn = useScrobbleConnections();
   const conn = useMemo<ScrobbleConnState>(() => ({
     scope: sharedConn.scope,
-    trakt: sharedConn.trakt,
     anilist: sharedConn.anilist,
     simkl: sharedConn.simkl,
-  }), [sharedConn.scope, sharedConn.trakt, sharedConn.anilist, sharedConn.simkl]);
+  }), [sharedConn.scope, sharedConn.anilist, sharedConn.simkl]);
 
   // Drop selections whose entries no longer exist (removed here or by a sync).
   useEffect(() => {
@@ -367,9 +365,7 @@ function HistoryViewBody({ onSelectMeta }: Props) {
   //      it is sent again only when the user says so in a prompt that says it
   //      is one (repeatPrompt), otherwise skipped without a call.
   //   2. The commands themselves are the real gate, and are the SAME ones the
-  //      per-row buttons use: Trakt's /sync/history is idempotent on the
-  //      `watched_at` we send (the entry's exact played_at), and AniList's
-  //      save_progress no-ops with AlreadyAhead when it is already past this
+  //      per-row buttons use: AniList's save_progress no-ops with AlreadyAhead when it is already past this
   //      episode. Simkl answers a re-sent row with a no-op. So even a
   //      stale/absent local record cannot produce a dupe.
   //   3. AniList is only ever offered for anime, and each service only when the
@@ -388,18 +384,18 @@ function HistoryViewBody({ onSelectMeta }: Props) {
       if (!anyService) {
         // Simkl is named only in a build that can sign in to it.
         const names = knownScrobbleServicesAvailable()?.has("simkl")
-          ? "Trakt, AniList or Simkl"
-          : "Trakt or AniList";
+          ? "AniList or Simkl"
+          : "AniList";
         showAppToast(`Connect ${names} in Settings > Scrobbling first.`, { tone: "danger" });
         return;
       }
 
       // Everything eligible and not already done, split by service. Keyed by
-      // service rather than `trakt ? ... : anilist`, so a new service is a
+      // service rather than `anilist ? ... : simkl`, so a new service is a
       // compile error here instead of silently landing in AniList's
       // per-entry collapse below.
       const pendingBy: Record<ScrobbleService, HistoryEntry[]> = {
-        trakt: [], anilist: [], simkl: [],
+        anilist: [], simkl: [],
       };
       const items = new Set<string>();
       // Already-scrobbled pushes, held back until the user decides on them.
@@ -409,7 +405,7 @@ function HistoryViewBody({ onSelectMeta }: Props) {
         for (const service of servicesFor(entry, conn)) {
           if (only && service !== only) continue;
           // The service has already told us, definitively, that it cannot take this
-          // item (Trakt has no catalog entry for it; AniList cannot resolve it).
+          // item (AniList cannot resolve it; Simkl has no catalog match for it).
           // Sending it again would fail identically and re-report the same error.
           // Checked before the repeat test, as the row's pill is: a retired id is
           // never offered as a repeat.
@@ -456,11 +452,6 @@ function HistoryViewBody({ onSelectMeta }: Props) {
         }
       }
 
-      // Trakt records each play separately, keyed on watched_at, so every row
-      // is its own push.
-      const traktWork: ScrobbleWorkItem[] = pendingBy.trakt.map(
-        (entry) => ({ entry, service: "trakt" }),
-      );
       const anilistPending = pendingBy.anilist;
 
       // COLLAPSE THE ANILIST SIDE, only where "same entry" is PROVABLE. AniList
@@ -504,17 +495,16 @@ function HistoryViewBody({ onSelectMeta }: Props) {
 
       const anilistCollapsed = anilistPending.length - anilistWork.length;
 
-      // Simkl logs each play separately like Trakt, so nothing collapses, but
+      // Simkl logs each play separately, so nothing collapses, but
       // the runner sends all of these in ONE batched call after the per-row
       // pushes (see scrobbleRun.ts) rather than one call each.
       const simklWork: ScrobbleWorkItem[] = pendingBy.simkl.map(
         (entry) => ({ entry, service: "simkl" }),
       );
-      const work: ScrobbleWorkItem[] = [...traktWork, ...anilistWork, ...simklWork];
+      const work: ScrobbleWorkItem[] = [...anilistWork, ...simklWork];
 
       if (work.length === 0) {
         const onlyWhy: Record<ScrobbleService, string> = {
-          trakt: "Trakt needs an IMDb id",
           anilist: "AniList only takes anime",
           simkl: "Simkl needs an IMDb, TMDB, TVDB or anime id, plus an episode number on an episode",
         };
@@ -523,7 +513,7 @@ function HistoryViewBody({ onSelectMeta }: Props) {
             ? `Nothing to do: all ${alreadyDone} eligible push${alreadyDone === 1 ? "" : "es"} in ${what}${only ? ` for ${SCROBBLE_LABELS[only]}` : ""} are already scrobbled.`
             : only
               ? `Nothing in ${what} can go to ${SCROBBLE_LABELS[only]} (${onlyWhy[only]}).`
-              : `Nothing in ${what} is eligible (AniList only takes anime; Trakt needs an IMDb id${
+              : `Nothing in ${what} is eligible (AniList only takes anime${
                 conn.simkl ? "; Simkl needs an IMDb, TMDB, TVDB or anime id, plus an episode number on an episode" : ""
               }).`;
         showAppToast(
@@ -534,13 +524,12 @@ function HistoryViewBody({ onSelectMeta }: Props) {
         return;
       }
 
-      // ITEMS vs PUSHES. One item can produce up to THREE pushes: every eligible
-      // row goes to Trakt and Simkl, and the anime subset ALSO goes to AniList.
-      // So "118 items" and "217 pushes" are both true of the same run, and the
+      // ITEMS vs PUSHES. One item can produce up to TWO pushes: every eligible
+      // row goes to Simkl, and the anime subset ALSO goes to AniList.
+      // So "118 items" and "170 pushes" are both true of the same run, and the
       // dialog has to say so outright -- quoting only the push count next to a
       // header that counts items reads like a bug.
       const legs: string[] = [];
-      if (traktWork.length > 0) legs.push(`${traktWork.length} to Trakt`);
       if (anilistWork.length > 0) legs.push(`${anilistWork.length} to AniList`);
       if (simklWork.length > 0) legs.push(`${simklWork.length} to Simkl (sent as one batch)`);
       const n = items.size;
@@ -724,8 +713,8 @@ function HistoryViewBody({ onSelectMeta }: Props) {
                 <MediaTypePills value={kind} onChange={setKind} counts={typeCounts} />
                 {titleFilter && (
                   <span
-                    className="inline-flex items-center gap-1.5 max-w-[280px] pl-3 pr-1 py-1 rounded-full
-                               text-xs font-medium bg-ln-accent/15 text-ln-accent border border-ln-accent/35"
+                    className="aura-glass-flat is-primary inline-flex items-center gap-1.5 max-w-[280px] pl-3 pr-1 py-1 rounded-full
+                               text-xs font-medium"
                   >
                     <span
                       className="truncate"
@@ -740,7 +729,7 @@ function HistoryViewBody({ onSelectMeta }: Props) {
                       title="Show every title again"
                       onClick={() => setTitleFilter(null)}
                       className="w-5 h-5 shrink-0 rounded-full grid place-items-center
-                                 hover:bg-ln-accent/25 hover:text-white transition-colors"
+                                 hover:bg-white/10 hover:text-white transition-colors"
                     >
                       <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor"
                            strokeWidth="3" strokeLinecap="round" aria-hidden>
@@ -761,11 +750,11 @@ function HistoryViewBody({ onSelectMeta }: Props) {
                     aria-label={`Jump to a date${topDay ? `, now showing ${monthLabel(topDay)}` : ""}`}
                     disabled={layout.dayKeys.length === 0}
                     onClick={() => setJumpOpen((o) => !o)}
-                    className={`inline-flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-medium
-                                border transition-colors disabled:opacity-40
-                                ${jumpOpen
-                                  ? "bg-ln-accent/20 text-ln-accent border-ln-accent/35"
-                                  : "bg-white/5 text-white/70 border-white/10 hover:text-white hover:bg-white/8"}`}
+                    // Glass flat control; open = is-selected (glass-misc.css:
+                    // accent wash in Frosted, raised face in Liquid).
+                    className={`aura-glass-flat inline-flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-medium
+                                disabled:opacity-40
+                                ${jumpOpen ? "is-selected" : "text-white/70 hover:text-white"}`}
                   >
                     <CalendarIcon />
                     {/* Doubles as a "where am I" readout while scrolling a
@@ -793,7 +782,7 @@ function HistoryViewBody({ onSelectMeta }: Props) {
           </HistoryHeader>
 
           {total === 0 && !loaded ? (
-            <div className="glass-panel rounded-2xl px-6 py-10 text-center" aria-busy="true">
+            <div {...sheet("rounded-[20px] px-6 py-10 text-center")} aria-busy="true">
               <p className="text-white/45 text-sm">
                 {loadError
                   ? "Aura can't read your history file right now (another program may have it open). Retrying..."
@@ -801,7 +790,7 @@ function HistoryViewBody({ onSelectMeta }: Props) {
               </p>
             </div>
           ) : total === 0 ? (
-            <div className="glass-panel rounded-2xl px-6 py-10 text-center">
+            <div {...sheet("rounded-[20px] px-6 py-10 text-center")}>
               <p className="text-white/55 text-sm">
                 Watch something to start a history. Plays you finish and
                 episodes you skip appear here; marking something watched by
@@ -809,7 +798,7 @@ function HistoryViewBody({ onSelectMeta }: Props) {
               </p>
             </div>
           ) : shown.length === 0 ? (
-            <div className="glass-panel rounded-2xl px-6 py-10 text-center space-y-3">
+            <div {...sheet("rounded-[20px] px-6 py-10 text-center space-y-3")}>
               <p className="text-white/55 text-sm">
                 {deferredQuery.trim()
                   ? <>No plays match <span className="text-white/80">&ldquo;{deferredQuery.trim()}&rdquo;</span>{titleInfo ? <> in {titleInfo.name}</> : null}{kind !== "all" ? " for this type" : ""}.</>
@@ -818,7 +807,7 @@ function HistoryViewBody({ onSelectMeta }: Props) {
               <button
                 type="button"
                 onClick={clearFilters}
-                className={`${PILL} bg-white/5 text-white/75 border-white/15 hover:bg-white/10 hover:text-white`}
+                className={`${PILL} text-white/75 hover:text-white`}
               >
                 Clear filters
               </button>
@@ -1203,13 +1192,15 @@ const VirtualHistoryList = memo(function VirtualHistoryList({
 // ---------------------------------------------------------------------------
 
 /** Shared pill geometry, so both states sit at exactly the same height and the
- *  swap never shifts the page. */
-const PILL = "px-3.5 py-1.5 rounded-full text-xs font-medium border transition-colors "
+ *  swap never shifts the page. A glass flat control (App.css GLASS SYSTEM): the
+ *  material draws its fill and border, so no bg / border utilities on a pill;
+ *  `aura-danger-hover` (glass-misc.css) is the destructive hover. */
+const PILL = "aura-glass-flat px-3.5 py-1.5 rounded-full text-xs font-medium "
   + "disabled:opacity-40 disabled:cursor-default";
 
 /**
  * A scrobble pill with a menu half. The main half runs every connected
- * service; the arrow opens "<label> to Trakt / AniList / Simkl", one row per
+ * service; the arrow opens "<label> to AniList / Simkl", one row per
  * connected service. With a single service connected the two would be the
  * same action, so the arrow is left off and it is a plain pill.
  */
@@ -1223,10 +1214,10 @@ function ScrobbleSplitButton({
   strong?: boolean;
   onRun: (only?: ScrobbleService) => void;
 }) {
-  const tone = strong
-    ? "bg-ln-accent/20 text-ln-accent border-ln-accent/45 hover:bg-ln-accent/30 hover:text-white"
-    : "bg-ln-accent/15 text-ln-accent border-ln-accent/35 hover:bg-ln-accent/25 hover:text-white";
-  const base = "py-1.5 text-xs font-medium border transition-colors "
+  // An accent glass flat control (is-primary); `strong` (selection mode) is
+  // aura-primary-strong in glass-misc.css.
+  const tone = strong ? "is-primary aura-primary-strong" : "is-primary";
+  const base = "aura-glass-flat py-1.5 text-xs font-medium "
     + "disabled:opacity-40 disabled:cursor-default";
   if (services.length < 2) {
     return (
@@ -1258,7 +1249,7 @@ function ScrobbleSplitButton({
               onClick: () => onRun(service),
             })));
           }}
-          className={`${base} ${tone} pl-2 pr-2.5 rounded-r-full border-l-0 h-full grid place-items-center`}
+          className={`${base} ${tone} aura-split-r pl-2 pr-2.5 rounded-r-full h-full grid place-items-center`}
         >
           <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor"
                strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
@@ -1387,13 +1378,15 @@ function HistoryHeader({
           opacity-only, so the fade runs on the compositor. */}
       <div
         aria-hidden
+        // data-liquid="off": a page-wide bar over a list that scrolls under it
+        // every frame takes the Liquid material with a plain blur, no bend.
+        data-liquid="off"
         className={`pointer-events-none absolute inset-0 rounded-2xl aura-float-glass
                     transition-opacity duration-200 ${stuck || selecting ? "opacity-100" : "opacity-0"}`}
       />
       <div
         aria-hidden
-        className={`pointer-events-none absolute inset-0 rounded-2xl
-                    border border-ln-accent/45 bg-ln-accent/10
+        className={`aura-history-select-wash pointer-events-none absolute inset-0 rounded-2xl
                     transition-opacity duration-200 ${selecting ? "opacity-100" : "opacity-0"}`}
       />
       {/* Always mounted, outside the keyed row. A live region inserted with
@@ -1441,12 +1434,12 @@ function HistoryHeader({
                   tabIndex={-1}
                   className="text-3xl font-semibold tracking-tight text-white outline-none"
                 >
-                  <span className="text-ln-accent tabular-nums">{selectedCount}</span> selected
+                  <span className="text-[color:var(--ln-accent-mark-text)] tabular-nums">{selectedCount}</span> selected
                 </p>
-                <p className="text-white/45 text-sm mt-1">
+                <p className="text-white/60 text-sm mt-1">
                   of {total}
                   {hiddenSelected > 0 && (
-                    <span className="text-ln-accent/85">
+                    <span className="text-[color:var(--ln-accent-mark-text)]">
                       {` · ${hiddenSelected} hidden by the filter`}
                     </span>
                   )}
@@ -1462,7 +1455,7 @@ function HistoryHeader({
                   type="button"
                   disabled={busy}
                   onClick={onSelectShown}
-                  className={`${PILL} bg-white/5 text-white/75 border-white/15 hover:bg-white/10 hover:text-white`}
+                  className={`${PILL} text-white/75 hover:text-white`}
                 >
                   {filtered ? `Select all ${shownCount} shown` : `Select all ${shownCount}`}
                 </button>
@@ -1480,8 +1473,7 @@ function HistoryHeader({
                 type="button"
                 disabled={busy}
                 onClick={removeSelectedGuarded}
-                className={`${PILL} bg-white/5 text-white/75 border-white/15
-                            hover:bg-rose-500/15 hover:text-rose-200 hover:border-rose-300/40`}
+                className={`${PILL} aura-danger-hover text-white/75`}
               >
                 Remove {selectedCount}
               </button>
@@ -1493,11 +1485,12 @@ function HistoryHeader({
               <h1
                 ref={titleRef}
                 tabIndex={-1}
+                data-glass-light="text"
                 className="aura-row-title text-3xl font-semibold tracking-tight outline-none"
               >
                 History
               </h1>
-              <p className="text-white/35 text-sm mt-1 tabular-nums">
+              <p className="text-white/55 text-sm mt-1 tabular-nums">
                 {total === 0 && loading
                   ? "Loading..."
                   : total === 0
@@ -1525,8 +1518,7 @@ function HistoryHeader({
                   type="button"
                   disabled={busy}
                   onClick={clearHistoryGuarded}
-                  className={`${PILL} bg-white/5 text-white/60 border-white/10
-                              hover:bg-rose-500/15 hover:text-rose-200 hover:border-rose-300/40`}
+                  className={`${PILL} aura-danger-hover text-white/60`}
                 >
                   Clear history
                 </button>
@@ -1546,7 +1538,7 @@ function HistoryHeader({
                   type="button"
                   disabled={busy}
                   onClick={() => { focusCountOnEnter.current = true; onSelectShown(); }}
-                  className={`${PILL} bg-white/5 text-white/70 border-white/10 hover:bg-white/10 hover:text-white`}
+                  className={`${PILL} text-white/70 hover:text-white`}
                 >
                   Select {shownCount} shown
                 </button>
@@ -1589,7 +1581,7 @@ function SelectBox({
       className={`w-[18px] h-[18px] rounded-[5px] flex-shrink-0
                   flex items-center justify-center border transition-colors
                   ${on
-                    ? "bg-ln-accent border-ln-accent text-black"
+                    ? "bg-ln-accent border-ln-accent text-ln-accent-ink"
                     : "bg-black/60 border-white/35 text-transparent hover:border-white/70"}
                   ${className}`}
     >
@@ -1666,14 +1658,14 @@ const DayHeader = memo(function DayHeader({
         <h2 className="text-white/85 text-lg font-semibold truncate">
           {label}
         </h2>
-        <span className="text-white/35 text-xs font-mono shrink-0">
+        <span className="text-white/55 text-xs font-mono shrink-0">
           {plays > 0 && `${plays} ${plays === 1 ? "play" : "plays"}`}
           {plays > 0 && skips > 0 && ", "}
           {skips > 0 && `${skips} skipped`}
         </span>
       </div>
       {totalSecs > 0 && (
-        <p className="text-white/35 text-xs font-mono tabular-nums shrink-0">
+        <p className="text-white/55 text-xs font-mono tabular-nums shrink-0">
           {formatDuration(totalSecs)}
         </p>
       )}
@@ -1798,7 +1790,6 @@ const HistoryCard = memo(function HistoryCard({
   const setBusy = (service: ScrobbleService | null) => setRowPush(pushKey, service);
 
   const eligible = servicesFor(entry, conn);
-  const showTrakt = eligible.includes("trakt");
   const showAnilist = eligible.includes("anilist");
   const showSimkl = eligible.includes("simkl");
 
@@ -1844,9 +1835,6 @@ const HistoryCard = memo(function HistoryCard({
         playedAt:  entry.played_at,
         anilistId:      entry.anilist_id ?? null,
         anilistEpisode: entry.anilist_episode ?? null,
-        // Trakt's title + air-date fallback; the other commands ignore them.
-        episodeTitle:    entry.episode_title ?? null,
-        episodeReleased: entry.episode_released ?? null,
       });
       markScrobbled(conn.scope, service, entry.id, entry.played_at);
       showAppToast(message, { tone: "success" });
@@ -1937,11 +1925,8 @@ const HistoryCard = memo(function HistoryCard({
 
   return (
     <div
-      className={`group relative card-contain rounded-xl overflow-hidden h-full
-                  bg-white/4 border cursor-pointer transition-colors
-                  ${isSelected
-                    ? "border-ln-accent/70 bg-ln-accent/10"
-                    : "border-white/8 hover:border-white/20"}`}
+      className={`aura-content-card is-live group relative card-contain rounded-[14px] overflow-hidden h-full
+                  cursor-pointer ${isSelected ? "is-selected" : ""}`}
       // While a selection is active the card toggles instead of navigating, so
       // building a selection never bounces the user off the page by accident.
       // A real click on a card navigates away, so a second press of a
@@ -1958,7 +1943,7 @@ const HistoryCard = memo(function HistoryCard({
             height (102 px) is what sets the card's, which the list's fixed
             row height (METRICS.rowH) relies on. */}
         <div
-          className="relative flex-shrink-0 w-[68px] h-[102px] rounded-md overflow-hidden bg-white/5 border border-white/10"
+          className="relative flex-shrink-0 w-[68px] h-[102px] rounded-md overflow-hidden bg-white/5"
         >
           {entry.poster ? (
             <ImageLoader
@@ -1974,10 +1959,11 @@ const HistoryCard = memo(function HistoryCard({
               imgClassName="w-full h-full object-cover"
             />
           ) : null}
+          <span aria-hidden className="aura-card-bezel" data-glass-light="rim" />
         </div>
 
         <div className="flex-1 min-w-0 flex flex-col justify-center gap-0.5 overflow-hidden">
-          <p className="text-white/90 text-[14px] font-medium leading-tight line-clamp-2">
+          <p className="aura-poster-title text-white/90 text-[14px] font-medium leading-tight line-clamp-2">
             {entry.name}
           </p>
           {/* Skips sit in the same feed as plays because they make the same
@@ -2001,7 +1987,7 @@ const HistoryCard = memo(function HistoryCard({
               {epLine}
             </p>
           )}
-          <p className="text-white/35 text-[10.5px] mt-0.5 font-mono tabular-nums truncate">
+          <p className="text-white/55 text-[10.5px] mt-0.5 font-mono tabular-nums truncate">
             {TIME_FMT.format(item.ts)} · {typeLabel(entry.media_type ?? "other")}
           </p>
         </div>
@@ -2028,7 +2014,7 @@ const HistoryCard = memo(function HistoryCard({
           still be pressed: it sends the push again after a prompt that says it
           is a repeat (confirmRepeat). Suppressed entirely while a
           selection is active, so the checkboxes own the hover surface. */}
-      {(showTrakt || showAnilist || showSimkl) && !selectionActive && (
+      {(showAnilist || showSimkl) && !selectionActive && (
         <div
           className="absolute bottom-0 inset-x-0 flex items-center justify-end gap-1.5
                      px-2 py-1.5 bg-gradient-to-t from-black/80 to-transparent
@@ -2036,16 +2022,6 @@ const HistoryCard = memo(function HistoryCard({
                      transition-opacity duration-150 z-10"
           onClick={(e) => e.stopPropagation()}
         >
-          {showTrakt && (
-            <ScrobbleButton
-              label="Trakt"
-              busy={busy === "trakt"}
-              disabled={busy !== null || runActive}
-              done={isScrobbled(conn.scope, "trakt", entry.id, entry.played_at)}
-              unavailable={isIneligible(conn.scope, "trakt", entry.id)}
-              onClick={() => scrobble("trakt")}
-            />
-          )}
           {showAnilist && (
             <ScrobbleButton
               label="AniList"
@@ -2131,15 +2107,14 @@ const HistoryCard = memo(function HistoryCard({
  *  build that can sign in to it. */
 function scrobbleHomes(): string {
   return knownScrobbleServicesAvailable()?.has("simkl")
-    ? "Trakt / AniList / Simkl"
-    : "Trakt / AniList";
+    ? "AniList / Simkl"
+    : "AniList";
 }
 
 /** What a repeat push does, for the prompts that offer one. Aura re-sends
  *  through the same commands, so each service answers a repeat its own way:
  *  AniList keeps one progress number (save_progress no-ops when it is already
- *  there), Trakt and Simkl get the same play, with the same watched time,
- *  again. */
+ *  there), Simkl gets the same play, with the same watched time, again. */
 function repeatDetail(services: string[]): string {
   const others = services.filter((s) => s !== SCROBBLE_LABELS.anilist);
   const parts: string[] = [];
@@ -2156,7 +2131,7 @@ function repeatDetail(services: string[]): string {
 }
 
 // ---------------------------------------------------------------------------
-// Scrobble action pill, shared by the Trakt / AniList / Simkl buttons on a card.
+// Scrobble action pill, shared by the AniList / Simkl buttons on a card.
 // Shows a spinner while its push is in flight; disabled while EITHER
 // service on the row is running. `done` renders the already-scrobbled state,
 // still pressable for a repeat.

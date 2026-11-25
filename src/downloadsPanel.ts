@@ -1,7 +1,7 @@
 // Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useSyncExternalStore } from "react";
+import { useEffect, useState, useSyncExternalStore } from "react";
 
 // ---------------------------------------------------------------------------
 // downloadsPanel: open/closed state for the title-bar downloads overlay.
@@ -111,6 +111,23 @@ export function toggleDownloadsPanel(): void {
  *  (App.tsx sets this class from isPlayerActive). */
 export function isPlayerActive(): boolean {
   return document.documentElement.classList.contains("playing-video");
+}
+
+/** isPlayerActive that re-renders when the class flips, watched only while
+ *  `watch` is true. App sets the class in an effect AFTER the render that
+ *  starts or ends playback, so a render-time read is one render stale, and a
+ *  memoized parent (TitleBar) would leave it stale until some unrelated render. */
+export function usePlayerActive(watch: boolean): boolean {
+  const [active, setActive] = useState(isPlayerActive);
+  useEffect(() => {
+    if (!watch) return;
+    const sync = () => setActive(isPlayerActive());
+    sync();
+    const mo = new MutationObserver(sync);
+    mo.observe(document.documentElement, { attributes: true, attributeFilter: ["class"] });
+    return () => mo.disconnect();
+  }, [watch]);
+  return active;
 }
 
 /** While a title-bar panel is up, keep the keys its controls need from the

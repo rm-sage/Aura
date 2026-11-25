@@ -40,7 +40,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use axum::extract::Query;
-use axum::http::header;
+use axum::http::{header, HeaderMap};
 use axum::response::{IntoResponse, Redirect, Response};
 use futures_util::StreamExt;
 use serde::Deserialize;
@@ -257,7 +257,14 @@ pub struct ImgQuery {
 /// `GET /img?url=<encoded>&w=<px>`. Serves a JPEG resized to ~`w` CSS px,
 /// disk-cached. Degrades to a 302 to the original URL on any failure so the
 /// poster still loads (just full-size).
-pub async fn handle(Query(q): Query<ImgQuery>) -> Response {
+///
+/// The resized bytes carry CORS for the WebView's OWN origin only
+/// (`streaming::add_cors`: reflected, never `*`), so the Home hero can read
+/// its art's colours back for the ambient light (src/heroAmbient.ts). A
+/// `<img>` load sends no Origin and gets no header, as before; the degrade
+/// redirect never carries one (the original host is not ours to vouch for).
+pub async fn handle(Query(q): Query<ImgQuery>, req_headers: HeaderMap) -> Response {
+    let origin = req_headers.get("origin").cloned();
     let url = q.url;
     let target_w = q.w.unwrap_or(DEFAULT_TARGET_W).clamp(MIN_TARGET_W, MAX_TARGET_W);
 
@@ -272,18 +279,44 @@ pub async fn handle(Query(q): Query<ImgQuery>) -> Response {
 
     // Cache hit → serve the small bytes directly.
     if let Some(p) = &path {
-        if let Ok(bytes) = tokio::fs::read(p).await {
-            if !bytes.is_empty() {
-                return jpeg_response(bytes);
-            }
+        if let Some(bytes) = read_cached(p).await {
+            return jpeg_response(bytes, origin.as_ref());
         }
     }
+
+    // One job per (url, w) at a time. The Home hero asks for the SAME url
+    // twice at once on a slide's first show (the <img>, and the colour
+    // readback's CORS fetch, which the webview cannot share with it), and
+    // each used to fetch, decode and resize the full backdrop on its own.
+    // A request that waited re-reads the disk cache the first one filled.
+    // Only with a cache to share through; without one each request works
+    // alone, as before.
+    let _flight = match &path {
+        Some(p) => {
+            let flight = Flight::join(&key);
+            let held = flight.slot.clone().lock_owned().await;
+            if let Some(bytes) = read_cached(p).await {
+                return jpeg_response(bytes, origin.as_ref());
+            }
+            // The job ahead of this one finished and failed: the same fetch
+            // would fail the same way, so degrade at once instead of paying
+            // the upstream timeout a second time. A job that was CANCELLED
+            // (its tile scrolled away) leaves no mark, so this one runs it.
+            if flight.failed.load(Ordering::Acquire) {
+                return Redirect::temporary(&url).into_response();
+            }
+            // (guard, hold): a tuple drops in order, so the lock is released
+            // before the entry is let go.
+            Some((held, flight))
+        }
+        None => None,
+    };
 
     if let Ok(bytes) = fetch_and_resize(&url, target_w).await {
         if let Some(p) = path {
             write_cache(p, bytes.clone()).await;
         }
-        return jpeg_response(bytes);
+        return jpeg_response(bytes, origin.as_ref());
     }
 
     // RPDB key-revoked recovery, centralized here (the webview's own
@@ -295,12 +328,74 @@ pub async fn handle(Query(q): Query<ImgQuery>) -> Response {
             if let Some(p) = path {
                 write_cache(p, bytes.clone()).await;
             }
-            return jpeg_response(bytes);
+            return jpeg_response(bytes, origin.as_ref());
         }
     }
 
+    if let Some((_, flight)) = &_flight {
+        flight.failed.store(true, Ordering::Release);
+    }
     // Never surface a broken tile: fall back to the original image.
     Redirect::temporary(&url).into_response()
+}
+
+async fn read_cached(p: &Path) -> Option<Vec<u8>> {
+    tokio::fs::read(p).await.ok().filter(|b| !b.is_empty())
+}
+
+/// The jobs in flight by cache key, with how many requests hold each entry.
+/// An entry lives only while a request holds it, so the map is bounded by
+/// the requests in flight.
+type Flights = std::collections::HashMap<String, (Arc<FlightSlot>, usize)>;
+static FLIGHTS: OnceLock<std::sync::Mutex<Flights>> = OnceLock::new();
+
+struct FlightSlot {
+    slot: Arc<tokio::sync::Mutex<()>>,
+    /// Set by a job that ran to the end and found nothing to serve.
+    failed: std::sync::atomic::AtomicBool,
+}
+
+/// One request's hold on a key's flight entry; dropping it (finished OR
+/// cancelled) releases the entry.
+struct Flight {
+    key: String,
+    entry: Arc<FlightSlot>,
+}
+
+impl std::ops::Deref for Flight {
+    type Target = FlightSlot;
+    fn deref(&self) -> &FlightSlot {
+        &self.entry
+    }
+}
+
+impl Flight {
+    fn join(key: &str) -> Flight {
+        let mut map = FLIGHTS.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+        let (entry, holders) = map.entry(key.to_string()).or_insert_with(|| {
+            (
+                Arc::new(FlightSlot {
+                    slot: Arc::new(tokio::sync::Mutex::new(())),
+                    failed: std::sync::atomic::AtomicBool::new(false),
+                }),
+                0,
+            )
+        });
+        *holders += 1;
+        Flight { key: key.to_string(), entry: entry.clone() }
+    }
+}
+
+impl Drop for Flight {
+    fn drop(&mut self) {
+        let mut map = FLIGHTS.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, holders)) = map.get_mut(&self.key) {
+            *holders -= 1;
+            if *holders == 0 {
+                map.remove(&self.key);
+            }
+        }
+    }
 }
 
 /// Map an `api.ratingposterdb.com/.../imdb/poster-default/<tt…>.jpg` URL to the
@@ -406,14 +501,16 @@ fn resize_to_jpeg(bytes: &[u8], target_w: u32) -> Result<Vec<u8>, String> {
     };
 
     let mut out = Vec::with_capacity(48 * 1024);
+    // `into_rgb8` hands an RGB8 image over as is (`to_rgb8` copied it), which
+    // matters on the no-resize path where it is the full decoded image.
     image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, OUTPUT_JPEG_QUALITY)
-        .encode_image(&resized.to_rgb8())
+        .encode_image(&resized.into_rgb8())
         .map_err(|e| e.to_string())?;
     Ok(out)
 }
 
-fn jpeg_response(bytes: Vec<u8>) -> Response {
-    (
+fn jpeg_response(bytes: Vec<u8>, origin: Option<&axum::http::HeaderValue>) -> Response {
+    let mut resp = (
         [
             (header::CONTENT_TYPE, "image/jpeg"),
             // Immutable for the (url, w) pair; let the webview cache it too so a
@@ -422,7 +519,9 @@ fn jpeg_response(bytes: Vec<u8>) -> Response {
         ],
         bytes,
     )
-        .into_response()
+        .into_response();
+    crate::streaming::add_cors(resp.headers_mut(), origin);
+    resp
 }
 
 fn cache_key(url: &str, target_w: u32) -> String {
@@ -486,4 +585,33 @@ fn maybe_evict(n: u64) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn holders(key: &str) -> Option<usize> {
+        FLIGHTS.get_or_init(Default::default).lock().unwrap().get(key).map(|(_, n)| *n)
+    }
+
+    #[tokio::test]
+    async fn a_flight_entry_lives_only_while_held_and_serializes_its_key() {
+        let key = "flight-test-key";
+        let a = Flight::join(key);
+        let b = Flight::join(key);
+        assert_eq!(holders(key), Some(2));
+        assert!(Arc::ptr_eq(&a.entry, &b.entry), "one entry per key");
+        let held = a.slot.clone().lock_owned().await;
+        assert!(b.slot.try_lock().is_err(), "the second request waits for the first");
+        a.failed.store(true, Ordering::Release);
+        drop((held, a));
+        assert!(b.slot.try_lock().is_ok());
+        assert!(b.failed.load(Ordering::Acquire), "a waiter sees the first job's failure");
+        drop(b);
+        assert_eq!(holders(key), None, "released with its last holder");
+        // A later request starts clean: no failure carried over.
+        let c = Flight::join(key);
+        assert!(!c.failed.load(Ordering::Acquire));
+    }
 }

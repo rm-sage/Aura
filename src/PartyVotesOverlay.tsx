@@ -11,7 +11,7 @@
 // something to show. Navigation reuses the existing `aura:open-meta` event.
 // ---------------------------------------------------------------------------
 
-import { useEffect, useReducer } from "react";
+import { memo, useEffect, useReducer } from "react";
 import { useWindowHidden } from "./windowVisibility";
 import { useWatchTogether } from "./watchTogether/useWatchTogether";
 import {
@@ -19,7 +19,7 @@ import {
 } from "./watchTogether/store";
 import type { VotePoll } from "./watchTogether/types";
 
-export default function PartyVotesOverlay({ suppressed = false }: { suppressed?: boolean }) {
+function PartyVotesOverlay({ suppressed = false }: { suppressed?: boolean }) {
   const w = useWatchTogether();
   const [, tick] = useReducer((n: number) => n + 1, 0);
 
@@ -55,8 +55,8 @@ export default function PartyVotesOverlay({ suppressed = false }: { suppressed?:
         <ActiveCard key={v.id} vote={v} memberCount={w.members.length} />
       ))}
       {w.voteError && (
-        <div className="pointer-events-auto w-full rounded-xl bg-rose-500/15 border border-rose-400/30
-                        px-3 py-2 text-rose-100 text-[12px] backdrop-blur-xl shadow-lg">
+        <div className="aura-glass-player aura-glass-tone-danger pointer-events-auto w-full rounded-xl
+                        px-3 py-2 text-rose-100 text-[12px]">
           {w.voteError}
         </div>
       )}
@@ -86,8 +86,9 @@ function ActiveCard({ vote, memberCount }: { vote: VotePoll; memberCount: number
   const C = 2 * Math.PI * R;
 
   return (
-    <div className="pointer-events-auto w-full rounded-2xl bg-black/80 backdrop-blur-xl border border-white/12
-                    shadow-[0_8px_30px_rgba(0,0,0,0.6)] p-3 flex gap-3 items-start aura-vote-won-pop">
+    // Over the mpv video: the player material (no backdrop pass).
+    <div className="aura-glass-player pointer-events-auto w-full rounded-2xl p-3 flex gap-3 items-start
+                    aura-vote-won-pop">
       <Poster src={vote.poster} />
       <div className="flex-1 min-w-0">
         <p className="text-white/45 text-[9.5px] uppercase tracking-[0.12em] font-semibold">Vote to watch</p>
@@ -100,7 +101,7 @@ function ActiveCard({ vote, memberCount }: { vote: VotePoll; memberCount: number
             <button
               type="button"
               onClick={() => castVote(vote.id, "yes")}
-              className="px-3 h-7 rounded-lg text-[12px] font-semibold bg-ln-accent text-black
+              className="px-3 h-7 rounded-lg text-[12px] font-semibold bg-ln-accent text-ln-accent-ink
                          hover:brightness-110 active:brightness-95 transition-[filter]"
             >
               Yes
@@ -145,7 +146,7 @@ function WonCard({ vote }: { vote: VotePoll }) {
     <div
       className="pointer-events-auto relative w-full overflow-hidden rounded-2xl cursor-pointer aura-vote-won-pop
                  bg-gradient-to-br from-ln-accent/25 to-ln-accent/5 border border-ln-accent/40
-                 shadow-[0_8px_30px_rgba(91,164,255,0.25)] p-3 flex gap-3 items-start
+                 shadow-[0_8px_30px_rgb(var(--ln-accent-rgb)/0.25)] p-3 flex gap-3 items-start
                  hover:from-ln-accent/30 transition-colors"
       onClick={open}
       role="button"
@@ -190,3 +191,9 @@ function VoteBurst() {
     </div>
   );
 }
+
+// Memoized: App renders this host with no props (or only primitives / its own
+// stable state) and re-renders on every playback-update tick. The host is
+// driven by its own state and store subscriptions, so skipping those renders
+// changes nothing on screen.
+export default memo(PartyVotesOverlay);

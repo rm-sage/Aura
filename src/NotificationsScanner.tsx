@@ -4,7 +4,7 @@
 import { useEffect, useRef, useState } from "react";
 import type { LibraryItem } from "./types";
 import { loadAuraSettings } from "./auraSettings";
-import { useNotifications } from "./NotificationsContext";
+import { safeNotifPoster, useNotifications } from "./NotificationsContext";
 import {
   getReleaseSignal,
   useReleaseSignalsVersion,
@@ -493,23 +493,25 @@ export default function NotificationsScanner({ library }: Props) {
               addNotification({
                 id: `release:${item.id}`,
                 kind: "release",
-                title: `${item.name} — now available`,
-                subtitle: undefined,
-                data: { metaId: item.id, mediaType: item.media_type },
+                // Name on the title line, the news on the second: no dash in
+                // UI copy, and the panel's 2-line slot carries the fact.
+                title: item.name,
+                subtitle: "Now available",
+                data: { metaId: item.id, mediaType: item.media_type, poster: safeNotifPoster(item.poster) },
               });
             } else {
               const epLabel = formatEpLabel(ep.season, ep.episode);
-              const titleParts: string[] = [item.name];
-              if (epLabel) titleParts.push(epLabel);
               addNotification({
                 // Representation-independent notification id (falls back to
                 // the raw cloud id only when there's no episode number) so the
                 // bell store's id-dedup also survives a churned cloud id.
                 id: `episode:${item.id}:${epKey ?? ep.id}`,
                 kind: "episode",
-                title: titleParts.join(" — "),
-                subtitle: undefined,
-                data: { metaId: item.id, videoId: ep.id, mediaType: item.media_type },
+                // The SxxEyy goes on the second line, where a long series
+                // name cannot truncate it away.
+                title: item.name,
+                subtitle: epLabel || "New episode",
+                data: { metaId: item.id, videoId: ep.id, mediaType: item.media_type, poster: safeNotifPoster(item.poster) },
               });
             }
           }

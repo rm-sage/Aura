@@ -47,3 +47,13 @@ pub mod engine;
 // render context (headless), so it's independent of the main playback engine.
 #[cfg(target_os = "windows")]
 pub mod thumb;
+
+// "Real glass over video": the OUTPUT-stage glass shader (`aura_glass.glsl`,
+// embedded), its parameter projection and state machine, and the
+// `player_glass` Tauri command. Platform-neutral logic; the engine drives it.
+pub mod glass;
+
+// Ignored runtime test for the glass shader. Drives its own libmpv window;
+// see the module doc for how to run it.
+#[cfg(all(test, target_os = "windows"))]
+mod glass_shader_tests;

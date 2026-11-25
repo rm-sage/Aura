@@ -1,0 +1,63 @@
+/* Aura - (c) 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice. */
+/* SPDX-License-Identifier: AGPL-3.0-or-later */
+
+/* Glass surface rules for the "chrome" group. Loaded once, after App.css (main.tsx),
+   so a rule here at equal specificity wins over App.css. Uses the GLASS SYSTEM
+   classes and custom properties defined in App.css; never redefine them here. */
+
+/* ------------------------------------------------------------------ */
+/* Context menu and submenu rows (src/ContextMenu.tsx).                 */
+/* Rows are .aura-glass-row; the menu is a [data-glass-droplet] list,  */
+/* so in Liquid the shared hover droplet replaces every row's own fill  */
+/* and the tone survives in the label colour only. Frosted keeps a      */
+/* faint tone tint on hover (semantic: green marks, red removes).       */
+/* ------------------------------------------------------------------ */
+.aura-ctx-row:disabled:hover { background-color: transparent; }
+.aura-ctx-row[data-tone="success"]:hover:not(:disabled) { background-color: rgb(52 211 153 / 0.12); }
+.aura-ctx-row[data-tone="warning"]:hover:not(:disabled) { background-color: rgb(251 191 36 / 0.12); }
+.aura-ctx-row[data-tone="danger"]:hover:not(:disabled)  { background-color: rgb(251 113 133 / 0.12); }
+.aura-ctx-row[data-tone="notice"]:hover:not(:disabled)  { background-color: rgb(var(--ln-accent-rgb) / 0.12); }
+.aura-ctx-row[data-tone="skip"]:hover:not(:disabled)    { background-color: rgb(192 132 252 / 0.12); }
+/* The row whose submenu is open keeps the hover face while the pointer is
+   over the submenu (the droplet leaves with the pointer). */
+.aura-ctx-row[aria-expanded="true"] { background-color: rgba(255, 255, 255, 0.08); }
+html[data-glass="liquid"] .aura-ctx-row[aria-expanded="true"] {
+  background: linear-gradient(rgb(255 255 255 / 0.075), rgb(255 255 255 / 0.035));
+  box-shadow: inset 0 6px 10px -8px rgb(255 255 255 / 0.07), inset 0 -8px 12px -9px rgb(0 0 0 / 0.35);
+}
+/* The droplet sits inset from the menu's rim, like the mockup's menus. */
+.aura-ctx-hl {
+  left: 6px;
+  right: 6px;
+  border-radius: 9px;
+}
+
+/* ------------------------------------------------------------------ */
+/* Popovers grow from their trigger in Liquid.                          */
+/* The panels keep their own Frosted entrances (App.css); Liquid swaps  */
+/* in the droplet grow. Never under reduced motion: App.css's reduced   */
+/* rules for these panels then apply unchanged.                        */
+/* ------------------------------------------------------------------ */
+/* The same pop as App.css's Liquid .aura-glass-pop-in: a short fade
+   (aura-glass-pop-fade) beside the shape on the bouncy spring token (never
+   the spring on opacity: it overshoots past 1). The notifications side sheet
+   and arrival bubble spring out of the rail on their own transitions
+   (styles/glass-notify.css). */
+/* Downloads panel and Service status panel (both .aura-dl-panel, whose
+   transform-origin already sits under the title-bar icon). */
+html[data-glass="liquid"]:not([data-reduced-motion="true"]) .aura-dl-panel-in {
+  animation:
+    aura-glass-pop-fade 140ms ease-out both,
+    aura-glass-pop-shape var(--aura-spring-bouncy-dur) var(--aura-spring-bouncy) both;
+}
+/* A warning-toned flat button (the Reconnect action on an expired sign-in
+   alert), shaped exactly like .aura-glass-flat.is-danger in both materials. */
+.aura-glass-flat.aura-chrome-warn {
+  --lg-face: linear-gradient(rgb(245 158 11 / 0.15), rgb(245 158 11 / 0.15));
+  --lg-border-c: rgb(251 191 36 / 0.35);
+  color: rgb(253 230 138);
+}
+html[data-glass="liquid"] .aura-glass-flat.aura-chrome-warn {
+  --lg-deco: linear-gradient(rgb(245 158 11 / 0.05), rgb(245 158 11 / 0.11));
+  --lg-ring: inset 0 -8px 12px -9px rgb(251 191 36 / 0.30), inset 0 0 0 1px rgb(251 191 36 / 0.14);
+}

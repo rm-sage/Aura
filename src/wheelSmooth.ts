@@ -39,20 +39,40 @@ export function springStep(x: number, v: number, omega: number, h: number): Spri
   return { x: (x + k * h) * e, v: (v - k * omega * h) * e };
 }
 
-/** The spring's own tail takes as long as the whole move and, with scroll offsets in whole
- *  pixels, plays as lone 1 px steps up to 46 ms apart. Close the last stretch at a steady
- *  speed instead: one step per frame at 240 Hz, and nothing the eye tracks as a stop. */
-const TAIL_SPEED = 240;
-const TAIL_PX = 16;
-
-/** The next position and speed. `prevX` is the distance before this step. */
-export function nextStep(prevX: number, v: number, omega: number, h: number): SpringState {
-  const s = springStep(prevX, v, omega, h);
-  const closing = s.x * s.v <= 0;
-  if (!closing || Math.abs(s.x) >= TAIL_PX || Math.abs(s.v) >= TAIL_SPEED) return s;
-  const left = Math.max(0, Math.abs(prevX) - TAIL_SPEED * h);
-  return { x: Math.sign(prevX) * left, v: -Math.sign(prevX) * TAIL_SPEED };
+/** How a run ends. The spring's own tail takes as long as the whole move and, with scroll
+ *  offsets in whole pixels, plays as lone 1 px steps up to 46 ms apart. Closing that tail at a
+ *  steady 240 px/s instead stopped dead from full speed, 57600 px/s^2 in one frame (the body
+ *  brakes at about 3300): the eye, still tracking, read that stop as the whole page jiggling.
+ *  So once the spring's own deceleration has grown to what stopping on the target needs, the
+ *  rest of the move brakes at that one constant rate: speed falls to zero exactly on the target,
+ *  the last pixels land 4 to 13 ms apart at 240 Hz (spreading out, never a lone long hold), and
+ *  the last one lands when it did before (254 ms after the notch vs 250).
+ *  From rest the hand-off falls at omega * t = sqrt(2), where speed and deceleration both match
+ *  the spring's, so there is no seam in the motion either. */
+export interface Step extends SpringState {
+  /** The braking rate (px/s^2) once the run is braking, else null. */
+  brake: number | null;
 }
+
+/** The next position and speed. `prevX` is the distance before this step; a new notch
+ *  passes `brake` null, since the spring has to pick the run up again. */
+export function nextStep(
+  prevX: number, v: number, omega: number, h: number, brake: number | null,
+): Step {
+  if (brake === null && prevX * v < 0) {
+    const decel = 2 * omega * Math.abs(v) - omega * omega * Math.abs(prevX);
+    const need = (v * v) / (2 * Math.abs(prevX));
+    if (decel >= need) brake = need;
+  }
+  if (brake === null) return { ...springStep(prevX, v, omega, h), brake };
+  // Exact over the step, so a long frame cannot overshoot: `left` is the time to the stop.
+  const left = Math.abs(v) / brake - h;
+  if (left <= 0) return { x: 0, v: 0, brake };
+  return { x: Math.sign(prevX) * brake * left * left / 2, v: Math.sign(v) * brake * left, brake };
+}
+
+/** Under half a pixel and this speed (px/s), a run that never braked counts as at rest. */
+const REST_SPEED = 30;
 
 /** A mouse notch, as opposed to the fine deltas of a touchpad or free-spin wheel. */
 export function isWholeNotch(wheelDeltaY: number): boolean {
@@ -64,6 +84,8 @@ interface Run {
   y: number;
   v: number;
   target: number;
+  /** The braking rate once the run is braking to its target (see nextStep). */
+  brake: number | null;
   /** Where the browser actually put it last frame, to notice anything else moving it. */
   landed: number;
 }
@@ -113,10 +135,13 @@ export function installWheelSmooth(isEnabled: () => boolean): () => void {
         r.y += moved;
         r.target += moved;
       }
-      const s = nextStep(r.y - r.target, r.v, OMEGA, h);
+      const s = nextStep(r.y - r.target, r.v, OMEGA, h, r.brake);
       r.y = r.target + s.x;
       r.v = s.v;
-      const done = !el.isConnected || (Math.abs(s.x) < 0.5 && Math.abs(s.v) <= TAIL_SPEED);
+      r.brake = s.brake;
+      const done = !el.isConnected
+        || (s.x === 0 && s.v === 0)
+        || (Math.abs(s.x) < 0.5 && Math.abs(s.v) < REST_SPEED);
       if (done) r.y = r.target;
       el.scrollTop = r.y;
       r.landed = el.scrollTop;
@@ -155,13 +180,14 @@ export function installWheelSmooth(isEnabled: () => boolean): () => void {
     const max = el.scrollHeight - el.clientHeight;
     let r = runs.get(el);
     if (!r) {
-      r = { el, y: el.scrollTop, v: 0, target: el.scrollTop, landed: el.scrollTop };
+      r = { el, y: el.scrollTop, v: 0, target: el.scrollTop, brake: null, landed: el.scrollTop };
       runs.set(el, r);
     }
     // Turning back answers at once instead of first working off what was still to come.
     const reversing = (r.target - r.y) * e.deltaY < 0;
     const from = reversing ? r.y : r.target;
     r.target = Math.max(0, Math.min(max, from + e.deltaY));
+    r.brake = null;
     if (raf === null) {
       lastTime = performance.now();
       raf = requestAnimationFrame(frame);

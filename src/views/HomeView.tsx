@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import {
-  useState, useEffect, useLayoutEffect, useMemo, useRef, useCallback,
+  memo, useState, useEffect, useLayoutEffect, useMemo, useRef, useCallback,
   type ReactElement, type RefObject,
 } from "react";
 import { invoke } from "@tauri-apps/api/core";
@@ -11,6 +11,7 @@ import { getMetaDetail } from "../metaCache";
 import type { CatalogInfo } from "../CatalogPicker";
 import type { UserSession } from "../LoginView";
 import HeroCarousel, { HERO_MAX_WIDTH } from "../HeroCarousel";
+import { HERO_SETTLE_MS, nextHeroSource, settledHeroRow, type HeroCandidate, type HeroSource } from "../heroSource";
 import { isManuallyWatched, onManualWatchedChange } from "../manualWatched";
 import { isAutoBumped, onAutoBumpedChange } from "../autoBumped";
 import { ContinueWatchingRow, DiscoveryRow, HOME_VISIBLE } from "../CinemaRows";
@@ -57,6 +58,18 @@ const HOME_EST_ROW_STRIDE = 479;
  *  persisted to localStorage), but the per-item logo extraction was
  *  React-state-only and reset on unmount. */
 const HERO_LOGO_MEMO = new Map<string, string | null>();
+/** HERO_LOGO_MEMO's cap: a session that cycles hero sources keeps adding ten
+ *  ids per source. The oldest go first; one evicted is re-read through
+ *  metaCache (24 h cache), so nothing is fetched twice. */
+const HERO_LOGO_MEMO_CAP = 120;
+
+/** The hero source last shown (one entry, at most 10 previews), so coming
+ *  back to Home puts the same hero up on the first frame instead of waiting
+ *  for the rows and landing on whichever row answers first (heroSource.ts).
+ *  Seeded with gen -1, which no row build matches, so the new build's own
+ *  decision still replaces it (keeping it as is when it is the same row with
+ *  the same titles). */
+let HERO_SOURCE_MEMO: { account: string; source: HeroSource<MetaPreview> } | null = null;
 
 /** Catalog ids that an addon's manifest declares but its catalog
  *  handler doesn't recognise. AIOMetadata ships `calendar-videos` in
@@ -68,11 +81,17 @@ const HERO_LOGO_MEMO = new Map<string, string | null>();
 const CATALOG_ID_DENYLIST = new Set<string>([
   "calendar-videos",
 ]);
+/** AIOStreams re-serves a wrapped addon's catalogs under a 7-hex instance
+ *  prefix ("2fce3b0.calendar-videos"), so the denylist is matched on the id
+ *  without it. */
+function isDenylistedCatalog(id: string): boolean {
+  return CATALOG_ID_DENYLIST.has(id) || CATALOG_ID_DENYLIST.has(id.replace(/^[0-9a-f]{7}\./, ""));
+}
 import SearchBar from "../SearchBar";
 import SearchView from "./SearchView";
-import { findAIOMetadataAddon, withTypeSuffix } from "../aiometadata";
+import { withTypeSuffix } from "../aiometadata";
 import { loadAuraSettings, HOME_RELEVANT_SETTING_KEYS, SEARCH_RELEVANT_SETTING_KEYS, settingsChangeIncludes } from "../auraSettings";
-import { electHomeAddons, electSearchAddons } from "../addonElection";
+import { electHomeAddons, electMetaAddons, electSearchAddons } from "../addonElection";
 // FilterBar moved to per-view sidebars (CatalogPageView, LibraryView,
 // QueueView, DiscoverView) — Home now only emits the unfiltered row list.
 
@@ -149,6 +168,9 @@ interface Props {
    *  by calling onExternalQueryConsumed after the query is picked up. */
   externalQuery?: string | null;
   onExternalQueryConsumed?: () => void;
+  /** Home is mounted but not seen (a Detail page over it, or playback): the
+   *  hero holds its slide instead of auto-advancing. */
+  heroPaused?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -163,7 +185,7 @@ interface Props {
 // rendering falls back to a small diagnostic card instead of a blank Home.
 // ---------------------------------------------------------------------------
 
-export default function HomeView(props: Props) {
+function HomeViewShell(props: Props) {
   return (
     <ErrorBoundary scope="Home">
       <HomeViewBody {...props} />
@@ -171,9 +193,30 @@ export default function HomeView(props: Props) {
   );
 }
 
+/** Every prop by identity except `onExternalQueryConsumed`. Home stays
+ *  mounted under a Detail page and under playback, and App re-renders on
+ *  every playback position tick (usePlayback's `time`), passing that
+ *  callback as a fresh inline closure each time: without this, every tick
+ *  re-rendered all of Home (the Continue Watching filter and sort over the
+ *  whole library, the search bar, the row list) for nothing. The callback is
+ *  only called from the effect that runs when `externalQuery` changes, and a
+ *  change there re-renders with the fresh callback, so skipping it otherwise
+ *  can never call a stale one. Any other (future) prop is compared. */
+function sameHomeProps(a: Props, b: Props): boolean {
+  const keys = new Set([...Object.keys(a), ...Object.keys(b)]) as Set<keyof Props>;
+  for (const k of keys) {
+    if (k === "onExternalQueryConsumed") continue;
+    if (!Object.is(a[k], b[k])) return false;
+  }
+  return true;
+}
+
+const HomeView = memo(HomeViewShell, sameHomeProps);
+export default HomeView;
+
 function HomeViewBody({
-  addons, library, onSelectMeta, onSelectFromCW, resetKey,
-  externalQuery, onExternalQueryConsumed,
+  addons, session, library, onSelectMeta, onSelectFromCW, resetKey,
+  externalQuery, onExternalQueryConsumed, heroPaused,
 }: Props) {
   /** Active committed search query — set on Enter, cleared when input empties. */
   const [activeQuery, setActiveQuery] = useState<string | null>(null);
@@ -223,6 +266,13 @@ function HomeViewBody({
    *  including rows whose catalog came back empty. `shownRows` below is
    *  what renders. */
   const [rows, setRows] = useState<CatalogRow[]>([]);
+  /** `rows` holds the current build's list (false from the start of a
+   *  rebuild until its manifests are read and the rows are laid out). The
+   *  hero keeps what it shows until then (heroSource.ts). */
+  const [rowsBuilt, setRowsBuilt] = useState(false);
+  /** HERO_SETTLE_MS have passed since this build's first row with items:
+   *  an earlier row still in flight no longer holds the hero back. */
+  const [heroGraceOver, setHeroGraceOver] = useState(false);
   const [bootstrapped, setBootstrapped] = useState(false);
   /** The row window (the rows in or near the viewport), as indexes into
    *  `shownRows`. The fetch queue works through these (plus
@@ -325,8 +375,10 @@ function HomeViewBody({
     fetchStartedRef.current = new Set();
     fetchInflightRef.current = 0;
     setWant(INITIAL_WANT);
+    setHeroGraceOver(false);
     if (addons.length === 0) {
       setRows([]);
+      setRowsBuilt(true);
       setBootstrapped(true);
       return;
     }
@@ -335,9 +387,11 @@ function HomeViewBody({
     const sources = electHomeAddons(addons);
     if (sources.length === 0) {
       setRows([]);
+      setRowsBuilt(true);
       setBootstrapped(true);
       return;
     }
+    setRowsBuilt(false);
 
     setRows([]); // reset for the new source list
 
@@ -380,7 +434,7 @@ function HomeViewBody({
           // parser computes is_hidden_from_home; we just skip those
           // rows here. The Discover tab still picks them up.
           if (c.is_hidden_from_home) continue;
-          if (CATALOG_ID_DENYLIST.has(c.id)) continue;
+          if (isDenylistedCatalog(c.id)) continue;
           const key = `${addon.url}|${c.media_type}-${c.id}`;
           if (seen.has(key)) continue;
           seen.add(key);
@@ -396,6 +450,7 @@ function HomeViewBody({
         }
       }
       setRows(initial);
+      setRowsBuilt(true);
       if (initial.length === 0) {
         // No catalog rows at all: nothing will ever settle, so the
         // splash must not wait for one.
@@ -563,23 +618,35 @@ function HomeViewBody({
     [addons, settingsTick, searchTick],
   );
 
-  const [heroOverrideItems, setHeroOverrideItems] = useState<MetaPreview[] | null>(null);
-  const [heroOverrideLabel, setHeroOverrideLabel] = useState<string | null>(null);
+  /** The carousel key of the pinned hero catalog, when one is pinned. */
+  const heroPinKey = heroCatalogPref
+    ? `pinned:${heroCatalogPref.addonUrl}|${heroCatalogPref.mediaType}-${heroCatalogPref.catalogId}`
+    : null;
+  /** The pinned catalog's answer, tagged with the catalog it answers, so a
+   *  newly pinned catalog never shows the previous pin's slides. */
+  const [heroOverride, setHeroOverride] = useState<{ forKey: string; items: MetaPreview[] } | null>(null);
+  /** The pinned catalog's display name, tagged like heroOverride: a pin
+   *  change must never put the new catalog's name over the old one's slides
+   *  (its manifest is cached and usually answers before its catalog). Not
+   *  cleared on a re-run for the SAME pin (every settings tick re-runs the
+   *  effect), so the chip does not blink. */
+  const [heroOverrideLabel, setHeroOverrideLabel] = useState<{ forKey: string; label: string } | null>(null);
   useEffect(() => {
     // Hero off, or no override catalog pinned → nothing to fetch.
     if (heroDisabled || !heroCatalogPref) {
-      setHeroOverrideItems(null);
+      setHeroOverride(null);
       setHeroOverrideLabel(null);
       return;
     }
     let cancelled = false;
+    const forKey = `pinned:${heroCatalogPref.addonUrl}|${heroCatalogPref.mediaType}-${heroCatalogPref.catalogId}`;
     invoke<MetaPreview[]>("fetch_catalog", {
       addonUrl:    heroCatalogPref.addonUrl,
       catalogType: heroCatalogPref.mediaType,
       catalogId:   heroCatalogPref.catalogId,
     })
-      .then((items) => { if (!cancelled) setHeroOverrideItems(items); })
-      .catch(() => { if (!cancelled) setHeroOverrideItems([]); });
+      .then((items) => { if (!cancelled) setHeroOverride({ forKey, items }); })
+      .catch(() => { if (!cancelled) setHeroOverride({ forKey, items: [] }); });
     invoke<{ name: string; catalogs: { id: string; media_type: string; name: string }[] }>(
       "get_addon_manifest",
       { addonUrl: heroCatalogPref.addonUrl },
@@ -589,47 +656,103 @@ function HomeViewBody({
         const cat = m.catalogs.find((c) =>
           c.id === heroCatalogPref.catalogId && c.media_type === heroCatalogPref.mediaType,
         );
-        if (cat) setHeroOverrideLabel(withTypeSuffix(cat.name, cat.media_type));
+        if (cat) setHeroOverrideLabel({ forKey, label: withTypeSuffix(cat.name, cat.media_type) });
       })
       .catch(() => {});
     return () => { cancelled = true; };
   }, [heroCatalogPref, heroDisabled]);
 
-  // The first row with items: the hero's default source. The fetch queue
-  // walks past the row window until one exists, so it does not wait on the
-  // window's rows loading. Rows now settle one by one as the window moves,
-  // long after the hero is filled, so the two memos below key on this row
-  // rather than on `rows`. A settled row is never rewritten, so it keeps
-  // its identity until an EARLIER row gains items and takes its place.
-  const firstFilledRow = useMemo(() => rows.find((r) => r.items.length > 0), [rows]);
+  // ---- The hero's source (heroSource.ts) ----------------------------------
+  // The default source is the first row with items, but only once every row
+  // before it has answered (or HERO_SETTLE_MS after this build's first row
+  // with items): rows answer in completion order, and taking "the first row
+  // with items" on every render put row 2's first slide up, then row 0's,
+  // each a fresh mount with its own art and bleed (the "hero cycles through
+  // slides on load" report). The fetch queue walks past the row window until
+  // a row has items, so the hero does not wait on the window's rows.
+  const anyRowFilled = rows.some((r) => r.items.length > 0);
+  useEffect(() => {
+    if (!anyRowFilled || heroGraceOver) return;
+    const t = setTimeout(() => setHeroGraceOver(true), HERO_SETTLE_MS);
+    return () => clearTimeout(t);
+  }, [anyRowFilled, heroGraceOver]);
 
-  // Source for the hero — override catalog when configured, otherwise
-  // the first browseable row's first ~5 art-bearing items. Empty when the
-  // hero is disabled, which both hides the banner and skips the per-item
-  // logo fetches below.
-  const heroItemsRaw: MetaPreview[] = useMemo(() => {
-    if (heroDisabled) return [];
-    const source = heroOverrideItems ?? firstFilledRow?.items ?? [];
-    return source
+  // What the hero SHOWS: latched, one source per row build. A rebuild (a new
+  // `addons` array at warm start and again after the account sync, a
+  // manifest refresh, a settings tick) keeps the hero up instead of
+  // unmounting it, and its decision keeps the very same object when it is
+  // the same row with the same titles, so the carousel neither remounts nor
+  // re-renders. Coming back to Home starts from the last source shown
+  // (HERO_SOURCE_MEMO), when it is still the same kind of source and the
+  // same account: the next account's Home must not open on the previous
+  // account's (possibly personalised) catalog while its own rows load. The
+  // account tag is the library cache's short auth-key prefix, memory only.
+  const heroAccount = session?.auth_key?.slice(0, 12) ?? "";
+  const [heroSource, setHeroSource] = useState<HeroSource<MetaPreview> | null>(() => {
+    const m = HERO_SOURCE_MEMO;
+    if (!m || heroDisabled || m.account !== heroAccount) return null;
+    if (m.source.pinned ? m.source.key !== heroPinKey : heroPinKey !== null) return null;
+    return { ...m.source, gen: -1 };
+  });
+
+  // What this render's data says the hero should be: `undefined` while it
+  // is not decided (a pinned catalog not answered yet, a rebuild in flight,
+  // an earlier row still loading), `null` for no hero (disabled, or a build
+  // with no row items). A pinned catalog never falls back to the first row
+  // while it loads.
+  let heroCandidate: HeroCandidate<MetaPreview>;
+  if (heroDisabled) {
+    heroCandidate = null;
+  } else if (heroPinKey) {
+    // A source shown for another key (the previous pin, or the first row
+    // before a pin) is dropped at once rather than latched while this pin
+    // loads: a pinned catalog shows nothing until its own answer.
+    heroCandidate = heroOverride && heroOverride.forKey === heroPinKey
+      ? { key: heroPinKey, gen: -1, pinned: true, label: null, items: heroOverride.items }
+      : heroSource && heroSource.key !== heroPinKey ? null : undefined;
+  } else if (!rowsBuilt) {
+    heroCandidate = undefined;
+  } else {
+    const row = settledHeroRow(rows, heroGraceOver);
+    heroCandidate = row
+      ? {
+          key: row.key, gen: row.gen, pinned: false, items: row.items,
+          label: withTypeSuffix(row.catalog.name, row.catalog.media_type),
+        }
+      : row;
+  }
+
+  const shownHeroSource = nextHeroSource(heroSource, heroCandidate);
+  // Adjusting state during render (React re-runs this render before it
+  // commits, so nothing shows the old value); nextHeroSource returns its
+  // input unchanged once it holds, so this converges in one pass.
+  if (shownHeroSource !== heroSource) setHeroSource(shownHeroSource);
+  // Keyed on the source alone: tagged with the account it was latched
+  // under, so a source still up after a switch is never re-tagged as the
+  // new account's.
+  useEffect(() => {
+    HERO_SOURCE_MEMO = heroSource ? { account: heroAccount, source: heroSource } : null;
+  }, [heroSource]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // The hero's slides: the source's first ten art-bearing items. Empty when
+  // there is no source (the hero is disabled or not decided yet), which
+  // both hides the banner and skips the per-item logo fetches below.
+  const heroSourceItems = shownHeroSource?.items;
+  const heroItemsRaw: MetaPreview[] = useMemo(
+    () => (heroSourceItems ?? [])
       .filter((it) => it.background ?? it.fanart ?? it.backdrop ?? it.poster)
-      .slice(0, 10);
-  }, [heroDisabled, heroOverrideItems, firstFilledRow]);
+      .slice(0, 10),
+    [heroSourceItems],
+  );
 
-  /** Display name of the catalog the hero is pulled from — surfaces
-   *  as a subtle top-left chip on the hero card so the user knows
-   *  which row contributed the current selection. Empty when there's
-   *  no resolved source row. */
-  /** Identity of the hero's source, for keying the carousel: the pinned
-   *  catalog when one is set, else the default source row. */
-  const heroSourceKey = heroOverrideItems
-    ? "pinned-hero"
-    : (firstFilledRow?.key ?? "no-hero-source");
+  /** Identity of the hero's source, for keying the carousel. */
+  const heroSourceKey = shownHeroSource?.key ?? "no-hero-source";
 
-  const heroSourceLabel: string | null = useMemo(() => {
-    if (heroOverrideLabel) return heroOverrideLabel;
-    if (!firstFilledRow) return null;
-    return withTypeSuffix(firstFilledRow.catalog.name, firstFilledRow.catalog.media_type);
-  }, [heroOverrideLabel, firstFilledRow]);
+  /** Display name of the catalog the hero is pulled from: a subtle top-left
+   *  chip on the hero card. Empty when there is no resolved source. */
+  const heroSourceLabel: string | null = shownHeroSource?.pinned
+    ? (heroOverrideLabel && heroOverrideLabel.forKey === shownHeroSource.key ? heroOverrideLabel.label : null)
+    : (shownHeroSource?.label ?? null);
 
   // Catalog responses don't carry the `logo` field — only meta-detail does.
   // Without this, the hero falls back to plain `<h2>{name}</h2>` instead of
@@ -656,16 +779,24 @@ function HomeViewBody({
     () => Object.fromEntries(HERO_LOGO_MEMO.entries()),
   );
   useEffect(() => {
-    const metaAddon = findAIOMetadataAddon(addons);
-    if (!metaAddon) return;
     let cancelled = false;
     const fetchOne = async (item: MetaPreview) => {
       const key = `${item.media_type}:${item.id}`;
       if (HERO_LOGO_MEMO.has(key)) return; // already resolved this session
-      const d = await getMetaDetail(metaAddon, item.media_type, item.id);
-      if (cancelled) return;
-      const logo = d?.logo ?? null;
+      // Ask the title's own meta providers (the ONE election, pin applied),
+      // not a separately installed AIOMetadata: wrapped inside AIOStreams it
+      // is not one, and a Cinemeta-only user has a logo to show too. The
+      // first two providers at most; metaCache answers repeats.
+      let logo: string | null = null;
+      for (const a of electMetaAddons(addons, item.media_type, item.id).slice(0, 2)) {
+        const d = await getMetaDetail(a, item.media_type, item.id);
+        if (cancelled) return;
+        if (d?.logo) { logo = d.logo; break; }
+      }
       HERO_LOGO_MEMO.set(key, logo);
+      while (HERO_LOGO_MEMO.size > HERO_LOGO_MEMO_CAP) {
+        HERO_LOGO_MEMO.delete(HERO_LOGO_MEMO.keys().next().value as string);
+      }
       setHeroLogoCache((prev) => (key in prev ? prev : { ...prev, [key]: logo }));
     };
     for (const item of heroItemsRaw) {
@@ -702,7 +833,13 @@ function HomeViewBody({
   // The "new episode out" notifications stremio-core pushes have
   // `time_offset === 0`, so they fall out of this filter naturally.
   // Stremio also excludes `type === "other"` (custom non-meta items).
-  const continueWatching: LibraryItem[] = library
+  //
+  // Memoized on the library and the manual-watched / auto-bumped version (the
+  // two stores the filter reads, whose change events also fire on an account
+  // switch): it walks and sorts the whole library, and a fresh array every
+  // render also defeated ContinueWatchingRow's memo, so every Home render (a
+  // row-window step while scrolling, a row answering) rebuilt the CW row.
+  const continueWatching: LibraryItem[] = useMemo(() => library
     .filter((i) => {
       if (i.removed) return false;
       if ((i.media_type ?? "").toLowerCase() === "other") return false;
@@ -721,11 +858,22 @@ function HomeViewBody({
       return off > 0;
     })
     .sort((a, b) => (b.mtime ?? "").localeCompare(a.mtime ?? ""))
-    .slice(0, 12);
+    .slice(0, 12),
+  [library, manualVersion]);
 
   // Search commit / clear handlers — feed the Stremio-style SearchView.
-  const handleSubmitSearch = (q: string) => setActiveQuery(q);
-  const handleClearSearch  = () => setActiveQuery(null);
+  // Stable, and the bar's element is memoized on them and the query: the bar
+  // is not memo()'d itself, so every Home render (each row-window step while
+  // scrolling) re-rendered it although nothing it shows had changed.
+  const handleSubmitSearch = useCallback((q: string) => setActiveQuery(q), []);
+  const handleClearSearch  = useCallback(() => setActiveQuery(null), []);
+  const searchBar = useMemo(() => (
+    <SearchBar
+      committedQuery={activeQuery}
+      onSubmit={handleSubmitSearch}
+      onClear={handleClearSearch}
+    />
+  ), [activeQuery, handleSubmitSearch, handleClearSearch]);
 
   // The scroll container is held as state, not a plain ref: it unmounts
   // while a search is showing, and the row window's effects must re-run
@@ -778,11 +926,7 @@ function HomeViewBody({
           className="mx-auto relative w-full pointer-events-auto"
           style={{ maxWidth: HERO_MAX_WIDTH }}
         >
-          <SearchBar
-            committedQuery={activeQuery}
-            onSubmit={handleSubmitSearch}
-            onClear={handleClearSearch}
-          />
+          {searchBar}
         </div>
       </div>
 
@@ -829,11 +973,14 @@ function HomeViewBody({
             {heroItems.length > 0 && (
               <div className="px-6 pt-2 pb-4">
                 <HeroCarousel
-                  // Keyed on the SOURCE so a change of source (a pinned hero
-                  // catalog, or an earlier row filling and becoming the first
-                  // row with items) starts at slide 0 rather than keeping a
-                  // slide index that belongs to the old list.
+                  // Keyed on the SOURCE so a real change of source (a pinned
+                  // hero catalog, or a rebuild that settles on another row)
+                  // mounts fresh rather than keeping a slide index that
+                  // belongs to the old list. The source is latched per row
+                  // build (heroSource.ts), so loading never changes the key.
                   key={heroSourceKey}
+                  sourceKey={heroSourceKey}
+                  paused={heroPaused}
                   items={heroItems}
                   onSelect={onSelectMeta}
                   sourceLabel={heroSourceLabel ?? undefined}
@@ -905,7 +1052,11 @@ function HomeViewBody({
  *  effect lists it as a dependency, like the View-all popup's options. */
 const ONE_ROW_PER_WINDOW_ROW = () => 1;
 
-function HomeRowList({
+// memo(): every prop is stable between row changes (`rows` is HomeView's
+// memoized `shownRows`, the callbacks are useCallback'd), so a Home render
+// for anything else (the hero source settling, a logo landing, the
+// scrollbar width) no longer walks the mounted rows a second time.
+const HomeRowList = memo(function HomeRowList({
   rows, scrollRef, leadRef, onWindowChange, onSelectMeta, onRetry,
 }: {
   rows: CatalogRow[];
@@ -1063,4 +1214,4 @@ function HomeRowList({
       </div>
     </div>
   );
-}
+});

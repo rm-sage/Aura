@@ -182,10 +182,12 @@ export default function LinkLoginModal({ provider, onSuccess, onCancel }: Props)
   const Glyph = provider === "facebook" ? FacebookGlyph : AppleGlyph;
 
   return (
-    <div className="aura-modal-backdrop-in fixed inset-0 z-[300] flex items-center justify-center
-                    bg-black/60 backdrop-blur-sm">
-      <div className="aura-modal-card-in glass-panel-elevated rounded-3xl px-7 py-8 w-full max-w-[380px] mx-4
-                      shadow-glass-edge flex flex-col gap-6">
+    <div className="fixed inset-0 z-[300] flex items-center justify-center">
+      {/* Dim + blur on a sibling layer, never the wrapper: an ancestor's
+          backdrop-filter (or fading opacity) would blind the card's glass. */}
+      <div aria-hidden className="aura-modal-backdrop-in absolute inset-0 bg-black/60 backdrop-blur-sm" />
+      <div className="aura-modal-card-in aura-float-glass relative rounded-3xl px-7 py-8 w-full max-w-[380px] mx-4
+                      flex flex-col gap-6">
         {/* Header */}
         <div className="flex flex-col gap-1.5">
           <div className="flex items-center gap-2.5">
@@ -213,9 +215,8 @@ export default function LinkLoginModal({ provider, onSuccess, onCancel }: Props)
             {/* Step 1 - open Stremio */}
             <button
               onClick={openStremio}
-              className="w-full py-3 rounded-xl font-medium text-sm transition-all
-                         bg-ln-accent/80 hover:bg-ln-accent active:scale-[0.99] text-white
-                         flex items-center justify-center gap-2.5 shadow-glass-edge"
+              className="aura-glass-flat aura-glass-press is-cta w-full py-3 rounded-xl font-medium text-sm text-ln-accent-ink
+                         flex items-center justify-center gap-2.5"
             >
               <Glyph />
               Open Stremio to sign in
@@ -241,9 +242,8 @@ export default function LinkLoginModal({ provider, onSuccess, onCancel }: Props)
                 <button
                   onClick={copyCode}
                   title="Click to copy"
-                  className="self-start font-mono text-2xl tracking-[0.3em] text-white
-                             px-3 py-1.5 rounded-lg bg-white/6 border border-white/12
-                             hover:border-white/25 transition-colors select-all"
+                  className="aura-glass-flat self-start font-mono text-2xl tracking-[0.3em] text-white
+                             px-3 py-1.5 rounded-lg select-all"
                 >
                   {linkCode.code}
                 </button>
@@ -271,8 +271,7 @@ export default function LinkLoginModal({ provider, onSuccess, onCancel }: Props)
             </div>
             <button
               onClick={retry}
-              className="w-full py-3 rounded-xl font-medium text-sm transition-all
-                         bg-ln-accent/80 hover:bg-ln-accent active:scale-[0.99] text-white"
+              className="aura-glass-flat aura-glass-press is-cta w-full py-3 rounded-xl font-medium text-sm text-ln-accent-ink"
             >
               Get a new code
             </button>
@@ -288,8 +287,7 @@ export default function LinkLoginModal({ provider, onSuccess, onCancel }: Props)
             </div>
             <button
               onClick={retry}
-              className="w-full py-3 rounded-xl font-medium text-sm transition-all
-                         bg-ln-accent/80 hover:bg-ln-accent active:scale-[0.99] text-white"
+              className="aura-glass-flat aura-glass-press is-cta w-full py-3 rounded-xl font-medium text-sm text-ln-accent-ink"
             >
               Try again
             </button>

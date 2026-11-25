@@ -107,7 +107,7 @@ optional but nice.
 ## Ratings
 
 - A **multi source ratings aggregator** that merges MDBList (IMDb, Rotten Tomatoes audience,
-  Metacritic, TMDB, Trakt, Letterboxd) with MyAnimeList (via Tenrai) and AniList for anime, on top of any
+  Metacritic, TMDB, Letterboxd) with MyAnimeList (via Tenrai) and AniList for anime, on top of any
   addon supplied scores.
 - Rendered as branded tiles with **per source logos** and critic vs audience tooltips, ordered by
   source authority. The IMDb, RT, and Metacritic tier needs no user supplied key.
@@ -194,18 +194,17 @@ ring if you can trigger auto-advance). The dark scrim over a paused frame looks 
 
 ## Scrobbling
 
-- **Trakt** (OAuth device flow) and **AniList** (GraphQL) scrobbling, both authorized in your
-  default browser, where your provider session already lives. For Trakt, Aura shows a short code
-  and a QR so you can approve from a phone; AniList comes back through a loopback callback on
-  Aura's local bridge. Signing in through an in app popup stays available as a fallback.
-- Cour aware anime mapping with absolute episode fallbacks, completion gates (80 percent plus real
+- **AniList** (anime) and **Simkl** (movies, series and anime) scrobbling, both authorized in your
+  default browser, where your provider session already lives, and both returning through a loopback
+  callback on Aura's local bridge. Signing in through an in app popup stays available as a fallback.
+- Cour aware anime mapping, completion gates (80 percent plus real
   elapsed time) to avoid false marks, proactive token refresh, and expiry alerts.
 - **Automatic scrobbling on by default**, with a separate toggle to turn it off if you would rather
   decide what gets recorded yourself, plus a master switch that silences all scrobble traffic.
-- **Manual scrobble from History**: every row has a Scrobble to Trakt button (and a Scrobble to
+- **Manual scrobble from History**: every row has a Scrobble to Simkl button (and a Scrobble to
   AniList button for anime) that pushes the play backdated to when you actually watched it, so a
   session where automatic scrobbling was off, or a title one service missed, can still be recorded
-  after the fact (Trakt to the exact watch time, AniList to the day).
+  after the fact (Simkl to the exact watch time, AniList to the day).
 - **Scrobble All and bulk scrobbling**: send your entire history at once, or select individual rows
   (or every play on a given date) and scrobble or remove them together. Runs are paced with backoff
   so a large history does not trip a service rate limit, keep going if you leave the History page, and
@@ -244,7 +243,7 @@ the left, and programme blocks across the timeline. Alternatively, capture the m
   <img src="docs/screenshots/live-tv.png" alt="Live TV program guide with now-line and channel grid" width="920">
 </p>
 
-## Watch Together
+## Watch Party
 
 - Create or join **synced watch parties** (shareable room codes, up to a dozen members) relayed
   through Cloudflare Workers and Durable Objects.
@@ -261,7 +260,7 @@ dots (and a crown on the host), the party media card, and ideally a couple of me
 can stage two clients, showing the "Make host" control on hover is a bonus.
 -->
 <p align="center">
-  <img src="docs/screenshots/watch-together.png" alt="Watch Together party panel with member roster and room code" width="344">
+  <img src="docs/screenshots/watch-together.png" alt="Watch Party panel with member roster and room code" width="344">
 </p>
 
 ## Stremio account and cloud sync

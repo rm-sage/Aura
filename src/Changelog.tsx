@@ -61,19 +61,21 @@ export default function Changelog({
       role="dialog"
       aria-modal="true"
       aria-label="Changelog"
-      className="aura-update-backdrop fixed inset-0 z-[60] flex items-center justify-center
-                 bg-black/60 backdrop-blur-md"
-      onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}
+      className="fixed inset-0 z-[60] flex items-center justify-center"
     >
+      {/* Dim + blur on a sibling layer, never the wrapper: an ancestor's
+          backdrop-filter (or fading opacity) would blind the card's glass.
+          A click on it is a click outside the card. */}
       <div
-        className="aura-update-card glass-panel-elevated rounded-2xl w-full max-w-[680px] mx-4
-                   shadow-glass-edge flex flex-col max-h-[82vh]"
-        // glass-panel-elevated's background is the per-theme ACCENT-tinted glass
-        // (--ln-glass-3), which made the whole changelog read as the accent
-        // colour. Override to a NEUTRAL frosted glass (the white-on-dark texture
-        // the neutral themes use) while keeping the blur + luminous rim, so the
-        // accent shows only in the headers, not the whole surface.
-        style={{ background: "rgba(255, 255, 255, 0.06)" }}
+        aria-hidden
+        className="aura-update-backdrop absolute inset-0 bg-black/60 backdrop-blur-md"
+        onClick={onClose}
+      />
+      <div
+        className="aura-update-card aura-float-glass relative rounded-2xl w-full max-w-[680px] mx-4
+                   flex flex-col max-h-[82vh]"
+        // The shared floating glass (neutral, never the per-theme accent tint of
+        // --ln-glass-3), so the accent shows only in the headers.
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
@@ -88,8 +90,8 @@ export default function Changelog({
             type="button"
             onClick={onClose}
             aria-label="Close"
-            className="flex items-center justify-center w-8 h-8 rounded-lg text-white/50
-                       hover:text-white hover:bg-white/8 transition-colors"
+            className="aura-glass-item flex items-center justify-center w-8 h-8 rounded-lg text-white/50
+                       hover:text-white"
           >
             <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
               <path d="M18.3 5.71 12 12l6.3 6.29-1.41 1.42L10.59 13.4 5.7 18.3l-1.42-1.42L9.17 12 4.29 5.71 5.7 4.29l4.89 4.88 4.88-4.88z" />
@@ -148,8 +150,7 @@ export default function Changelog({
               <button
                 type="button"
                 onClick={() => void loadMore()}
-                className="px-4 py-2 rounded-xl text-[12.5px] font-medium text-white/80
-                           bg-white/[0.05] border border-white/10 hover:bg-white/10 transition-colors"
+                className="aura-glass-flat aura-glass-press px-4 py-2 rounded-xl text-[12.5px] font-medium text-white/80"
               >
                 {error ? "Retry" : `View ${RELEASES_PAGE_SIZE} more`}
               </button>
@@ -162,8 +163,7 @@ export default function Changelog({
           <button
             type="button"
             onClick={() => openUrl("https://github.com/rm-sage/Aura/releases").catch(() => {})}
-            className="px-3 py-1.5 rounded-lg text-[11px] text-white/45 hover:text-white/75
-                       hover:bg-white/[0.04] transition-colors"
+            className="aura-glass-item px-3 py-1.5 rounded-lg text-[11px] text-white/45 hover:text-white/75"
           >
             All releases on GitHub
           </button>

@@ -3,7 +3,7 @@
 
 import {
   CONTINUITY_SOURCE, INTRODB_SINGLE_SOURCE, INTRODB_SOURCE, LAYER1_EARLY_SOURCE,
-  LAYER1_PROMPT_SOURCE, LAYER1_SOURCE, LAYER1_TRANSITION_SOURCE, PAIRING_SOURCE, isPromptOnly,
+  LAYER1_PROMPT_SOURCE, LAYER1_SOURCE, LAYER1_SWAP_SOURCE, LAYER1_TRANSITION_SOURCE, PAIRING_SOURCE, isPromptOnly,
   THEME_VERIFIED_MAX_SECONDS, skipConfidence, skipKindGroup, skipModeForKind,
   type SkipBasis, type SkipConfidence, type SkipHold, type SkipModes,
 } from "./skipWindows";
@@ -17,6 +17,7 @@ export function skipSourceLabel(source: string): string {
     case LAYER1_PROMPT_SOURCE:  return "Theme match (over story in some versions)";
     case LAYER1_TRANSITION_SOURCE: return "Theme match (starts in story)";
     case LAYER1_EARLY_SOURCE:   return "Theme match (confirming)";
+    case LAYER1_SWAP_SOURCE:    return "Theme match (song from the other end)";
     case PAIRING_SOURCE:        return "Other episodes (audio)";
     case CONTINUITY_SOURCE:     return "Detected";
     case "aniskip":             return "AniSkip";
@@ -41,6 +42,7 @@ export function skipSourceHint(source: string): string {
     case LAYER1_PROMPT_SOURCE:  return "Theme song found, but some versions play it over story scenes";
     case LAYER1_TRANSITION_SOURCE: return "Ending song found; it starts while the story is still playing";
     case LAYER1_EARLY_SOURCE:   return "The theme song's start matched; the rest is still being checked";
+    case LAYER1_SWAP_SOURCE:    return "The opening song found at the end, or the ending song at the start";
     case PAIRING_SOURCE:        return "Matched against other episodes' audio";
     case CONTINUITY_SOURCE:     return "Guessed from this episode's audio";
     case "aniskip":             return "Community timings from AniSkip";
@@ -115,6 +117,11 @@ export function skipPromptOnlyReason(w: SkipWindowLike): SkipPromptOnlyReason | 
       return {
         hint: "The ending song starts while the story is still playing, so it asks first",
         line: "the ending song starts while the story is still playing",
+      };
+    case LAYER1_SWAP_SOURCE:
+      return {
+        hint: "This song usually plays at the other end of the episode, so it asks first",
+        line: "this song usually plays at the other end of the episode",
       };
     case LAYER1_EARLY_SOURCE:
       return {
@@ -212,6 +219,9 @@ export function skipConfidenceNote(w: SkipWindowLike): string | null {
     case "theme-partial":    return `Matched the ${song}, which plays over story scenes in some versions`;
     case "theme-transition": return "The song starts while the story is still playing: skipping from its start may cut into the story";
     case "theme-early":      return "The opening song's start matched; still confirming the rest";
+    case "theme-swapped":    return g === "ed"
+      ? "Matched the opening song where the ending would be: it can play over the story too"
+      : "Matched the ending song where the opening would be: it can play over the story too";
     case "chapter":
       if (g === "op") {
         return len >= 20 && len <= 100

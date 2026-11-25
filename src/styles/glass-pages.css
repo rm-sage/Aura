@@ -1,0 +1,363 @@
+/* Aura - (c) 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice. */
+/* SPDX-License-Identifier: AGPL-3.0-or-later */
+
+/* IN-PAGE SHEETS AND PAGES (round 11): the A look carried onto every page
+   outside Home and the detail page (Settings, Library, Queue, Airing,
+   Discover, Catalog, Search, History, Calendar, Live TV, Addons, Login,
+   Landing, Onboarding). Loaded after App.css (main.tsx) and unlayered, so a
+   rule here beats App.css `@layer components` rules (`.glass-panel`,
+   `.cal-today`) and wins ties with the GLASS SYSTEM block on order.
+   frontend-ui.md "In-page sheets and pages". Never edit App.css for these. */
+
+/* ---- The sheet ------------------------------------------------------- */
+/* An in-page section or card ON a page (not over art): the A control face
+   with NO backdrop pass. Markup comes from glassSheet.ts `sheet()`:
+   `aura-float-glass aura-glass-control aura-glass-sheet` +
+   data-liquid="off" (liquidGlass skips it: no lens) +
+   data-glass-light="panel" (the cursor light's panel tier).
+   Why no backdrop: behind a page there is only Mica (already blurred by DWM)
+   or the ambient sweep (already soft), so a 20 px blur changes almost
+   nothing, while a backdrop-filter over the animated sweep re-filters every
+   frame and every scroll frame (the Calendar alone had about 44 passes).
+   It inherits the rest for free: the idle rim (Liquid floating glass), the
+   lit rim and interior light, the zero-blur themes' opaque rule
+   (`--ln-panel-solid`, higher specificity than these rules), the High
+   Contrast 0.35 edge (!important) and the paint rule. */
+html[data-glass] .aura-float-glass.aura-glass-sheet {
+  --lg-backdrop: none;
+}
+/* Liquid: never lifts on hover (like the rail); the cursor light is the
+   feedback. Same specificity as App.css's control hover rule, later. */
+html[data-glass="liquid"] .aura-glass-sheet:hover { --lg-lift: 0; }
+/* Liquid drop: softer than a floating control's, because sheets stack down
+   a page. Three entries, the --lg-drop-liquid shape. */
+html[data-glass="liquid"] .aura-glass-control.aura-glass-sheet {
+  --lg-drop:
+    0 1px 2px rgb(0 0 0 / 0.30),
+    0 12px 32px -6px rgb(0 0 0 / 0.45),
+    0 0 0 rgb(0 0 0 / 0);
+}
+/* Frosted: a FLAT face (no vertical gradient: a large unblurred gradient
+   bands at 8 bits) a touch lighter than the page, and a short drop. */
+html:not([data-glass="liquid"]) .aura-glass-sheet {
+  --lg-face:
+    linear-gradient(rgb(255 255 255 / 0.035), rgb(255 255 255 / 0.035)),
+    linear-gradient(rgb(10 12 16 / 0.22), rgb(10 12 16 / 0.22));
+  --lg-drop: 0 8px 24px -10px rgb(0 0 0 / 0.5);
+}
+/* PERFORMANCE (round 12): the cursor light on a sheet is drawn on an
+   OVERLAY, a `::after` in its own compositing layer, never in the sheet's
+   own background. A lit surface repaints on every pointer frame, and a
+   sheet's background repaint re-rasters everything the sheet holds (a
+   Settings section: every row's text and control). On its own layer only
+   the light re-rasters. In-page A/B on Settings at 2575 x 1038 with every
+   round 12 light fix in (frontend-ui.md "Round 12" table): pointer moving
+   over the rows 103 to 219 fps (moving slowly 133 to 234).
+   While lit (and fading) the sheet's own ring, interior light and border
+   are empty and the overlay (the border box: inset -1px, the radius
+   inherited) draws them in the sheet's order (the idle and lit rim, the
+   interior image, then the border over them) from the light's per-element
+   tokens, which are registered NON-INHERITING, so the overlay inherits them
+   explicitly. It sits ABOVE the sheet's content (no stacking
+   context on the sheet: a Settings section holds `fixed` z-[200] dialogs
+   that a stacking context would trap under the next section); the light
+   there is the faint interior wash (Surface glow 25%: under 1% white) and
+   the hairline rim at the edge, which no content touches. The wash is CAPPED
+   at the round 11 strength (Surface glow 100%, a 3.5% peak: the cross-fade
+   amount is divided by max(1, Surface glow)), so a Surface glow up to 250%
+   never lays a bright film over the rows' text and controls; from 0 to
+   100% the slider acts on sheets as everywhere else. A sheet needs a
+   containing block for it, so every sheet is `relative` (no layout change
+   for a static box; the sheets' absolute children already sit in their own
+   relative wrappers). Not on the scrolling sheets (the Settings TOC, the Live
+   TV group rail): an absolute overlay would scroll with their content. */
+html[data-glass] .aura-glass-sheet:not(.aura-toc-scroll, .aura-live-rail, .absolute, .fixed, .sticky) {
+  position: relative;
+}
+@supports (background-image: paint(aura-rim)) and (background-image: -webkit-cross-fade(linear-gradient(#000, #000), linear-gradient(#000, #000), 50%)) {
+  html[data-glass] .aura-glass-sheet:not(.aura-toc-scroll, .aura-live-rail)[data-glint-lit] {
+    --lg-rim-layer: linear-gradient(transparent, transparent);
+    --lg-glint: linear-gradient(transparent, transparent);
+    /* The overlay paints the border, OVER its rim, as the sheet did (the
+       Liquid face ring darkens the rim's outer pixel, 0.55 black at the
+       bottom): drawn twice, or the rim above it, the corners read
+       brighter and bluer. */
+    border-color: transparent;
+  }
+  html[data-glass] .aura-glass-sheet:not(.aura-toc-scroll, .aura-live-rail)[data-glint-lit]::after {
+    content: "";
+    position: absolute;
+    inset: -1px;
+    border-radius: inherit;
+    border-width: 1px;
+    border-style: solid;
+    border-color: var(--lg-border-c);
+    pointer-events: none;
+    will-change: transform;
+    --gx: inherit;
+    --gy: inherit;
+    --gnx: inherit;
+    --gny: inherit;
+    --gw: inherit;
+    --gh: inherit;
+    --lg-glint-a: inherit;
+    --lg-glint-img: inherit;
+    --lg-idle-tl: inherit;
+    --lg-idle-mid: inherit;
+    --lg-idle-br: inherit;
+    background:
+      paint(aura-rim) border-box,
+      -webkit-cross-fade(linear-gradient(transparent, transparent), var(--lg-glint-img), calc(var(--lg-glint-a) * 100% / max(1, var(--lg-glow-surface-k, 0.25))))
+        calc(var(--gx) - var(--gw)) calc(var(--gy) - var(--gh)) / calc(var(--gw) * 2) calc(var(--gh) * 2) no-repeat;
+  }
+}
+/* An error state: a faint red hairline (semantic, not the accent). */
+.aura-glass-sheet.is-danger {
+  --lg-ring: inset 0 0 0 1px rgb(251 113 133 / 0.22);
+}
+
+/* Legibility on a sheet (round 11 review): dim text was still white 0.35 in
+   places (every Settings row description, empty states), 3.0:1 on the face.
+   Floored in two tiers so a hierarchy survives: /30 to /40 at white 0.56
+   (about 5:1), /45 and /50 at 0.64. `:where` keeps the utility's own
+   specificity, so hover / group-hover colours still win. Decorative
+   separators (/20, /25) keep their value. The same floor as the Detail
+   panels (glass-detail.css). The onboarding wizard's step groups
+   (`.aura-content-panel`: StepGroup and the addon cards, OnboardingView only) take it too. */
+:is(.aura-glass-sheet, .aura-content-panel) :where(.text-white\/30, .text-white\/35, .text-white\/40) {
+  color: rgb(255 255 255 / 0.56);
+}
+:is(.aura-glass-sheet, .aura-content-panel) :where(.text-white\/45, .text-white\/50) {
+  color: rgb(255 255 255 / 0.64);
+}
+
+/* ---- Rows on a sheet --------------------------------------------------- */
+/* CONTENT rows with ONE sliding droplet per list (useListDroplet with
+   ".aura-sheet-row"; the droplet `.aura-glass-hl.aura-sheet-hl` is the
+   list's FIRST child, the list is position: relative). Never per-row glass.
+   Positioned, so they paint over the absolute droplet. */
+.aura-sheet-row {
+  position: relative;
+  border-radius: 10px;
+  transition: color 150ms ease, background-color 150ms ease;
+}
+.aura-sheet-row:focus-visible { outline: 1px solid rgb(255 255 255 / 0.32); outline-offset: -1px; }
+/* The droplet: the rail's faint fill (white 0.035 to 0.02), no rim, no
+   meniscus, full width of the list. */
+.aura-glass-hl.aura-sheet-hl {
+  left: 0;
+  right: 0;
+  border-radius: 10px;
+}
+html[data-glass="liquid"] .aura-glass-hl.aura-sheet-hl {
+  background: linear-gradient(rgb(255 255 255 / 0.035), rgb(255 255 255 / 0.02));
+  box-shadow: none;
+}
+/* Full width, so it grows in HEIGHT only (round 12): the shared grow from
+   scale 0.94 on the bouncy spring overshot the list's width for a few frames
+   (about 1 px each side). In the Settings TOC, a scroller with only
+   overflow-y set (x computes to auto), that flashed a horizontal scrollbar
+   on hover. */
+html[data-glass="liquid"] .aura-glass-hl.aura-sheet-hl:not(.is-on) { scale: 1 0.8; }
+/* The Settings TOC scrollers (the sheet aside and its inner list): vertical
+   scroll only, so nothing (a droplet overshoot, a long label) can ever raise
+   a horizontal scrollbar. `hidden`, not `clip`: beside overflow-y auto a
+   clip computes to hidden anyway. Focus outlines sit inside the rows
+   (offset -1 px), so nothing visible is cut. */
+.aura-toc-scroll { overflow-x: hidden; }
+/* Frosted rows keep a hover fill (the droplet is Liquid only). */
+html:not([data-glass="liquid"]) .aura-sheet-row:not(.is-selected):hover {
+  background-color: rgb(255 255 255 / 0.06);
+}
+/* Selected: the rail pill face. Liquid: white 0.075 and a soft drop (the
+   inner glow is at zero alpha since round 17, glass-rail.css), NO accent
+   fill, ring or glow; the label takes the accent 34% into
+   white. The row carries data-glass-light="rim" while selected, so the ring
+   layer comes FIRST in its background (the cursor light's contract). */
+html[data-glass="liquid"] .aura-sheet-row.is-selected {
+  background: var(--lg-rim-layer), rgb(255 255 255 / 0.075);
+  box-shadow:
+    inset 0 0 12px rgb(255 255 255 / 0),
+    0 2px 8px rgb(0 0 0 / 0.28);
+  color: color-mix(in srgb, rgb(var(--ln-accent-rgb)) 34%, white);
+  font-weight: 500;
+  --lg-idle-tl: 0.30;
+  --lg-idle-mid: 0.04;
+  --lg-idle-br: 0.16;
+}
+/* Frosted: the style A accent wash and inset hairline; the label in the
+   accent MARK text (a dark custom accent still reads on the dark sheet). */
+html:not([data-glass="liquid"]) .aura-sheet-row.is-selected {
+  background: var(--lg-rim-layer), rgb(var(--ln-accent-rgb) / 0.12);
+  box-shadow: inset 0 0 0 1px rgb(var(--ln-accent-rgb) / 0.30);
+  color: var(--ln-accent-mark-text);
+  font-weight: 500;
+}
+html:is([data-theme="contrast"], [data-theme="contrast-azure"]) .aura-sheet-row.is-selected {
+  box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.35);
+}
+
+/* Live TV's group rail: the Favorites row keeps its amber label (selected
+   too) and a hairline under it. */
+.aura-sheet-row.is-fav { margin-bottom: 9px; }
+.aura-sheet-row.is-fav::after {
+  content: "";
+  position: absolute;
+  left: 10px;
+  right: 10px;
+  bottom: -5px;
+  height: 1px;
+  background: rgb(255 255 255 / 0.09);
+  pointer-events: none;
+}
+.aura-sheet-row.is-fav.is-selected { color: rgb(252 211 77); }
+
+/* ---- A list of content rows inside one sheet (Addons) ------------------ */
+/* One sheet holds the rows; 1 px white hairlines between them, hidden next to
+   a hovered one; a faint hover fill in both materials (no droplet: dnd-kit's
+   transforms would desync it). */
+.aura-sheet-list > .aura-content-row + .aura-content-row::before {
+  content: "";
+  position: absolute;
+  left: 14px;
+  right: 14px;
+  top: 0;
+  height: 1px;
+  background: rgb(255 255 255 / 0.07);
+  pointer-events: none;
+  transition: opacity 150ms ease;
+}
+.aura-sheet-list > .aura-content-row:is(:hover, .is-dragging)::before,
+.aura-sheet-list > .aura-content-row:is(:hover, .is-dragging) + .aura-content-row::before { opacity: 0; }
+.aura-sheet-list > .aura-content-row:not(.is-dragging):hover { background-color: rgb(255 255 255 / 0.04); }
+
+/* ---- Content cards and panels ----------------------------------------- */
+/* A card on a page that is CONTENT, never glass (History entries, Calendar
+   day-overlay cards, Live TV channels): a faint white fill, a quiet hover
+   fill, no border. Selected (History) = the rail pill face, as above. */
+.aura-content-card {
+  position: relative;
+  background-color: rgb(255 255 255 / 0.03);
+  transition: background-color 150ms ease, color 150ms ease;
+}
+.aura-content-card.is-live:hover { background-color: rgb(255 255 255 / 0.06); }
+.aura-content-card:focus-visible { outline: 1px solid rgb(255 255 255 / 0.32); outline-offset: -1px; }
+html[data-glass="liquid"] .aura-content-card.is-selected {
+  background-color: rgb(255 255 255 / 0.075);
+  box-shadow:
+    inset 0 0 12px rgb(255 255 255 / 0),
+    inset 0 0 0 1px rgb(255 255 255 / 0.10),
+    0 2px 8px rgb(0 0 0 / 0.28);
+}
+html:not([data-glass="liquid"]) .aura-content-card.is-selected {
+  background-color: rgb(var(--ln-accent-rgb) / 0.10);
+  box-shadow: inset 0 0 0 1px rgb(var(--ln-accent-rgb) / 0.55);
+}
+.aura-content-card.is-selected .aura-poster-title {
+  color: color-mix(in srgb, rgb(var(--ln-accent-rgb)) 34%, white);
+}
+html:is([data-theme="contrast"], [data-theme="contrast-azure"]) .aura-content-card {
+  box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.22);
+}
+html:is([data-theme="contrast"], [data-theme="contrast-azure"]) .aura-content-card.is-selected {
+  box-shadow: inset 0 0 0 2px rgb(255 255 255 / 0.6);
+}
+/* Live TV channel art: a static hairline, NOT a cursor-lit bezel (up to 400
+   cards mount at once, and every [data-glass-light] is a light-registry
+   candidate re-measured after each scroll). */
+.aura-live-channel {
+  box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.07);
+}
+
+/* A grouped box inside a glass card (Onboarding's sections and addon
+   cards): the content-group look (no glass on glass). */
+.aura-content-panel {
+  background: var(--ln-glass-1, rgb(255 255 255 / 0.04));
+  box-shadow: inset 0 0 0 1px var(--ln-rim-subtle, rgb(255 255 255 / 0.06));
+}
+
+/* ---- Poster grids (Library, Queue, Discover, Catalog, Airing) ---------- */
+/* The hovered card's title takes the rail's active label colour, as on the
+   Home cards (glass-cards.css .aura-card-title). Frozen while a user-driven
+   scroll carries cards under the pointer, unless the card was already
+   hovered (data-hover-held). */
+.aura-poster-title { transition: color 200ms ease; }
+:is(.aura-lib-card, .aura-poster-card, .aura-content-card.is-live):hover .aura-poster-title {
+  color: color-mix(in srgb, rgb(var(--ln-accent-rgb)) 34%, white);
+}
+html[data-aura-scrolling] :is(.aura-lib-card, .aura-poster-card, .aura-content-card):not([data-hover-held]):hover .aura-poster-title {
+  color: rgb(255 255 255 / 0.85);
+  transition: none;
+}
+:is(.aura-content-card).is-selected:hover .aura-poster-title,
+html[data-aura-scrolling] .aura-content-card.is-selected .aura-poster-title {
+  color: color-mix(in srgb, rgb(var(--ln-accent-rgb)) 34%, white);
+}
+
+/* FAUX frost on art outside Home's row virtualization (no backdrop pass):
+   the hardware-acceleration-off recipe of glass-cards.css, scoped. Real frost
+   is a 12 px backdrop pass per badge; these grids mount 80+ cards, and the
+   Airing grid (ContinueWatchingCard, 2 to 3 frost elements each) is not
+   virtualized at all. */
+:is(.aura-lib-grid, .aura-poster-grid, .aura-airing-grid) .aura-frost {
+  background: var(--lg-rim-layer), rgb(26 29 38 / 0.66);
+  border-color: rgb(255 255 255 / 0.13);
+  box-shadow: inset 0 0 8px rgb(255 255 255 / 0.03);
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+}
+:is(.aura-lib-grid, .aura-poster-grid, .aura-airing-grid) .aura-frost.aura-frost-btn:hover {
+  background: var(--lg-rim-layer), rgb(26 29 38 / 0.82);
+}
+/* A remove button: a faint red wash under the pointer (was rose 0.4 on a
+   black 0.7 disc). */
+:is(.aura-lib-grid, .aura-poster-grid) .aura-frost.aura-frost-btn.is-remove:hover {
+  background: var(--lg-rim-layer), linear-gradient(rgb(244 63 94 / 0.32), rgb(244 63 94 / 0.32)), rgb(26 29 38 / 0.82);
+  border-color: rgb(253 164 175 / 0.45);
+}
+
+/* ---- Calendar ---------------------------------------------------------- */
+/* Day cells are sheets (`is-cell`, radius 14): zero backdrop passes where
+   every cell was a `.glass-panel` blur. Hover is a small lift, never a scale
+   (it scaled the date and badge text) or an accent ring. */
+html[data-glass] .aura-glass-sheet.is-cell {
+  --lg-drop: 0 1px 2px rgb(0 0 0 / 0.22), 0 6px 16px -8px rgb(0 0 0 / 0.35), 0 0 0 rgb(0 0 0 / 0);
+  transition: --lg-lift 160ms ease;
+}
+html[data-glass] .aura-glass-sheet.is-cell.is-live:hover { --lg-lift: 0.035; }
+.aura-glass-sheet.is-cell.is-dim { opacity: 0.45; }
+/* Today: the selected face (a brighter raised face with a faint white inner
+   hairline) and the day number on an accent-MARK disc with mark ink. No
+   accent ring, no glow, no violet bloom (the old `.cal-today`: a large soft
+   unblurred glow that banded). */
+html[data-glass] .aura-glass-sheet.is-cell.is-today {
+  --lg-lift: 0.05;
+  --lg-ring: inset 0 0 0 1px rgb(255 255 255 / 0.12);
+}
+html[data-glass] .aura-glass-sheet.is-cell.is-today.is-live:hover { --lg-lift: 0.07; }
+html:not([data-glass="liquid"]) .aura-glass-sheet.is-cell.is-today {
+  --lg-deco: linear-gradient(rgb(var(--ln-accent-rgb) / 0.10), rgb(var(--ln-accent-rgb) / 0.10));
+  --lg-ring: inset 0 0 0 1px rgb(var(--ln-accent-rgb) / 0.35);
+}
+.aura-cal-today-num {
+  background: var(--ln-accent-mark);
+  color: rgb(var(--ln-accent-mark-ink-rgb));
+}
+/* A mono count chip on a mark wash (the notifications sheet's "N new"). */
+.aura-mark-chip {
+  border-radius: 999px;
+  color: var(--ln-accent-mark-text);
+  background: color-mix(in srgb, var(--ln-accent-mark) 16%, transparent);
+}
+
+/* ---- History ----------------------------------------------------------- */
+/* The sticky bar's selection-mode wash: Liquid has no accent border (the
+   Liquid selection rule), only a faint accent-mark wash; Frosted keeps its
+   accent border. */
+.aura-history-select-wash {
+  background: color-mix(in srgb, var(--ln-accent-mark) 6%, transparent);
+}
+html:not([data-glass="liquid"]) .aura-history-select-wash {
+  background: rgb(var(--ln-accent-rgb) / 0.10);
+  box-shadow: inset 0 0 0 1px rgb(var(--ln-accent-rgb) / 0.45);
+}

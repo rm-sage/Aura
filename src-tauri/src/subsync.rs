@@ -150,7 +150,7 @@ fn client() -> &'static reqwest::Client {
             .tcp_keepalive(Duration::from_secs(60))
             .pool_max_idle_per_host(1)
             .pool_idle_timeout(Duration::from_secs(30))
-            .user_agent("Aura subsync")
+            .user_agent(concat!("Aura/", env!("CARGO_PKG_VERSION"), " subsync"))
             .build()
             .expect("subsync HTTP client init failed")
     })

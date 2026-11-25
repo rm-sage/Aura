@@ -10,11 +10,16 @@ import { isWindowHidden } from "./windowVisibility";
 import { loadAuraSettings, saveAuraSettings } from "./auraSettings";
 import { getRelayUrl } from "./watchTogether/store";
 import { openExternalUrl } from "./externalUrl";
-import { SIDE_PILL_TOP_PX } from "./SidePill";
+import { CHROME_TOP_PX } from "./railLayout";
+import { addonHints, useAddonHintsFor } from "./addonHints";
+import {
+  nestedAge, nestedCategory, nestedFailureExplanation, nestedFailureSuffix, nestedRecentFailure,
+  type NestedLastRequest, type NestedReportClock,
+} from "./nestedAddonStatus";
 import {
   closeDownloadsPanel,
-  isPlayerActive,
   keepPanelKeysFromPlayer,
+  usePlayerActive,
   useDownloadsPanelPhase,
 } from "./downloadsPanel";
 import {
@@ -37,8 +42,12 @@ import {
 //
 //   • Aura's server (aura.animasec.dev /healthz: OAuth, Aura Cloud, releases)
 //   • Aura Cloud sync (the old chip's `sync_status` logic, unchanged)
-//   • the Watch Together relay
-//   • every installed addon (its manifest, timed; slow = degraded)
+//   • the Watch Party relay
+//   • every installed addon (its manifest, timed; slow = degraded), and for an
+//     addon that wraps others and declares `behaviorHints.addonStatus` (the
+//     rm-sage AIOStreams fork), the addons inside it, as checked by the wrapper
+//     from its own server (contract:
+//     docs/superpowers/specs/2026-11-15-aiostreams-nested-addon-status.md)
 //   • the debrid providers the user chose to monitor (their own status feed,
 //     from a fixed table in Rust: src-tauri/src/service_status.rs)
 //
@@ -88,6 +97,28 @@ interface Probe {
   not_running?: boolean;
   /** The probe went to this machine (an addon or relay on a loopback address). */
   loopback?: boolean;
+  /** The addons this one wraps, when it declares `addonStatus` and was asked. */
+  nested?: NestedReport;
+}
+
+interface NestedReport extends NestedReportClock {
+  /** Unix ms the wrapper ran its probes (it caches them 60 s), on ITS clock. */
+  checked_at: number | null;
+  addons: NestedProbe[];
+  /** The report could not be read; `addons` is then empty. */
+  error: string | null;
+}
+
+interface NestedProbe {
+  name: string;
+  /** "skipped": the wrapper never requested it (disabled, misconfigured). */
+  state: "ok" | "down" | "skipped";
+  http_status: number | null;
+  /** Time to the wrapped addon's response headers, measured by the wrapper. */
+  latency_ms: number | null;
+  error: string | null;
+  /** The wrapper's latest REAL request to this addon, when it keeps one. */
+  last_request: NestedLastRequest | null;
 }
 
 type ProviderState =
@@ -215,6 +246,47 @@ function probeLevel(p: Probe | null | undefined): Level {
   if (!p.ok) return "down";
   if (p.latency_ms != null && p.latency_ms > SLOW_MS) return "warn";
   return "ok";
+}
+
+function nestedLevel(n: NestedProbe, now: number, clock: NestedReportClock): Level {
+  // Never requested on purpose: nothing to judge, like a stopped local addon.
+  if (n.state === "skipped") return "idle";
+  if (n.state === "down") return "down";
+  if (nestedRecentFailure(n.last_request, now, clock)) return "warn";
+  if (n.latency_ms != null && n.latency_ms > SLOW_MS) return "warn";
+  return "ok";
+}
+
+function nestedDetail(n: NestedProbe, now: number, clock: NestedReportClock): string {
+  if (n.state === "skipped") return n.error ? `Skipped: ${nestedCategory(n.error)}` : "Skipped";
+  if (n.state === "down") {
+    return n.http_status != null ? `Error, HTTP ${n.http_status}` : `Not answering (${nestedCategory(n.error) ?? "failed"})`;
+  }
+  const lat = formatLatency(n.latency_ms);
+  const word = n.latency_ms != null && n.latency_ms > SLOW_MS ? "Slow" : "OK";
+  const base = lat ? `${word}, ${lat} response` : word;
+  const l = n.last_request;
+  return l && nestedRecentFailure(l, now, clock) ? base + nestedFailureSuffix(l) : base;
+}
+
+function nestedHint(n: NestedProbe, wrapper: string, clock: NestedReportClock, now: number): string[] {
+  const out: string[] = [];
+  // Ages are read on the wrapper's clock (`nestedAge`): the two machines'
+  // clocks need not agree.
+  const ago = (at: number) => formatAgo(nestedAge(at, now, clock));
+  const when = clock.checked_at != null ? ` ${ago(clock.checked_at)}` : "";
+  out.push(`Checked by ${wrapper} from its server${when}, not from this machine`);
+  if (n.latency_ms != null) out.push(`Response ${formatLatency(n.latency_ms)}: time to its manifest's answer, from ${wrapper}`);
+  const l = n.last_request;
+  if (l && l.at != null) {
+    const what = l.resource ? `${l.resource} request` : "request";
+    out.push(l.ok
+      ? `Last ${what} answered ${ago(l.at)}`
+      : `Last ${what} failed ${ago(l.at)}${l.error ? ` (${nestedCategory(l.error)})` : ""}`);
+    const why = nestedFailureExplanation(l);
+    if (why && nestedRecentFailure(l, now, clock)) out.push(why);
+  }
+  return out;
 }
 
 function providerLevel(r: ProviderReport | undefined): Level {
@@ -360,6 +432,16 @@ function checkableAddonUrls(): string[] {
     .slice(0, MAX_ADDONS);
 }
 
+/** Does this addon's live manifest say it reports the addons it wraps? */
+function wantsNested(url: string): boolean {
+  return addonHints(url)?.addon_status === true;
+}
+
+/** Indexes into `urls` to ask Rust for a nested report on. */
+function nestedIndexes(urls: string[]): number[] {
+  return urls.flatMap((u, i) => (wantsNested(u) ? [i] : []));
+}
+
 /** Merge a reply against the list as it stands NOW: an addon removed meanwhile
  *  goes, and an answer that arrived from another check stays. */
 function mergeAddonProbes(
@@ -391,7 +473,7 @@ async function runFullCheck(): Promise<void> {
   const providers = loadAuraSettings().monitoredProviders;
   try {
     const r = await invoke<CheckReply>("service_status", {
-      action: { op: "check", aura: true, relay, addons: urls, providers },
+      action: { op: "check", aura: true, relay, addons: urls, nested: nestedIndexes(urls), providers },
     });
     for (const u of urls) addonUrlsAsked.delete(u);
     // MERGE providers against the list as it stands NOW, not the one this
@@ -451,15 +533,21 @@ async function runProviderCheck(ids: string[]): Promise<void> {
 
 /** Addons only, for urls the list gained after a check read it. Probes just
  *  those: a full round per list change would break the "never more often than
- *  the poll" rule for every other addon, and this leaves the poll's clock alone. */
+ *  the poll" rule for every other addon, and this leaves the poll's clock alone.
+ *  An addon whose `addonStatus` hint landed after its last probe counts as new
+ *  once, so its wrapped addons show without waiting for the poll. */
 async function probeNewAddons(): Promise<void> {
   const known = serviceState.svc.addons;
-  const fresh = checkableAddonUrls().filter((u) => !known.has(u) && !addonUrlsAsked.has(u));
+  const fresh = checkableAddonUrls().filter((u) => {
+    if (addonUrlsAsked.has(u)) return false;
+    const p = known.get(u);
+    return !p || (wantsNested(u) && p.nested === undefined);
+  });
   if (fresh.length === 0) return;
   for (const u of fresh) addonUrlsAsked.add(u);
   try {
     const r = await invoke<CheckReply>("service_status", {
-      action: { op: "check", aura: false, relay: null, addons: fresh, providers: [] },
+      action: { op: "check", aura: false, relay: null, addons: fresh, nested: nestedIndexes(fresh), providers: [] },
     });
     for (const u of fresh) addonUrlsAsked.delete(u);
     updateSvc((s) => ({ ...s, addons: mergeAddonProbes(s.addons, fresh, r.addons) }));
@@ -510,6 +598,10 @@ export default function ServiceStatusChip() {
   const providersRef = useRef(svc.providers);
   providersRef.current = svc.providers;
   const { addons, settled } = useStatusAddons();
+  // The live manifest hints of every addon, for `addonStatus`. A hint that
+  // lands moves `hintsVersion`, which re-runs the new-addon probe below.
+  const addonUrls = useMemo(() => addons.map((a) => a.url).filter(isCheckable), [addons]);
+  const hintsVersion = useAddonHintsFor(addonUrls);
 
   // A finished check moves the relative readouts at once, not at the next tick.
   useEffect(() => {
@@ -595,7 +687,7 @@ export default function ServiceStatusChip() {
       if (!isWindowHidden()) void probeNewAddons();
     }, NEW_ADDON_DEBOUNCE_MS);
     return () => window.clearTimeout(id);
-  }, [addons]);
+  }, [addons, hintsVersion]);
 
   // The chip is invisible while minimized, so everything pauses there, and
   // `runOnResume` snaps each one current on the way back in.
@@ -650,12 +742,24 @@ export default function ServiceStatusChip() {
     if (syncLv === "down") out.push({ level: syncLv, text: "Cloud sync check failed" });
     else if (syncLv === "warn") out.push({ level: syncLv, text: "Cloud sync idle for over a week" });
     const relayLv = probeLevel(svc.relay);
-    if (relayLv === "down") out.push({ level: relayLv, text: "Watch Together relay unreachable" });
-    else if (relayLv === "warn") out.push({ level: relayLv, text: "Watch Together relay slow" });
+    if (relayLv === "down") out.push({ level: relayLv, text: "Watch Party relay unreachable" });
+    else if (relayLv === "warn") out.push({ level: relayLv, text: "Watch Party relay slow" });
     for (const a of addons) {
-      const lv = probeLevel(svc.addons.get(a.url));
+      const p = svc.addons.get(a.url);
+      const lv = probeLevel(p);
       if (lv === "down") out.push({ level: lv, text: `${a.name}: not answering` });
       else if (lv === "warn") out.push({ level: lv, text: `${a.name}: slow` });
+      // A wrapped addon that is down degrades its wrapper, it does not take it
+      // down: the wrapper skips it and serves the rest. Not judged while the
+      // wrapper itself is down (its report then says nothing new).
+      if (lv === "down" || !p?.nested) continue;
+      for (const n of p.nested.addons) {
+        const nl = nestedLevel(n, tickNow, p.nested);
+        if (nl === "down") out.push({ level: "warn", text: `${n.name} (in ${a.name}): not answering` });
+        else if (nl === "warn") {
+          out.push({ level: "warn", text: `${n.name} (in ${a.name}): ${nestedRecentFailure(n.last_request, tickNow, p.nested) ? "last request failed" : "slow"}` });
+        }
+      }
     }
     for (const def of monitoredDefs) {
       const r = svc.providers[def.id];
@@ -664,7 +768,7 @@ export default function ServiceStatusChip() {
     }
     // Worst first, so the tooltip leads with what matters.
     return out.sort((a, b) => RANK[b.level] - RANK[a.level]);
-  }, [svc, syncState, addons, monitoredDefs]);
+  }, [svc, syncState, addons, monitoredDefs, tickNow]);
 
   const anyOk = useMemo(() => {
     if (probeLevel(svc.aura) === "ok" || probeLevel(svc.relay) === "ok" || syncState === "ok") return true;
@@ -822,7 +926,7 @@ export default function ServiceStatusChip() {
 
   // Settings cannot open during playback: the page would switch under the
   // player and the detail page the user came from would be closed.
-  const inPlayback = isPlayerActive();
+  const inPlayback = usePlayerActive(phase !== "closed");
 
   const openSettingsCloudSync = () => {
     closePanel();
@@ -891,7 +995,7 @@ export default function ServiceStatusChip() {
             "rounded-2xl overflow-hidden",
             phase === "closing" ? "aura-dl-panel-out pointer-events-none" : "aura-dl-panel-in",
           ].join(" ")}
-          style={{ top: SIDE_PILL_TOP_PX, left: anchorLeft }}
+          style={{ top: CHROME_TOP_PX, left: anchorLeft }}
           // Never reaches the player's window-level volume wheel. The list
           // still scrolls: this stops propagation, not the default.
           onWheel={(e) => e.stopPropagation()}
@@ -929,8 +1033,8 @@ export default function ServiceStatusChip() {
                 onClick={() => { if (!checking) { void refreshSync(); void runFullCheck(); } }}
                 aria-disabled={checking}
                 aria-label="Check again"
-                className={`w-7 h-7 flex items-center justify-center rounded-md text-white/55
-                           hover:text-white hover:bg-white/10 transition-colors${checking ? " opacity-40" : ""}`}
+                className={`aura-glass-item w-7 h-7 flex items-center justify-center rounded-md text-white/55
+                           hover:text-white${checking ? " opacity-40" : ""}`}
               >
                 <RefreshIcon spinning={checking && !readReducedMotion()} />
               </button>
@@ -955,7 +1059,7 @@ export default function ServiceStatusChip() {
               {relayUrl && (
                 <Row
                   level={probeLevel(svc.relay)}
-                  label="Watch Together relay"
+                  label="Watch Party relay"
                   detail={`${addonHost(relayUrl)} · ${probeDetail(svc.relay, checking)}`}
                   hint={latencyLines(svc.relay)}
                 />
@@ -980,8 +1084,8 @@ export default function ServiceStatusChip() {
                     // The accessible name starts with the visible word (WCAG
                     // 2.5.3), so a voice-control "click Edit" finds it.
                     aria-label={editingProviders ? "Done choosing providers" : "Edit monitored providers"}
-                    className="text-[10.5px] font-medium px-1.5 py-0.5 rounded-md text-white/50
-                               hover:text-white hover:bg-white/10 transition-colors"
+                    className="aura-glass-item text-[10.5px] font-medium px-1.5 py-0.5 rounded-md text-white/50
+                               hover:text-white"
                   >
                     {editingProviders ? "Done" : "Edit"}
                   </button>
@@ -1008,7 +1112,7 @@ export default function ServiceStatusChip() {
                       />
                     );
                   })}
-                  <p className="px-2 pt-1 pb-0.5 text-[10.5px] leading-snug text-white/40">
+                  <p className="px-2 pt-1 pb-0.5 text-[10.5px] leading-snug text-white/55">
                     Offcloud and usenet providers publish no status feed Aura can read.
                   </p>
                 </>
@@ -1017,8 +1121,8 @@ export default function ServiceStatusChip() {
                   ref={emptyStateRef}
                   type="button"
                   onClick={() => { focusToggleRef.current = true; setEditingProviders(true); }}
-                  className="flex items-center gap-2.5 w-full text-left px-2 py-1.5 rounded-lg
-                             text-[12px] text-white/60 hover:text-white hover:bg-white/8 transition-colors"
+                  className="aura-glass-row flex items-center gap-2.5 w-full text-left px-2 py-1.5 rounded-lg
+                             text-[12px] text-white/60 hover:text-white"
                 >
                   <svg width="8" height="8" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3"
                        strokeLinecap="round" aria-hidden className="shrink-0">
@@ -1048,8 +1152,8 @@ export default function ServiceStatusChip() {
                         <button
                           type="button"
                           onClick={() => openExternalUrl(def.statusPage!)}
-                          className="shrink-0 text-[11px] px-1.5 py-0.5 rounded-md text-white/50
-                                     hover:text-white hover:bg-white/10 transition-colors"
+                          className="aura-glass-item shrink-0 text-[11px] px-1.5 py-0.5 rounded-md text-white/50
+                                     hover:text-white"
                         >
                           Status page
                         </button>
@@ -1066,14 +1170,45 @@ export default function ServiceStatusChip() {
               ) : (
                 addons.map((a, i) => {
                   const p = svc.addons.get(a.url);
+                  const name = a.name || "Unnamed addon";
+                  const nested = p?.nested;
                   return (
-                    <Row
-                      key={`${i}:${a.url}`}
-                      level={p ? probeLevel(p) : isCheckable(a.url) ? "pending" : "idle"}
-                      label={a.name || "Unnamed addon"}
-                      detail={`${addonHost(a.url)} · ${isCheckable(a.url) ? probeDetail(p, checking) : "Not checkable"}`}
-                      hint={latencyLines(p)}
-                    />
+                    <div key={`${i}:${a.url}`}>
+                      <Row
+                        level={p ? probeLevel(p) : isCheckable(a.url) ? "pending" : "idle"}
+                        label={name}
+                        detail={`${addonHost(a.url)} · ${isCheckable(a.url) ? probeDetail(p, checking) : "Not checkable"}`}
+                        hint={latencyLines(p)}
+                      />
+                      {nested && (nested.error || nested.addons.length > 0) && (
+                        // The addons inside this one, indented under it. A
+                        // report that could not be read is one quiet row, and
+                        // only while the wrapper itself answers (when it is
+                        // down its own row already says so).
+                        <div className="ml-[13px] pl-1.5 border-l border-white/10">
+                          {nested.error ? (
+                            probeLevel(p) !== "down" && (
+                              <Row
+                                level="idle"
+                                label="Addons inside"
+                                detail={`Status unavailable (${nested.error})`}
+                                hint={`${name} declares a status report for the addons it wraps, but it could not be read.`}
+                              />
+                            )
+                          ) : (
+                            nested.addons.map((n, j) => (
+                              <Row
+                                key={`${j}:${n.name}`}
+                                level={nestedLevel(n, tickNow, nested)}
+                                label={n.name}
+                                detail={nestedDetail(n, tickNow, nested)}
+                                hint={nestedHint(n, name, nested, tickNow)}
+                              />
+                            ))
+                          )}
+                        </div>
+                      )}
+                    </div>
                   );
                 })
               )}
@@ -1094,7 +1229,7 @@ function Section({ title, action, children }: { title: string; action?: ReactNod
       {/* Fixed height, so the header does not jump when the action appears or
           its label changes. */}
       <div className="flex items-center gap-2 h-6 px-2">
-        <h3 className="flex-1 min-w-0 truncate text-[10.5px] font-semibold uppercase tracking-wider text-white/40">
+        <h3 className="flex-1 min-w-0 truncate text-[10.5px] font-semibold uppercase tracking-wider text-white/55">
           {title}
         </h3>
         {action}
@@ -1136,7 +1271,7 @@ function Row({
   );
   const cls = "flex items-start gap-2.5 w-full text-left px-2 py-1.5 rounded-lg";
   const row = onClick ? (
-    <button type="button" onClick={onClick} className={`${cls} hover:bg-white/8 transition-colors`}>
+    <button type="button" onClick={onClick} className={`aura-glass-row ${cls}`}>
       {body}
       {trailing}
     </button>

@@ -98,7 +98,7 @@ export default function UpdatePopup({
     try {
       const ok = await onUpdate();
       if (!ok) {
-        setInstallError("Install failed — the signed download or signature check didn't succeed. Use \"View on GitHub\" to download the installer manually.");
+        setInstallError("Install failed: the signed download or signature check didn't succeed. Use \"View on GitHub\" to download the installer manually.");
       }
     } catch (e) {
       setInstallError(String(e));
@@ -112,22 +112,22 @@ export default function UpdatePopup({
       role="dialog"
       aria-modal="true"
       aria-labelledby="aura-update-title"
-      className="aura-update-backdrop fixed inset-0 z-[60] flex items-center
-                 justify-center bg-black/60 backdrop-blur-md"
-      onClick={(e) => {
-        if (installing) return;
-        if (e.target === e.currentTarget) onDismiss();
-      }}
+      className="fixed inset-0 z-[60] flex items-center justify-center"
     >
+      {/* Dim + blur on a sibling layer, never the wrapper: an ancestor's
+          backdrop-filter (or fading opacity) would blind the card's glass.
+          A click on it is a click outside the card. */}
       <div
-        className="aura-update-card glass-panel-elevated rounded-2xl
-                   px-8 py-7 w-full max-w-[680px] mx-4 shadow-glass-edge
+        aria-hidden
+        className="aura-update-backdrop absolute inset-0 bg-black/60 backdrop-blur-md"
+        onClick={() => { if (!installing) onDismiss(); }}
+      />
+      <div
+        className="aura-update-card aura-float-glass relative rounded-2xl
+                   px-8 py-7 w-full max-w-[680px] mx-4
                    flex flex-col gap-5"
-        // glass-panel-elevated's background is the per-theme ACCENT-tinted glass
-        // (--ln-glass-3), which tinted the whole popup the accent colour. Override
-        // to a NEUTRAL frosted grey glass (matching Changelog.tsx) so the accent
-        // shows only in the title + section headers, not the whole surface.
-        style={{ background: "rgba(255, 255, 255, 0.06)" }}
+        // The shared floating glass (neutral, never the per-theme accent tint of
+        // --ln-glass-3), so the accent shows only in the title + section headers.
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
@@ -210,8 +210,7 @@ export default function UpdatePopup({
               <button
                 type="button"
                 onClick={() => void loadMorePrior()}
-                className="px-3 py-1.5 rounded-lg text-[11.5px] font-medium text-white/75
-                           bg-white/[0.05] border border-white/10 hover:bg-white/10 transition-colors"
+                className="aura-glass-flat aura-glass-press px-3 py-1.5 rounded-lg text-[11.5px] font-medium text-white/75"
               >
                 {priorError ? "Retry" : showPrior ? `View ${RELEASES_PAGE_SIZE} more` : "View earlier versions"}
               </button>
@@ -232,10 +231,9 @@ export default function UpdatePopup({
             type="button"
             onClick={() => openUrl(releasePageUrl).catch(() => {})}
             disabled={installing}
-            className="px-3 py-2 rounded-xl text-[11px] text-white/45
-                       hover:text-white/75 hover:bg-white/[0.04]
-                       disabled:opacity-40 disabled:cursor-not-allowed
-                       transition-colors"
+            className="aura-glass-item px-3 py-2 rounded-xl text-[11px] text-white/45
+                       hover:text-white/75
+                       disabled:opacity-40 disabled:cursor-not-allowed"
           >
             View on GitHub
           </button>
@@ -244,10 +242,9 @@ export default function UpdatePopup({
               type="button"
               onClick={onDismiss}
               disabled={installing}
-              className="px-4 py-2 rounded-xl text-sm text-white/60
-                         hover:text-white/90 hover:bg-white/[0.05]
-                         disabled:opacity-40 disabled:cursor-not-allowed
-                         transition-colors"
+              className="aura-glass-item px-4 py-2 rounded-xl text-sm text-white/60
+                         hover:text-white/90
+                         disabled:opacity-40 disabled:cursor-not-allowed"
             >
               Dismiss
             </button>
@@ -255,10 +252,8 @@ export default function UpdatePopup({
               type="button"
               onClick={handleInstall}
               disabled={installing}
-              className="px-4 py-2 rounded-xl text-sm font-medium text-white
-                         bg-ln-accent/80 hover:bg-ln-accent active:scale-95
-                         disabled:opacity-60 disabled:cursor-progress
-                         transition-all shadow-accent-glow"
+              className="aura-glass-flat aura-glass-press is-cta px-4 py-2 rounded-xl text-sm font-medium text-ln-accent-ink
+                         disabled:opacity-60 disabled:cursor-progress"
             >
               {installing ? "Installing…" : "Install"}
             </button>

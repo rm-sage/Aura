@@ -19,11 +19,12 @@ export const PLAYER_STACK_GAP_PX = 12;
  *  each starts on one line too. */
 export const PLAYER_STACK_WIDTH = "min(28rem, calc(100vw - 3rem))";
 
-/** The stack's first slot: clears the "Exit playback / title" header, which
+/** The stack's first slot: clears the back button / title header, which
  *  starts at 16 px in fullscreen and 16 + 36 = 52 px windowed and is about
- *  64 px tall. */
+ *  51 px tall (the two title lines; the 40 px back button is centred on
+ *  them), plus a 16 px gap. Its left edge shares the stack's 24 px inset. */
 export function playerStackBaseTop(isFullscreen: boolean): number {
-  return isFullscreen ? 96 : 132;
+  return isFullscreen ? 84 : 120;
 }
 
 /** `top` for an element under the skip prompt. */

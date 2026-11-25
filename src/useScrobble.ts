@@ -5,12 +5,13 @@ import { useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { MetaDetail, MetaPreview } from "./types";
 import { isAnimeMeta } from "./aiometadata";
+import { usePlaybackClock } from "./playbackClock";
 
 // ---------------------------------------------------------------------------
 // useScrobble — completion-only scrobbling for the active playback session
 //
-// Originally a three-phase Trakt-style flow (start = "currently watching"
-// check-in → heartbeats → end). The check-in feature was removed: AIOMetadata's
+// Originally a three-phase flow (start = "currently watching" check-in, then
+// heartbeats, then end). The check-in feature was removed: AIOMetadata's
 // AniList integration responded to /scrobble/start by bumping the user's
 // `progress` to the current episode immediately, marking unwatched episodes
 // as watched after a few seconds of preview playback. The user opted to drop
@@ -29,14 +30,13 @@ const COMPLETE_THRESHOLD = 0.80;
  * before we fire scrobble_start. Measured by accumulating positive
  * time-pos deltas between ticks (≤ 5s, while not paused) so seeks
  * forward / backward never inflate the counter — the user has to
- * actually watch this much fresh material before Trakt sees a "start".
+ * actually watch this much fresh material before a provider sees a "start".
  *
  * Without this gate, brief misclicks ("started the wrong stream, hit
  * back after 3 s") still emit scrobble_start, polluting the user's
  * history.
  *
- * Raised to 120 s (was 30 s). 30 s was the de-facto Trakt threshold,
- * but AIOMetadata's AniList integration on the addon side responds to
+ * Raised to 120 s (was 30 s). AIOMetadata's AniList integration on the addon side responds to
  * the start event by bumping the user's `progress` to the current
  * episode immediately — which means a 31-second-watched episode of
  * Frieren got flipped from unwatched → watched on AniList while the
@@ -50,7 +50,7 @@ const START_WARMUP_S_DEFAULT = 120;
  * Minimum ELAPSED playback time (same delta-accumulation as start)
  * before scrobble_end's auto-complete will fire. Without this floor,
  * resuming a CW item at 95% triggered an instant "completed" within
- * 1-2 ticks — Trakt then marked the episode watched while the user
+ * 1-2 ticks: the provider then marked the episode watched while the user
  * had only seen a few seconds of fresh content. 90 s is enough to
  * filter out resume-bounce flickers without delaying genuine
  * completions (a user who legitimately watches 90 more seconds at
@@ -87,14 +87,9 @@ export interface ActiveScrobbleTarget {
   /** The episode's own title (separate field so the OSD can render
    *  S01E05 — "The Big Heist" cleanly). */
   episode_title?: string;
-  /** The episode's air date (VideoEntry `released`, ISO 8601). With
-   *  `episode_title` it feeds Trakt's last-resort title + air-date lookup in
-   *  scrobble.rs. `undefined` = not looked up yet; `null` = the VideoEntry has
-   *  none (so App's enrichment effect does not look again). */
-  episode_released?: string | null;
   /** Authoritative numeric season from the VideoEntry the user clicked.
-   *  Passed through to scrobble.rs so Trakt's /sync/history receives
-   *  the picker's numbering directly instead of relying on the ID
+   *  Passed through to scrobble.rs so the providers receive the
+   *  picker's numbering directly instead of relying on the ID
    *  string-parse. Needed because AIOMetadata can produce dual-
    *  numbering inconsistencies (id says `:2:3` while video.season=1,
    *  video.episode=31 for the same physical episode). When omitted,
@@ -105,8 +100,8 @@ export interface ActiveScrobbleTarget {
   /** Absolute episode across the entire show, computed by
    *  handlePlayStream from detail.videos by summing earlier main-run
    *  cours' episode counts. After AIOMetadata's cour-aggregation
-   *  patch, `episode_num` is cour-relative — Trakt entries indexed by
-   *  absolute numbering need this value as a fallback target.
+   *  patch, `episode_num` is cour-relative; the player's episode label and
+   *  the story-arc lookup read this. Not sent to the scrobblers.
    *  Optional; only stamped for season ≥ 2 of cour-aggregated anime. */
   absolute_episode_num?: number;
   /** Stylized logo URL — used by the buffering overlay. */
@@ -150,10 +145,14 @@ export function activeTargetFromMeta(
 interface Options {
   /** The current item, or null when nothing is playing / loaded. */
   active: ActiveScrobbleTarget | null;
-  /** Latest playback snapshot from the playback-update event stream. */
-  playback: PlaybackSnapshot;
+  /** Latest duration and pause state from the playback-update event stream. */
+  playback: Omit<PlaybackSnapshot, "time">;
+  /** Reads the position to report, live (playbackClock.tsx). The per-tick
+   *  logic runs as a playhead subscription, so the caller (App) does not
+   *  re-render per tick. Must be stable. */
+  readTime: () => number;
   /** Stremio auth_key prefix (first 12 chars) or "guest" — keys the
-   *  per-account Trakt / AniList token in the OS keyring. scrobble.rs
+   *  per-account AniList / Simkl tokens in the OS keyring. scrobble.rs
    *  needs this to fire /scrobble/stop with the right token. App.tsx
    *  derives it from the active session before mounting the hook. */
   scope: string;
@@ -170,7 +169,7 @@ interface Options {
    *  `time-pos` at `duration`. Auto-complete MUST NOT fire then: the ratio
    *  gate reads 1.0 and the warmup is long since satisfied on any real
    *  episode, so a dropped connection would otherwise scrobble a "watched" to
-   *  Trakt / AniList and auto-advance past an episode nobody finished.
+   *  AniList / Simkl and auto-advance past an episode nobody finished.
    *  Defaults to true (trusted) when omitted. */
   positionTrusted?: boolean;
 }
@@ -178,6 +177,7 @@ interface Options {
 export function useScrobble({
   active,
   playback,
+  readTime,
   scope,
   startWarmupSecs,
   completeWarmupSecs,
@@ -189,7 +189,7 @@ export function useScrobble({
    *  lifetime. After a scrobble_end fires from the completion branch,
    *  `startedFor` resets to null so a subsequent tick would normally
    *  re-enter the start-warmup branch (elapsed time is still high) and
-   *  immediately re-complete. That's how Trakt ended up with 6× entries
+   *  immediately re-complete. That's how one episode ended up with 6× entries
    *  for one episode. This set holds the keys we've already completed,
    *  and the start branch refuses to re-arm for any key in it. Cleared
    *  on hook unmount (the wrapping useRef survives across renders but
@@ -199,7 +199,7 @@ export function useScrobble({
    *  seconds. Reset on session change / unmount. Drives both the
    *  scrobble_start warmup and the auto-complete floor — a seek (or
    *  resume from a saved position) increments absolute time but does
-   *  NOT increment elapsed, so Trakt can't be fooled into thinking a
+   *  NOT increment elapsed, so a provider can't be fooled into thinking a
    *  resumed-near-end CW item finished after one tick. */
   const elapsedThisSession = useRef<number>(0);
   /** Previous tick's `playback.time` — used to compute per-tick delta. */
@@ -214,8 +214,10 @@ export function useScrobble({
    *  initial render, which meant a session ended via component
    *  teardown told the addon "ended at 0/0" — useless for /scrobble/end
    *  progress fidelity. */
-  const playbackRef = useRef<PlaybackSnapshot>(playback);
+  const playbackRef = useRef(playback);
   playbackRef.current = playback;
+  const readTimeRef = useRef(readTime);
+  readTimeRef.current = readTime;
   /** Last position seen while a file was genuinely loaded (duration > 0 AND
    *  time > 0), stamped with the session key it belongs to. handlePlayStream
    *  zeroes time and duration (notifyNewLoad) well BEFORE it flips the active
@@ -271,7 +273,7 @@ export function useScrobble({
         // command synchronously enough that the Rust side records the
         // intent and the post_event lands via the runtime executor.
         invoke("scrobble_end", endValues(
-          playbackRef.current.time,
+          readTimeRef.current(),
           playbackRef.current.duration,
         )).catch(() => {});
         startedFor.current = null;
@@ -284,7 +286,7 @@ export function useScrobble({
       // playback values (via ref), not the stale closure-captured ones.
       if (startedFor.current) {
         invoke("scrobble_end", endValues(
-          playbackRef.current.time,
+          readTimeRef.current(),
           playbackRef.current.duration,
         )).catch(() => {});
       }
@@ -293,7 +295,12 @@ export function useScrobble({
   }, []);
 
   // ── Per-frame logic ──
-  useEffect(() => {
+  // A playhead subscription (playbackClock.tsx), not an effect on a `time`
+  // value: it runs on mount, when the deps change and on every tick whose
+  // reported position changed, without re-rendering the caller.
+  const { duration, paused } = playback;
+  usePlaybackClock((time) => {
+    const playback = { time, duration, paused };
     // No active target → end any open session and reset elapsed counter.
     if (!active) {
       endSession(playback.time, playback.duration);
@@ -379,7 +386,7 @@ export function useScrobble({
           scope,
           // Authoritative numbers from the VideoEntry the user clicked.
           // scrobble.rs prefers these over the ID-string parse when
-          // building the Trakt payload — fixes dual-numbering anime
+          // building the payloads, which fixes dual-numbering anime
           // where the stream id and the displayed S/E disagree.
           season:      active.season ?? null,
           episode_num: active.episode_num ?? null,
@@ -387,29 +394,16 @@ export function useScrobble({
           // carries the video id for the episode). After AIOMetadata's
           // IMDb-anime patch, the video id may be kitsu/mal/anidb-
           // shaped (e.g. `kitsu:46474:5`) while the series root stays
-          // tt-prefixed. Trakt keys shows by IMDb id; without this
-          // anchor, scrobble.rs's id-parse path fails and no Trakt
-          // payload goes out for those episodes. Falls back to a tt
-          // extracted from `imdb_id` when not supplied.
+          // tt-prefixed. Falls back to a tt extracted from `imdb_id`
+          // when not supplied.
           series_imdb_id: active.series_id && active.series_id.startsWith("tt")
             ? active.series_id
             : (active.id.startsWith("tt") ? active.id.split(":")[0] : null),
-          // Absolute episode for Trakt's S1-absolute fallback target.
-          // Computed by handlePlayStream from detail.videos prior-cour
-          // sums; passed through verbatim. scrobble.rs uses it to build
-          // a tertiary candidate target after the cour-numbered primary
-          // returns not_found — covers shows Trakt indexes by absolute
-          // numbering (Frieren et al.).
-          absolute_episode_num: active.absolute_episode_num ?? null,
           // Addon-embedded AniList entry + cour-local episode. When present,
           // scrobble_anilist saves straight to this id and skips all mapping
           // heuristics (Aura<->AIOMetadata contract).
           anilist_id:      active.anilist_id ?? null,
           anilist_episode: active.anilist_episode ?? null,
-          // Episode title + air date for Trakt's last-resort lookup (an
-          // episode Trakt files under a different show than the addon does).
-          episode_title:    active.episode_title ?? null,
-          episode_released: active.episode_released ?? null,
         },
         duration: playback.duration,
       }).catch(() => {});
@@ -453,5 +447,7 @@ export function useScrobble({
       }));
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [active, playback.time, playback.duration, playback.paused, positionTrusted]);
+  // Every value the body reads goes here: the old effect re-ran on every tick
+  // and so always saw a fresh closure; a subscription refreshes only on these.
+  }, [active, duration, paused, positionTrusted, scope, startWarmup, completeWarmup], readTime);
 }

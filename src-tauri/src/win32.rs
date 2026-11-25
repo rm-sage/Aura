@@ -1506,6 +1506,40 @@ pub fn install_iconic_frame_guard(hwnd: isize) {
     }
 }
 
+// The same subclass also holds the MINIMUM SIZE against Snap. Dragging an
+// edge is clamped by tao's WM_GETMINMAXINFO answer (tauri.conf.json
+// `minWidth` / `minHeight`), but a Windows 11 snap layout (the three-column
+// and quarter zones) sized the window below it: the snap's SetWindowPos is
+// not an interactive size, and nothing else checked it. WM_WINDOWPOSCHANGING
+// now raises any size under the minimum (asked of tao through
+// WM_GETMINMAXINFO, so the numbers stay tauri.conf.json's, DPI-scaled), and
+// WM_WINDOWPOSCHANGED catches a move that skipped the CHANGING message
+// (SWP_NOSENDCHANGING) by posting one corrective resize. The window then
+// overflows the zone, as any app with a minimum size does. Never while
+// minimized or maximized (their rects are the system's).
+
+const MIN_SIZE_FIX_MSG: u32 = 0x8000 + 0x2A1; // WM_APP + 0x2A1
+static MIN_SIZE_FIX_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// tao's minimum track size for this window, in physical px, or None.
+unsafe fn min_track_size(hwnd: HWND) -> Option<(i32, i32)> {
+    use windows::Win32::Foundation::{LPARAM, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{SendMessageW, MINMAXINFO, WM_GETMINMAXINFO};
+    let mut mmi = MINMAXINFO::default();
+    unsafe {
+        SendMessageW(hwnd, WM_GETMINMAXINFO, Some(WPARAM(0)), Some(LPARAM(&mut mmi as *mut _ as isize)));
+    }
+    let (w, h) = (mmi.ptMinTrackSize.x, mmi.ptMinTrackSize.y);
+    // A plain DefWindowProc answer is the caption-sized system minimum
+    // (about 136 x 39); only a real app minimum is worth enforcing.
+    if w > 200 && h > 150 { Some((w, h)) } else { None }
+}
+
+unsafe fn sizing_is_ours(hwnd: HWND) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{IsIconic, IsZoomed};
+    unsafe { !IsIconic(hwnd).as_bool() && !IsZoomed(hwnd).as_bool() }
+}
+
 unsafe extern "system" fn iconic_frame_proc(
     hwnd: HWND,
     msg: u32,
@@ -1514,12 +1548,397 @@ unsafe extern "system" fn iconic_frame_proc(
     _id: usize,
     _ref_data: usize,
 ) -> windows::Win32::Foundation::LRESULT {
+    use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
     use windows::Win32::UI::Shell::DefSubclassProc;
-    use windows::Win32::UI::WindowsAndMessaging::{DefWindowProcW, IsIconic, WM_NCCALCSIZE};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        DefWindowProcW, GetWindowRect, IsIconic, PostMessageW, SetWindowPos, SWP_NOACTIVATE,
+        SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WINDOWPOS, WM_NCCALCSIZE, WM_WINDOWPOSCHANGED,
+        WM_WINDOWPOSCHANGING,
+    };
+    use std::sync::atomic::Ordering;
     unsafe {
         if msg == WM_NCCALCSIZE && IsIconic(hwnd).as_bool() {
             return DefWindowProcW(hwnd, msg, wparam, lparam);
         }
+        if msg == WM_WINDOWPOSCHANGING && lparam.0 != 0 {
+            let wp = &mut *(lparam.0 as *mut WINDOWPOS);
+            if (wp.flags & SWP_NOSIZE).0 == 0 && sizing_is_ours(hwnd) {
+                if let Some((mw, mh)) = min_track_size(hwnd) {
+                    if wp.cx < mw { wp.cx = mw; }
+                    if wp.cy < mh { wp.cy = mh; }
+                }
+            }
+        } else if msg == WM_WINDOWPOSCHANGED && lparam.0 != 0 {
+            let wp = &*(lparam.0 as *const WINDOWPOS);
+            if (wp.flags & SWP_NOSIZE).0 == 0 && sizing_is_ours(hwnd) {
+                if let Some((mw, mh)) = min_track_size(hwnd) {
+                    if (wp.cx < mw || wp.cy < mh)
+                        && !MIN_SIZE_FIX_PENDING.swap(true, Ordering::SeqCst)
+                        && PostMessageW(Some(hwnd), MIN_SIZE_FIX_MSG, WPARAM(0), LPARAM(0)).is_err()
+                    {
+                        MIN_SIZE_FIX_PENDING.store(false, Ordering::SeqCst);
+                    }
+                }
+            }
+        } else if msg == MIN_SIZE_FIX_MSG {
+            MIN_SIZE_FIX_PENDING.store(false, Ordering::SeqCst);
+            if sizing_is_ours(hwnd) {
+                if let Some((mw, mh)) = min_track_size(hwnd) {
+                    let mut r = windows::Win32::Foundation::RECT::default();
+                    if GetWindowRect(hwnd, &mut r).is_ok() {
+                        let (w, h) = (r.right - r.left, r.bottom - r.top);
+                        if w < mw || h < mh {
+                            crate::devlog!(info, "win32", "window {}x{} under the minimum {}x{} (a snap layout?): raised", w, h, mw, mh);
+                            let _ = SetWindowPos(hwnd, None, 0, 0, w.max(mw), h.max(mh),
+                                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+                        }
+                    }
+                }
+            }
+            return LRESULT(0);
+        }
         DefSubclassProc(hwnd, msg, wparam, lparam)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HDR display probe (Settings > HDR mode recommendation)
+// ---------------------------------------------------------------------------
+//
+// Answers two questions for the monitor the main window is on: can it show
+// HDR at all ("advanced color" in Windows terms), and is Windows HDR turned
+// on for it right now. Settings uses the answer to pick which HDR mode it
+// recommends; nothing in playback reads it.
+//
+// The DisplayConfig API (QueryDisplayConfig + DisplayConfigGetDeviceInfo)
+// exists since Windows 7, but it is still bound by hand through libloading
+// like the rest of this module, so the probe can never add a load-time
+// import, and the structs are declared here (sizes checked against the
+// Windows SDK below) rather than pulling in another `windows` crate feature.
+//
+// The window -> display match goes through the GDI device name: the
+// monitor's `MONITORINFOEXW.szDevice` (`\\.\DISPLAY1`) equals the path
+// source's `viewGdiDeviceName`.
+//
+// Windows 11 24H2 changed what the old query means: with Auto Color
+// Management an SDR panel can report "advanced color supported / enabled"
+// (wide colour, not HDR). The `_2` query (type 15) separates HDR from wide
+// colour, so it is tried first; builds that predate it reject it and fall back
+// to the original query, where "enabled" counts only when wide colour is not
+// the reason.
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct DcLuid {
+    low_part: u32,
+    high_part: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct DcPathSourceInfo {
+    adapter_id: DcLuid,
+    id: u32,
+    mode_info_idx: u32,
+    status_flags: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct DcPathTargetInfo {
+    adapter_id: DcLuid,
+    id: u32,
+    mode_info_idx: u32,
+    output_technology: u32,
+    rotation: u32,
+    scaling: u32,
+    refresh_numerator: u32,
+    refresh_denominator: u32,
+    scan_line_ordering: u32,
+    target_available: i32,
+    status_flags: u32,
+}
+
+/// DISPLAYCONFIG_PATH_INFO.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct DcPathInfo {
+    source_info: DcPathSourceInfo,
+    target_info: DcPathTargetInfo,
+    flags: u32,
+}
+
+/// DISPLAYCONFIG_MODE_INFO. Never read: QueryDisplayConfig requires the
+/// buffer, so only its size and alignment matter.
+#[repr(C, align(8))]
+#[derive(Clone, Copy)]
+struct DcModeInfo([u8; 64]);
+
+/// DISPLAYCONFIG_DEVICE_INFO_HEADER.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct DcDeviceInfoHeader {
+    kind: i32,
+    size: u32,
+    adapter_id: DcLuid,
+    id: u32,
+}
+
+/// DISPLAYCONFIG_SOURCE_DEVICE_NAME.
+#[repr(C)]
+struct DcSourceDeviceName {
+    header: DcDeviceInfoHeader,
+    view_gdi_device_name: [u16; 32],
+}
+
+/// DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO.
+#[repr(C)]
+struct DcAdvancedColorInfo {
+    header: DcDeviceInfoHeader,
+    value: u32,
+    color_encoding: u32,
+    bits_per_color_channel: u32,
+}
+
+/// DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO_2 (Windows 11 24H2+).
+#[repr(C)]
+struct DcAdvancedColorInfo2 {
+    header: DcDeviceInfoHeader,
+    value: u32,
+    color_encoding: u32,
+    bits_per_color_channel: u32,
+    active_color_mode: u32,
+}
+
+/// MONITORINFOEXW (the `MonitorInfo` above plus the GDI device name).
+#[repr(C)]
+#[derive(Default)]
+struct MonitorInfoExW {
+    cb_size: u32,
+    rc_monitor: Rect,
+    rc_work: Rect,
+    dw_flags: u32,
+    sz_device: [u16; 32],
+}
+
+// Sizes from the Windows SDK (wingdi.h / winuser.h). A wrong layout here
+// would make Windows reject the request (or read past a buffer), so a
+// mismatch fails the build instead.
+const _: () = assert!(std::mem::size_of::<DcPathInfo>() == 72);
+const _: () = assert!(std::mem::size_of::<DcModeInfo>() == 64);
+const _: () = assert!(std::mem::size_of::<DcDeviceInfoHeader>() == 20);
+const _: () = assert!(std::mem::size_of::<DcSourceDeviceName>() == 84);
+const _: () = assert!(std::mem::size_of::<DcAdvancedColorInfo>() == 32);
+const _: () = assert!(std::mem::size_of::<DcAdvancedColorInfo2>() == 36);
+const _: () = assert!(std::mem::size_of::<MonitorInfoExW>() == 104);
+
+const QDC_ONLY_ACTIVE_PATHS: u32 = 0x0000_0002;
+const ERROR_INSUFFICIENT_BUFFER: i32 = 122;
+const DC_GET_SOURCE_NAME: i32 = 1;
+const DC_GET_ADVANCED_COLOR_INFO: i32 = 9;
+const DC_GET_ADVANCED_COLOR_INFO_2: i32 = 15;
+/// DISPLAYCONFIG_ADVANCED_COLOR_MODE_HDR.
+const DC_ADVANCED_COLOR_MODE_HDR: u32 = 2;
+
+type GetDisplayConfigBufferSizesFn =
+    unsafe extern "system" fn(u32, *mut u32, *mut u32) -> i32;
+type QueryDisplayConfigFn = unsafe extern "system" fn(
+    u32, *mut u32, *mut DcPathInfo, *mut u32, *mut DcModeInfo, *mut c_void,
+) -> i32;
+type DisplayConfigGetDeviceInfoFn =
+    unsafe extern "system" fn(*mut DcDeviceInfoHeader) -> i32;
+type GetMonitorInfoExWFn =
+    unsafe extern "system" fn(*mut c_void, *mut MonitorInfoExW) -> i32;
+
+/// HDR facts for one display.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct DisplayHdrState {
+    /// The display can show HDR (Windows offers "Use HDR" for it).
+    pub supported: bool,
+    /// Windows HDR is on for it right now.
+    pub enabled: bool,
+}
+
+/// HDR state of the display that holds `parent_hwnd`, or `None` when it
+/// cannot be determined (any API failure, no matching display path). Never
+/// panics; a failure costs the caller its recommendation, nothing more.
+pub fn display_hdr_state(parent_hwnd: isize) -> Option<DisplayHdrState> {
+    let state = if parent_hwnd == 0 { None } else { unsafe { query_display_hdr_state(parent_hwnd) } };
+    // Log on change only: Settings re-reads on every window focus.
+    static LAST: Mutex<Option<Option<DisplayHdrState>>> = Mutex::new(None);
+    if let Ok(mut last) = LAST.lock() {
+        if *last != Some(state) {
+            *last = Some(state);
+            match state {
+                Some(s) => crate::devlog!(info, "win32",
+                    "display HDR: supported={} enabled={}", s.supported, s.enabled),
+                None => crate::devlog!(info, "win32", "display HDR: unknown (probe failed)"),
+            }
+        }
+    }
+    state
+}
+
+unsafe fn query_display_hdr_state(parent_hwnd: isize) -> Option<DisplayHdrState> {
+    let user32 = libloading::Library::new("user32.dll").ok()?;
+    let monitor_from_window: libloading::Symbol<MonitorFromWindowFn> =
+        user32.get(b"MonitorFromWindow\0").ok()?;
+    let get_monitor_info: libloading::Symbol<GetMonitorInfoExWFn> =
+        user32.get(b"GetMonitorInfoW\0").ok()?;
+    let get_buffer_sizes: libloading::Symbol<GetDisplayConfigBufferSizesFn> =
+        user32.get(b"GetDisplayConfigBufferSizes\0").ok()?;
+    let query_display_config: libloading::Symbol<QueryDisplayConfigFn> =
+        user32.get(b"QueryDisplayConfig\0").ok()?;
+    let get_device_info: libloading::Symbol<DisplayConfigGetDeviceInfoFn> =
+        user32.get(b"DisplayConfigGetDeviceInfo\0").ok()?;
+
+    let monitor = monitor_from_window(parent_hwnd as *mut c_void, MONITOR_DEFAULTTONEAREST);
+    if monitor.is_null() {
+        return None;
+    }
+    let mut mi = MonitorInfoExW {
+        cb_size: std::mem::size_of::<MonitorInfoExW>() as u32,
+        ..Default::default()
+    };
+    if get_monitor_info(monitor, &mut mi) == 0 {
+        return None;
+    }
+    let device = wide_until_nul(&mi.sz_device);
+    if device.is_empty() {
+        return None;
+    }
+
+    // The topology can change between the size query and the read (a
+    // display plugged in), which answers ERROR_INSUFFICIENT_BUFFER: retry a
+    // few times, then give up.
+    let mut paths: Vec<DcPathInfo> = Vec::new();
+    let mut fetched = false;
+    for _ in 0..3 {
+        let (mut n_paths, mut n_modes) = (0u32, 0u32);
+        if get_buffer_sizes(QDC_ONLY_ACTIVE_PATHS, &mut n_paths, &mut n_modes) != 0 {
+            return None;
+        }
+        paths = vec![DcPathInfo::default(); n_paths as usize];
+        let mut modes = vec![DcModeInfo([0u8; 64]); n_modes as usize];
+        let r = query_display_config(
+            QDC_ONLY_ACTIVE_PATHS,
+            &mut n_paths,
+            paths.as_mut_ptr(),
+            &mut n_modes,
+            modes.as_mut_ptr(),
+            std::ptr::null_mut(),
+        );
+        if r == ERROR_INSUFFICIENT_BUFFER {
+            continue;
+        }
+        if r != 0 {
+            return None;
+        }
+        paths.truncate(n_paths as usize);
+        fetched = true;
+        break;
+    }
+    if !fetched {
+        return None;
+    }
+
+    for path in &paths {
+        let mut name = DcSourceDeviceName {
+            header: DcDeviceInfoHeader {
+                kind: DC_GET_SOURCE_NAME,
+                size: std::mem::size_of::<DcSourceDeviceName>() as u32,
+                adapter_id: path.source_info.adapter_id,
+                id: path.source_info.id,
+            },
+            view_gdi_device_name: [0u16; 32],
+        };
+        if get_device_info(&mut name.header) != 0 {
+            continue;
+        }
+        if wide_until_nul(&name.view_gdi_device_name) != device {
+            continue;
+        }
+        return advanced_color_state(&get_device_info, path.target_info);
+    }
+    None
+}
+
+unsafe fn advanced_color_state(
+    get_device_info: &libloading::Symbol<DisplayConfigGetDeviceInfoFn>,
+    target: DcPathTargetInfo,
+) -> Option<DisplayHdrState> {
+    let mut v2 = DcAdvancedColorInfo2 {
+        header: DcDeviceInfoHeader {
+            kind: DC_GET_ADVANCED_COLOR_INFO_2,
+            size: std::mem::size_of::<DcAdvancedColorInfo2>() as u32,
+            adapter_id: target.adapter_id,
+            id: target.id,
+        },
+        value: 0,
+        color_encoding: 0,
+        bits_per_color_channel: 0,
+        active_color_mode: 0,
+    };
+    if get_device_info(&mut v2.header) == 0 {
+        // highDynamicRangeSupported is bit 4; HDR counts as on only when it
+        // is the ACTIVE mode (user-enabled can still be inactive).
+        return Some(DisplayHdrState {
+            supported: v2.value & (1 << 4) != 0,
+            enabled: v2.active_color_mode == DC_ADVANCED_COLOR_MODE_HDR,
+        });
+    }
+    let mut v1 = DcAdvancedColorInfo {
+        header: DcDeviceInfoHeader {
+            kind: DC_GET_ADVANCED_COLOR_INFO,
+            size: std::mem::size_of::<DcAdvancedColorInfo>() as u32,
+            adapter_id: target.adapter_id,
+            id: target.id,
+        },
+        value: 0,
+        color_encoding: 0,
+        bits_per_color_channel: 0,
+    };
+    if get_device_info(&mut v1.header) != 0 {
+        return None;
+    }
+    // Bits: 0 advancedColorSupported, 1 advancedColorEnabled,
+    // 2 wideColorEnforced, 3 advancedColorForceDisabled.
+    let bit = |n: u32| v1.value & (1 << n) != 0;
+    // Auto Color Management on Win11 22H2 / 23H2 sets "supported" and
+    // "wide colour enforced" on an SDR panel too. This query cannot tell that
+    // apart from an HDR panel with HDR off, so it is reported as unknown
+    // rather than telling an SDR owner to turn on an HDR switch they lack.
+    if bit(0) && bit(2) {
+        return None;
+    }
+    let supported = bit(0);
+    Some(DisplayHdrState {
+        supported,
+        enabled: supported && bit(1) && !bit(2) && !bit(3),
+    })
+}
+
+fn wide_until_nul(s: &[u16]) -> String {
+    let end = s.iter().position(|&c| c == 0).unwrap_or(s.len());
+    String::from_utf16_lossy(&s[..end])
+}
+
+#[cfg(test)]
+mod display_hdr_tests {
+    /// Runs the real probe against the desktop window's monitor. Ignored by
+    /// default: the answer depends on the machine (`cargo test --lib --
+    /// --ignored display_hdr_probe --nocapture` prints it).
+    #[test]
+    #[ignore]
+    fn display_hdr_probe() {
+        type GetDesktopWindowFn = unsafe extern "system" fn() -> *mut std::ffi::c_void;
+        let hwnd = unsafe {
+            let user32 = libloading::Library::new("user32.dll").unwrap();
+            let f: libloading::Symbol<GetDesktopWindowFn> = user32.get(b"GetDesktopWindow\0").unwrap();
+            f() as isize
+        };
+        let state = unsafe { super::query_display_hdr_state(hwnd) };
+        println!("display HDR state: {state:?}");
+        assert!(state.is_some(), "the probe should resolve the desktop's display");
     }
 }

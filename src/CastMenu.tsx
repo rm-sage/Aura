@@ -50,7 +50,7 @@ export default function CastMenu({
 
       <div
         className="aura-modal-card-in relative w-[min(440px,92vw)] max-h-[70vh] flex flex-col
-                   rounded-2xl aura-glass-menu shadow-glass-edge overflow-hidden"
+                   rounded-2xl aura-glass-player overflow-hidden"
         onClick={(e) => e.stopPropagation()}
         role="dialog"
         aria-label="Cast to device"
@@ -87,8 +87,8 @@ export default function CastMenu({
                   type="button"
                   disabled={connecting}
                   onClick={() => onPick(d)}
-                  className="w-full text-left rounded-xl px-3 py-2.5 mb-1 flex items-center gap-3
-                             transition-colors hover:bg-white/[0.07] focus:bg-white/[0.07] focus:outline-none"
+                  className="aura-glass-row w-full text-left rounded-xl px-3 py-2.5 mb-1 flex items-center gap-3
+                             focus:outline-none focus-visible:ring-1 focus-visible:ring-white/30"
                 >
                   <TvIcon kind={d.kind} />
                   <div className="min-w-0 flex-1">

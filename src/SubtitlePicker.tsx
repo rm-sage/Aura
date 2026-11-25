@@ -1,11 +1,12 @@
 // Aura — © 2026 rm-sage. AGPL-3.0-or-later. See LICENSE for full notice.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useState, useEffect, useCallback, useRef } from "react";
+import { memo, useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { SubtitleEntry } from "./types";
 import type { StreamHash } from "./subtitleExtras";
 import { PlayerMenuChip } from "./playerMenu";
+import { useListDroplet } from "./glassListDroplet";
 
 // ---------------------------------------------------------------------------
 // SubtitlePicker — glass overlay floating over the player
@@ -39,6 +40,9 @@ interface Props {
    *  while the picker is open re-runs the search with it. */
   streamHash?: StreamHash | null;
   onClose: () => void;
+  /** Called once a downloaded subtitle is added to mpv and selected, so the
+   *  player can turn visibility back on when subtitles were Off. */
+  onLoaded?: () => void;
 }
 
 const LANG_PRESETS = [
@@ -65,8 +69,8 @@ const CloseIcon = () => (
   </svg>
 );
 
-export default function SubtitlePicker({
-  open, initialQuery, initialYear, initialImdbId, streamUrl, streamHash, onClose,
+function SubtitlePicker({
+  open, initialQuery, initialYear, initialImdbId, streamUrl, streamHash, onClose, onLoaded,
 }: Props) {
   const [query, setQuery] = useState(initialQuery ?? "");
   const [language, setLanguage] = useState("en");
@@ -79,6 +83,10 @@ export default function SubtitlePicker({
   // switch by one round trip, and a stale hash would rank another release's
   // subtitles as a match.
   const hash = streamHash && streamUrl && streamHash.url === streamUrl ? streamHash : null;
+  // Liquid's shared hover droplet over the result rows (inert in Frosted).
+  const droplet = useListDroplet();
+  const hideDroplet = droplet.hide;
+  useEffect(() => { hideDroplet(); }, [results, hideDroplet]);
 
   // Prefill query when activeTarget changes
   useEffect(() => {
@@ -154,6 +162,7 @@ export default function SubtitlePicker({
     try {
       const path = await invoke<string>("download_subtitle", { fileId: entry.file_id });
       await invoke("add_subtitle_to_mpv", { path });
+      onLoaded?.();
       setSuccess(entry.release || "Subtitle loaded");
       // Auto-close briefly after a successful injection
       if (closeTimerRef.current) clearTimeout(closeTimerRef.current);
@@ -173,8 +182,12 @@ export default function SubtitlePicker({
 
   return (
     <div className="absolute inset-0 z-40 flex items-end justify-center p-6 pointer-events-none">
+      {/* A PLAYER surface: .aura-glass-player (material only). The video is
+          the native mpv window under the webview, so a backdrop pass (blur or
+          Liquid refraction) would sample nothing and the menu tier's face
+          would be see-through over the frame. */}
       <div
-        className="aura-sheet-in aura-float-glass rounded-2xl w-full max-w-[42rem]
+        className="aura-sheet-in aura-glass-player rounded-[20px] w-full max-w-[42rem]
                    pointer-events-auto flex flex-col max-h-[60vh] overflow-hidden"
       >
         {/* Header. Same title row as the Switch source and AuraSkip dialogs
@@ -183,7 +196,7 @@ export default function SubtitlePicker({
           <div className="flex items-baseline gap-2 min-w-0">
             <span className="text-white/70 self-center"><SearchIcon /></span>
             <h2 className="text-white text-[16px] font-semibold tracking-tight">External Subtitles</h2>
-            <span className="text-white/55 text-[12px] truncate">· OpenSubtitles</span>
+            <span className="text-white/60 text-[12px] truncate">· OpenSubtitles</span>
           </div>
           <button
             onClick={onClose}
@@ -204,16 +217,16 @@ export default function SubtitlePicker({
             placeholder="Title, episode, or filename…"
             data-aura-search
             spellCheck={false}
-            className="flex-1 h-9 bg-white/8 border border-white/12 rounded-lg px-3
-                       text-[13.5px] placeholder:text-white/40 outline-none focus:border-white/30
-                       transition-colors"
+            className="aura-glass-field flex-1 h-9 rounded-lg px-3
+                       text-[13.5px] placeholder:text-white/55 outline-none"
             style={{ color: "var(--text-primary)" }}
           />
           <select
             value={language}
             onChange={(e) => setLanguage(e.target.value)}
-            className="h-9 bg-white/8 border border-white/12 rounded-lg px-3 text-[13.5px]
-                       outline-none focus:border-white/30 transition-colors cursor-pointer"
+            aria-label="Subtitle language"
+            className="aura-glass-flat aura-glass-select appearance-none h-9 rounded-lg pl-3 text-[13.5px]
+                       outline-none cursor-pointer"
             style={{ color: "var(--text-primary)" }}
           >
             {LANG_PRESETS.map((l) => (
@@ -235,9 +248,16 @@ export default function SubtitlePicker({
 
         {/* Results */}
         <div
-          className="flex-1 min-h-0 overflow-y-auto px-2 py-2"
+          className="relative flex-1 min-h-0 overflow-y-auto px-2 py-2"
           style={{ scrollbarWidth: "thin", scrollbarColor: "rgba(255,255,255,0.1) transparent" }}
+          {...droplet.listProps}
         >
+          <span
+            ref={droplet.ref}
+            aria-hidden
+            className="aura-glass-hl aura-player-hl"
+            style={{ left: 8, right: 8, borderRadius: 12 }}
+          />
           {!loading && !error && results.length === 0 && (
             <div className="text-white/55 text-[13px] px-3 py-8 text-center">
               {query.trim() || initialImdbId
@@ -250,8 +270,8 @@ export default function SubtitlePicker({
               key={r.file_id}
               onClick={() => handleDownload(r)}
               disabled={downloading !== null}
-              className="w-full text-left flex items-center gap-3 px-3 py-2.5 mb-1 rounded-xl
-                         text-white/90 hover:bg-white/10 hover:text-white transition-colors
+              className="aura-glass-row relative w-full text-left flex items-center gap-3 px-3 py-2.5 mb-1 rounded-xl
+                         text-white/90 hover:text-white
                          disabled:opacity-40 disabled:cursor-not-allowed"
             >
               <div className="flex-1 min-w-0">
@@ -288,3 +308,6 @@ export default function SubtitlePicker({
     </div>
   );
 }
+
+// Memoized: it is a child of PlayerOverlay, which re-renders on every playback tick.
+export default memo(SubtitlePicker);

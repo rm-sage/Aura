@@ -253,6 +253,9 @@ pub async fn set_shader_profile(app: tauri::AppHandle, profile: u8) -> Result<()
                 path.clone(),
             ])?;
         }
+        // The `clr` above dropped the "Real glass over video" shader along
+        // with the old chain; put it back LAST (a no-op when it is off).
+        let _ = crate::mpv::engine::submit_glass(crate::mpv::glass::GlassCmd::EnsureLast);
     }
     #[cfg(not(target_os = "windows"))]
     return Err("playback engine is Windows-only".into());
